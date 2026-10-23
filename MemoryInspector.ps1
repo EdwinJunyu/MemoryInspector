@@ -672,6 +672,7 @@ try {
             try { [void]$script:WorkerPs.BeginStop($null,$null) } catch {}
         }
     }
+    Stop-MiActionObservation
     Close-MiV4Gui
     $script:UiTimer.Dispose()
     $script:Form.Dispose()

@@ -193,7 +193,16 @@ function Update-MiActionObservation {
         $sampleUtc=([datetime]$Snapshot.CaptureEndUtc).ToUniversalTime()
         foreach ($second in $due) {
             if ($elapsed -lt $second -or @($p.Observations | Where-Object { $_.TargetSecond -eq $second }).Count -gt 0) { continue }
-            if ($sampleUtc -lt $p.StartedUtc.AddSeconds($second)) { continue }
+            $targetUtc=$p.StartedUtc.AddSeconds($second)
+            if ($sampleUtc -lt $targetUtc) { continue }
+            # Never represent a 60-second sample as if it had been captured at 5/15/30.
+            if (($sampleUtc-$targetUtc).TotalSeconds -gt 12) {
+                $p.Observations.Add([pscustomobject]@{
+                    TargetSecond=$second;SampleUtc=$null;CommittedBytes=$null
+                    AvailablePhysicalBytes=$null;TargetPrivateBytes=$null;TargetStatus='MissingSample'
+                })
+                continue
+            }
             $sys=$Snapshot.System
             $committed=$null;$available=$null;$observed='Unknown'
             if ($null -ne $sys -and $sys.Status -eq 'Success') {
@@ -237,4 +246,14 @@ function Update-MiActionObservation {
         return [pscustomobject]@{State='Incomplete';Operation=$p;NetCommitBytes=$null;TargetStatus='Unknown'}
     }
     return $null
+}
+
+function Stop-MiActionObservation {
+    if ($null -eq $script:MiActions -or $null -eq $script:MiActions.Pending) { return }
+    $p=$script:MiActions.Pending
+    [void](Write-MiProcessAudit -OperationId $p.OperationId -State 'OBSERVATION_INTERRUPTED' -Mode $p.Mode -TargetPid $p.PID -Name $p.Name -Details @{
+        Reason='GUI exited before follow-up measurements were complete'
+        Observations=@($p.Observations.ToArray())
+    })
+    $script:MiActions.Pending=$null
 }
