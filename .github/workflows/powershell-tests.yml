@@ -1,0 +1,19 @@
+name: MemoryInspector PowerShell tests
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  regression:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Windows PowerShell 5.1 regression tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
+          .\SmokeTest.ps1
+          .\PersistenceTest.ps1
+          .\AnalyzerTest.ps1

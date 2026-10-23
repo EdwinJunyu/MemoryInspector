@@ -1,10 +1,10 @@
 #requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1 + 2 (v0.0.2)
+MemoryInspector v2 / Milestones 1 + 2 + 3 (v0.0.3)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 READ ONLY. No process close/kill, service modifications, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
-Milestone 2 JSONL persistence is enabled; anomaly analysis and privileged operations are NOT implemented.
+Milestone 3 read-only anomaly analysis is enabled; privileged operations are NOT implemented.
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -22,7 +22,8 @@ $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:CollectorPath = Join-Path $script:Root 'Collector.ps1'
 $script:WorkerPath = Join-Path $script:Root 'Worker.ps1'
 $script:PersistencePath = Join-Path $script:Root 'Persistence.ps1'
-foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath)) {
+$script:AnalyzerPath = Join-Path $script:Root 'Analyzer.ps1'
+foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('缺少项目文件：' + $path) }
 }
 
@@ -39,6 +40,7 @@ $script:History = New-Object 'System.Collections.Generic.List[object]'
 $script:PreviousInstances = @{}
 $script:CurrentProcesses = @()
 $script:LatestSnapshot = $null
+$script:CurrentDiagnosis = $null
 $script:LastSequence = 0
 $script:LastReceiveUtc = $null
 $script:UiUpdating = $false
@@ -136,6 +138,7 @@ function Start-MiWorker {
         [void]$powershell.AddScript($workerCode)
         [void]$powershell.AddArgument($script:CollectorPath)
         [void]$powershell.AddArgument($script:PersistencePath)
+        [void]$powershell.AddArgument($script:AnalyzerPath)
         [void]$powershell.AddArgument($queue)
         [void]$powershell.AddArgument($cancellation)
         [void]$powershell.AddArgument($script:PeriodMs)
@@ -177,6 +180,25 @@ function Get-MiSelectedProcess {
     if ($script:Grid.SelectedRows.Count -eq 0) { return $null }
     return $script:Grid.SelectedRows[0].Tag
 }
+function Get-MiDiagnosisReport {
+    param($Item)
+    if ($null -eq $Item -or $null -eq $script:CurrentDiagnosis) { return $null }
+    foreach ($r in @($script:CurrentDiagnosis.Reports)) {
+        if ($r.PID -eq $Item.PID -and $null -ne $Item.StartUtcTicks -and
+            $r.StartUtcTicks -eq $Item.StartUtcTicks) { return $r }
+    }
+    return $null
+}
+function Format-MiDiagnosisState {
+    param($Report)
+    if ($null -eq $Report) { return '未分析' }
+    switch ([string]$Report.AnomalyState) {
+        'SuspectedSustainedGrowth' { return '疑似持续增长' }
+        'NoSignificantGrowth' { return '暂无明显增长' }
+        'InsufficientEvidence' { return '证据不足' }
+        default { return '诊断不可用' }
+    }
+}
 function Update-MiSelectedProcess {
     if ($script:UiUpdating) { return }
     $item = Get-MiSelectedProcess
@@ -191,6 +213,17 @@ function Update-MiSelectedProcess {
     }
     $growth = '—（首次采样或身份无法验证）'
     if ($null -ne $item.DeltaBytes) { $growth = ('{0:+0.0;-0.0;0.0} MiB' -f ([double]$item.DeltaBytes / 1MB)) }
+    $diagnosis = Get-MiDiagnosisReport -Item $item
+    $diagText = Format-MiDiagnosisState -Report $diagnosis
+    $diagExplain = '暂无可信诊断数据；继续观察。'
+    $historyExplain = '暂无有效跨日程序基线。'
+    if ($null -ne $diagnosis) {
+        $diagExplain = [string]$diagnosis.Explanation
+        if ($null -ne $diagnosis.HistoricalProgramMedianBytes) {
+            $historyExplain = ('历史同名程序合计 Private Bytes 中位数：{0} GiB（当前同名进程合计偏离 {1:+0.0;-0.0;0.0}%）。' -f
+                (Format-MiGiB $diagnosis.HistoricalProgramMedianBytes),$diagnosis.HistoricalDeviationPercent)
+        }
+    }
     $script:Details.Text = @(
         ('进程：{0}' -f $item.Name),
         ('PID：{0}' -f $item.PID),
@@ -201,10 +234,15 @@ function Update-MiSelectedProcess {
         ('Working Set：{0} GiB' -f (Format-MiGiB $item.WorkingBytes)),
         ('本轮增长：{0}' -f $growth),
         '',
+        ('30 分钟诊断：{0}' -f $diagText),
+        $diagExplain,
+        ('跨日程序基线：{0}' -f $historyExplain),
+        '历史比较按同名程序合计，不代表本进程实例泄漏。',
+        '',
         'Private Bytes 是进程的私有提交量，不等于目前实际驻留 RAM。',
         '高占用不等于无用，也不能凭一次增长认定 Memory Leak。',
         '',
-        'Milestone 2：历史存储；安全操作尚未开放。'
+        'Milestone 3：只读趋势诊断；安全操作仍未开放。'
     ) -join [Environment]::NewLine
 }
 function Update-MiKpi {
@@ -265,8 +303,9 @@ function Update-MiGrid {
             }
             $deltaText = '—'
             if ($null -ne $item.DeltaBytes) { $deltaText = ('{0:+0.0;-0.0;0.0}' -f ([double]$item.DeltaBytes / 1MB)) }
+            $anomalyText = Format-MiDiagnosisState -Report (Get-MiDiagnosisReport -Item $item)
             $index = $script:Grid.Rows.Add([object[]]@($item.PID,$item.Name,(Format-MiGiB $item.PrivateBytes),
-                (Format-MiGiB $item.WorkingBytes),$deltaText,$item.Status))
+                (Format-MiGiB $item.WorkingBytes),$deltaText,$anomalyText,$item.Status))
             $script:Grid.Rows[$index].Tag = $item
             if ($item.PID -eq $selectedPid -and $null -ne $selectedStart -and $item.StartUtcTicks -eq $selectedStart) {
                 $script:Grid.Rows[$index].Selected = $true
@@ -328,6 +367,7 @@ function Process-MiMailbox {
         Set-MiStatus ('UI 丢弃了 {0} 个旧采样；图表已标记时间缺口。' -f ($latest.Sequence-$script:LastSequence-1)) $true
     }
     $script:LatestSnapshot = $latest
+    $script:CurrentDiagnosis = $latest.Diagnosis
     $script:LastSequence = $latest.Sequence
     $script:LastReceiveUtc = [datetime]::UtcNow
     Add-MiHistory -Snapshot $latest
@@ -340,15 +380,23 @@ function Process-MiMailbox {
     if ($latest.Status -ne 'Success') {
         $text += (' | {0} {1}' -f $latest.System.Error,$latest.Processes.Error)
     }
+    if ($null -ne $latest.Diagnosis -and $latest.Diagnosis.Status -eq 'Success') {
+        $pressure = [string]$latest.Diagnosis.Pressure.State
+        $suspected = @($latest.Diagnosis.Reports | Where-Object { $_.AnomalyState -eq 'SuspectedSustainedGrowth' }).Count
+        $text += (' | 压力：{0} | 疑似增长：{1}' -f $pressure,$suspected)
+    } elseif ($null -ne $latest.Diagnosis) {
+        $text += (' | 诊断不可用：{0}' -f $latest.Diagnosis.Error)
+    }
     if ($latest.PersistenceStatus -ne 'Saved') {
         $text += (' | 历史未保存：{0}' -f $latest.PersistenceError)
     }
-    Set-MiStatus $text ($latest.Status -ne 'Success' -or $latest.PersistenceStatus -ne 'Saved')
+    Set-MiStatus $text ($latest.Status -ne 'Success' -or $latest.PersistenceStatus -ne 'Saved' -or
+        $null -eq $latest.Diagnosis -or $latest.Diagnosis.Status -ne 'Success')
 }
 
 # ---- WinForms layout, all created and updated on GUI thread ----
 $script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = 'MemoryInspector v0.0.2 · 持久化监控（只读）'
+$script:Form.Text = 'MemoryInspector v0.0.3 · 异常诊断（只读）'
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.Size = [System.Drawing.Size]::new(1300,850)
 $script:Form.MinimumSize = [System.Drawing.Size]::new(1020,690)
@@ -450,7 +498,7 @@ $bottom.Dock='Fill';$bottom.RowCount=1;$bottom.ColumnCount=2
 [void]$bottom.ColumnStyles.Add(([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent,[single]29)))
 $root.Controls.Add($bottom,0,3)
 $tablePanel=New-MiPanel;$tablePanel.Dock='Fill';$bottom.Controls.Add($tablePanel,0,0)
-$tableHeader=New-MiLabel '进程明细 · 按 Private Bytes 排序（前 60 项）' 10 $true
+$tableHeader=New-MiLabel '进程明细 · Private Bytes 排序 / 30 分钟诊断（前 60 项）' 10 $true
 $tableHeader.Dock='Top';$tableHeader.Height=33;$tableHeader.Padding=[System.Windows.Forms.Padding]::new(10,7,0,0)
 $tablePanel.Controls.Add($tableHeader)
 $script:Grid=New-Object System.Windows.Forms.DataGridView
@@ -463,7 +511,8 @@ $script:Grid.BackgroundColor=[System.Drawing.Color]::White
 $script:Grid.RowTemplate.Height=26
 foreach($def in @(
     @('PID','PID',11),@('Name','进程',27),@('Private','Private GiB',17),
-    @('Working','RAM GiB',17),@('Delta','增量 MiB',16),@('Status','采样',12)
+    @('Working','RAM GiB',16),@('Delta','增量 MiB',14),
+    @('Anomaly','异常诊断',19),@('Status','采样',11)
 )) {
     $column=New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $column.Name=[string]$def[0];$column.HeaderText=[string]$def[1]
@@ -472,7 +521,7 @@ foreach($def in @(
 }
 $tablePanel.Controls.Add($script:Grid);$script:Grid.BringToFront();$tableHeader.BringToFront()
 $detailPanel=New-MiPanel;$detailPanel.Dock='Fill';$bottom.Controls.Add($detailPanel,1,0)
-$detailHeader=New-MiLabel '选中进程 · 只读信息' 10 $true
+$detailHeader=New-MiLabel '进程详情 · 趋势诊断（只读）' 10 $true
 $detailHeader.Dock='Top';$detailHeader.Height=33;$detailHeader.Padding=[System.Windows.Forms.Padding]::new(10,7,0,0)
 $detailPanel.Controls.Add($detailHeader)
 $script:Details=New-Object System.Windows.Forms.RichTextBox
@@ -500,6 +549,7 @@ $script:UiTimer.Add_Tick({
                 $script:PreviousInstances=@{}
                 $script:CurrentProcesses=@()
                 $script:LatestSnapshot=$null
+                $script:CurrentDiagnosis=$null
                 $script:Grid.Rows.Clear()
                 $script:Details.Text='等待新的进程快照…'
                 foreach ($v in $script:KpiValues) { $v.Text='采集中…' }
