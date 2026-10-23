@@ -314,155 +314,104 @@ function Save-MiSnapshot {
 }
 function Invoke-MiMaintenance {
     param($State,[datetime]$NowUtc=[datetime]::UtcNow)
-    $today=$NowUtc.Date
+    $today=$NowUtc.ToUniversalTime().Date
     $rawCutoff=$today.AddDays(-[int]$State.Settings.RawDays)
     $aggCutoff=$today.AddDays(-[int]$State.Settings.AggregateDays)
     $archiveDir=Join-Path $State.Root 'archives'
+
+    # Delete only well-formed, expired snapshot/summary files in managed folders.
     foreach ($kind in @('system','process')) {
         foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $State.Root $kind) -Filter '*.jsonl' -File)) {
-            if ($f.Name -match '^(system|process)-(\d{4}-\d{2}-\d{2})\.jsonl$') {
-                $date=[datetime]::MinValue
-                if ([datetime]::TryParseExact($Matches[2],'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date)) {
-                    if ($date -lt $rawCutoff) { [IO.File]::Delete($f.FullName) }
-                }
+            if ($f.Name -notmatch ('^'+$kind+'-(\d{4}-\d{2}-\d{2})\.jsonl$')) { continue }
+            $date=[datetime]::MinValue
+            if ([datetime]::TryParseExact($Matches[1],'yyyy-MM-dd',
+                [Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date) -and
+                $date -lt $rawCutoff) {
+                [IO.File]::Delete($f.FullName)
             }
         }
     }
     foreach ($kind in @('archives','aggregates')) {
+        $pattern=if($kind -eq 'archives'){'^raw-(\d{4}-\d{2}-\d{2})\.zip$'}else{'^summary-(\d{4}-\d{2}-\d{2})\.jsonl$'}
+        $cutoff=if($kind -eq 'archives'){$rawCutoff}else{$aggCutoff}
         foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $State.Root $kind) -File)) {
-            $pattern=if ($kind -eq 'archives') {'^raw-(\d{4}-\d{2}-\d{2})\.zip$'}else{'^summary-(\d{4}-\d{2}-\d{2})\.jsonl$'}
-            if ($f.Name -match $pattern) {
-                $date=[datetime]::MinValue
-                if ([datetime]::TryParseExact($Matches[1],'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date)) {
-                    $cutoff=if($kind -eq 'archives'){$rawCutoff}else{$aggCutoff}
-                    if ($date -lt $cutoff) { [IO.File]::Delete($f.FullName) }
-                }
+            if ($f.Name -notmatch $pattern) { continue }
+            $date=[datetime]::MinValue
+            if ([datetime]::TryParseExact($Matches[1],'yyyy-MM-dd',
+                [Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date) -and
+                $date -lt $cutoff) {
+                [IO.File]::Delete($f.FullName)
             }
         }
     }
-    # Compress the oldest unarchived completed day, catching up after downtime.
-    $candidates = @()
+
+    # Archive one completed day at a time (resume after interruption).
+    $candidates=@()
     foreach ($kind in @('system','process')) {
-        foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $State.Root $kind) -Filter '*.jsonl' -File)) {
-            if ($file.Name -match '^(system|process)-(\d{4}-\d{2}-\d{2})\.jsonl
-    $zipPath=Join-Path $archiveDir ('raw-'+$date+'.zip')
-    $sources=@()
-    foreach ($kind in @('system','process')) {
-        $source=Join-Path (Join-Path $State.Root $kind) ($kind+'-'+$date+'.jsonl')
-        if ([IO.File]::Exists($source)) { $sources+= $source }
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $State.Root $kind) -Filter '*.jsonl' -File)) {
+            if ($f.Name -notmatch '^(system|process)-(\d{4}-\d{2}-\d{2})\.jsonl$') { continue }
+            $date=[datetime]::MinValue
+            if ([datetime]::TryParseExact($Matches[2],'yyyy-MM-dd',
+                [Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date) -and
+                $date -lt $today -and $date -ge $rawCutoff) {
+                $candidates+= $date.ToString('yyyy-MM-dd')
+            }
+        }
     }
-    if ($sources.Count -gt 0 -and -not [IO.File]::Exists($zipPath)) {
-        Add-Type -AssemblyName System.IO.Compression
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $tmp=$zipPath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
-        try {
-            $zip=[IO.Compression.ZipFile]::Open($tmp,[IO.Compression.ZipArchiveMode]::Create)
-            try {
-                foreach ($source in $sources) {
-                    [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$source,[IO.Path]::GetFileName($source),[IO.Compression.CompressionLevel]::Optimal)
-                }
-            } finally { $zip.Dispose() }
-            $check=[IO.Compression.ZipFile]::OpenRead($tmp)
+    if ($candidates.Count -gt 0) {
+        $date=@($candidates | Sort-Object -Unique)[0]
+        $zipPath=Join-Path $archiveDir ('raw-'+$date+'.zip')
+        $sources=@()
+        foreach ($kind in @('system','process')) {
+            $source=Join-Path (Join-Path $State.Root $kind) ($kind+'-'+$date+'.jsonl')
+            if ([IO.File]::Exists($source)) { $sources+= $source }
+        }
+        if ($sources.Count -gt 0) {
+            Add-Type -AssemblyName System.IO.Compression
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            if (-not [IO.File]::Exists($zipPath)) {
+                $tmp=$zipPath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+                try {
+                    $zip=[IO.Compression.ZipFile]::Open($tmp,[IO.Compression.ZipArchiveMode]::Create)
+                    try {
+                        foreach ($source in $sources) {
+                            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                                $zip,$source,[IO.Path]::GetFileName($source),[IO.Compression.CompressionLevel]::Optimal)
+                        }
+                    } finally { $zip.Dispose() }
+                    [IO.File]::Move($tmp,$zipPath)
+                } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+            }
+            # Never remove source records unless every source is in the archive.
+            $check=[IO.Compression.ZipFile]::OpenRead($zipPath)
             try {
                 foreach ($source in $sources) {
                     $found=$false
-                    foreach ($e in $check.Entries) {
-                        if ($e.Name -eq [IO.Path]::GetFileName($source) -and $e.Length -eq ([IO.FileInfo]$source).Length) { $found=$true }
+                    foreach ($entry in $check.Entries) {
+                        if ($entry.FullName -eq [IO.Path]::GetFileName($source) -and
+                            $entry.Length -eq ([IO.FileInfo]::new($source)).Length) { $found=$true }
                     }
-                    if (-not $found) { throw 'ZIP 验证失败，原文件仍保留。' }
+                    if (-not $found) { throw 'ZIP 验证失败，原始文件予以保留。' }
                 }
             } finally { $check.Dispose() }
-            [IO.File]::Move($tmp,$zipPath)
-        } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+            foreach ($source in $sources) { [IO.File]::Delete($source) }
+        }
     }
-    if ([IO.File]::Exists($zipPath)) {
-        $check=[IO.Compression.ZipFile]::OpenRead($zipPath)
-        try {
-            foreach ($source in $sources) {
-                $found=$false
-                foreach ($e in $check.Entries) {
-                    if ($e.Name -eq [IO.Path]::GetFileName($source) -and $e.Length -eq ([IO.FileInfo]$source).Length) { $found=$true }
-                }
-                if (-not $found) { throw '归档与源数据不一致，拒绝删除。' }
-            }
-        } finally { $check.Dispose() }
-        foreach ($source in $sources) { [IO.File]::Delete($source) }
+
+    # Quota is strictly confined to monitoring files; never delete audit files.
+    $managed=New-Object 'System.Collections.Generic.List[object]'
+    foreach ($kind in @('system','process','aggregates','archives')) {
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $State.Root $kind) -File)) {
+            $managed.Add($f)
+        }
     }
-    # Monitoring quota does not touch audits or arbitrary files.
-    $files=@(@('system','process','aggregates','archives') | ForEach-Object { Get-ChildItem -LiteralPath (Join-Path $State.Root $_) -File })
-    $usage=[long]0; foreach($f in $files) { $usage+=$f.Length }
+    $usage=[long]0
+    foreach ($f in $managed) { $usage += [long]$f.Length }
     if ($usage -gt [long]$State.Settings.DiskBudgetBytes) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $archiveDir -Filter 'raw-*.zip' -File|Sort-Object Name)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $archiveDir -Filter 'raw-*.zip' -File | Sort-Object Name)) {
             if ($usage -le [long]$State.Settings.DiskBudgetBytes) { break }
-            $usage-=$f.Length;[IO.File]::Delete($f.FullName)
-            $State.Warning='磁盘预算不足，部分历史归档提前过期。'
-        }
-        if ($usage -gt [long]$State.Settings.DiskBudgetBytes) {
-            $State.Warning='磁盘预算不足，已暂停持久化以防止继续增长。'
-            $State.Healthy=$false
-        }
-    }
-}
-) {
-                $dateValue=[datetime]::MinValue
-                if ([datetime]::TryParseExact($Matches[2],'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$dateValue) -and $dateValue -lt $today) {
-                    $candidates += $Matches[2]
-                }
-            }
-        }
-    }
-    if ($candidates.Count -eq 0) { return }
-    $date = @($candidates | Sort-Object -Unique)[0]
-    $zipPath=Join-Path $archiveDir ('raw-'+$date+'.zip')
-    $sources=@()
-    foreach ($kind in @('system','process')) {
-        $source=Join-Path (Join-Path $State.Root $kind) ($kind+'-'+$date+'.jsonl')
-        if ([IO.File]::Exists($source)) { $sources+= $source }
-    }
-    if ($sources.Count -gt 0 -and -not [IO.File]::Exists($zipPath)) {
-        Add-Type -AssemblyName System.IO.Compression
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $tmp=$zipPath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
-        try {
-            $zip=[IO.Compression.ZipFile]::Open($tmp,[IO.Compression.ZipArchiveMode]::Create)
-            try {
-                foreach ($source in $sources) {
-                    [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$source,[IO.Path]::GetFileName($source),[IO.Compression.CompressionLevel]::Optimal)
-                }
-            } finally { $zip.Dispose() }
-            $check=[IO.Compression.ZipFile]::OpenRead($tmp)
-            try {
-                foreach ($source in $sources) {
-                    $found=$false
-                    foreach ($e in $check.Entries) {
-                        if ($e.Name -eq [IO.Path]::GetFileName($source) -and $e.Length -eq ([IO.FileInfo]$source).Length) { $found=$true }
-                    }
-                    if (-not $found) { throw 'ZIP 验证失败，原文件仍保留。' }
-                }
-            } finally { $check.Dispose() }
-            [IO.File]::Move($tmp,$zipPath)
-        } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
-    }
-    if ([IO.File]::Exists($zipPath)) {
-        $check=[IO.Compression.ZipFile]::OpenRead($zipPath)
-        try {
-            foreach ($source in $sources) {
-                $found=$false
-                foreach ($e in $check.Entries) {
-                    if ($e.Name -eq [IO.Path]::GetFileName($source) -and $e.Length -eq ([IO.FileInfo]$source).Length) { $found=$true }
-                }
-                if (-not $found) { throw '归档与源数据不一致，拒绝删除。' }
-            }
-        } finally { $check.Dispose() }
-        foreach ($source in $sources) { [IO.File]::Delete($source) }
-    }
-    # Monitoring quota does not touch audits or arbitrary files.
-    $files=@(@('system','process','aggregates','archives') | ForEach-Object { Get-ChildItem -LiteralPath (Join-Path $State.Root $_) -File })
-    $usage=[long]0; foreach($f in $files) { $usage+=$f.Length }
-    if ($usage -gt [long]$State.Settings.DiskBudgetBytes) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $archiveDir -Filter 'raw-*.zip' -File|Sort-Object Name)) {
-            if ($usage -le [long]$State.Settings.DiskBudgetBytes) { break }
-            $usage-=$f.Length;[IO.File]::Delete($f.FullName)
+            $usage -= [long]$f.Length
+            [IO.File]::Delete($f.FullName)
             $State.Warning='磁盘预算不足，部分历史归档提前过期。'
         }
         if ($usage -gt [long]$State.Settings.DiskBudgetBytes) {
