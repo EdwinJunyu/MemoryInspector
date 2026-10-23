@@ -11,7 +11,7 @@ function Get-MiV4Risk {
     if ($null -ne $script:ServicePids -and $script:ServicePids.ContainsKey([int]$Item.PID)) {
         return '受限（服务宿主）'
     }
-    return '未知（只读）'
+    return '待核验（不可自动操作）'
 }
 function Protect-MiV4Csv {
     param($Value)
@@ -438,16 +438,34 @@ function Initialize-MiV4Gui {
     $hostPanel=$script:Details.Parent
     $hostPanel.Controls.Remove($script:Details)
     $split=New-Object System.Windows.Forms.TableLayoutPanel
-    $split.Dock='Fill';$split.RowCount=2;$split.ColumnCount=1
+    $split.Dock='Fill';$split.RowCount=3;$split.ColumnCount=1
     [void]$split.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Percent',[single]100)))
-    [void]$split.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]185)))
+    [void]$split.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]100)))
+    [void]$split.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]155)))
     $hostPanel.Controls.Add($split)
     $split.Controls.Add($script:Details,0,0)
     $script:ProcessChart=New-MiV4Chart
     $script:ProcessChart.Series['Committed'].Name='Private'
     $script:ProcessChart.ChartAreas[0].AxisX.LabelStyle.Format='HH:mm'
     $script:ProcessChart.Series['RAM'].Name='RAM'
-    $split.Controls.Add($script:ProcessChart,0,1)
+    $split.Controls.Add($script:ProcessChart,0,2)
+    $actionPanel=New-Object System.Windows.Forms.TableLayoutPanel
+    $actionPanel.Dock='Fill';$actionPanel.RowCount=2;$actionPanel.ColumnCount=2
+    [void]$actionPanel.ColumnStyles.Add(([Windows.Forms.ColumnStyle]::new('Percent',[single]50)))
+    [void]$actionPanel.ColumnStyles.Add(([Windows.Forms.ColumnStyle]::new('Percent',[single]50)))
+    [void]$actionPanel.RowStyles.Add(([Windows.Forms.RowStyle]::new('Percent',[single]48)))
+    [void]$actionPanel.RowStyles.Add(([Windows.Forms.RowStyle]::new('Percent',[single]52)))
+    $script:MiDangerCheck=[Windows.Forms.CheckBox]::new()
+    $script:MiDangerCheck.Text='危险模式（仅对核验后的普通 GUI 应用）';$script:MiDangerCheck.Dock='Fill'
+    $script:MiDangerCheck.Checked=$false;$script:MiDangerCheck.Font=$script:Font
+    $actionPanel.Controls.Add($script:MiDangerCheck,0,0);$actionPanel.SetColumnSpan($script:MiDangerCheck,2)
+    $script:MiGracefulButton=New-MiButton '正常关闭' 115;$script:MiGracefulButton.Dock='Fill';$script:MiGracefulButton.Enabled=$false
+    $script:MiForceButton=New-MiButton '强制结束' 115;$script:MiForceButton.Dock='Fill';$script:MiForceButton.Enabled=$false
+    $actionPanel.Controls.Add($script:MiGracefulButton,0,1);$actionPanel.Controls.Add($script:MiForceButton,1,1)
+    $split.Controls.Add($actionPanel,0,1)
+    $script:MiDangerCheck.Add_CheckedChanged({Update-MiActionButtons})
+    $script:MiGracefulButton.Add_Click({Request-MiGuiProcessAction -Mode Graceful})
+    $script:MiForceButton.Add_Click({Request-MiGuiProcessAction -Mode Force})
     $split.BringToFront()
     foreach ($control in @($hostPanel.Controls)) {
         if ($control -is [System.Windows.Forms.Label]) { $control.BringToFront() }
@@ -467,7 +485,7 @@ function Initialize-MiV4Gui {
     $serviceHeader=New-Object System.Windows.Forms.Panel
     $serviceHeader.Dock='Top';$serviceHeader.Height=68
     $servicePage.Controls.Add($serviceHeader)
-    $script:ServiceNote=New-MiLabel '服务页为只读：无法停止、启动或修改服务。' 9
+    $script:ServiceNote=New-MiLabel 'Milestone 5：服务页仍然只读；仅普通 GUI 进程可手动安全管理。' 9
     $script:ServiceNote.Dock='Bottom';$script:ServiceNote.Height=26
     $serviceHeader.Controls.Add($script:ServiceNote)
     $script:ServiceSearch=New-Object System.Windows.Forms.TextBox
@@ -492,9 +510,12 @@ function Initialize-MiV4Gui {
     [void]$script:HistoryRange.Items.AddRange([object[]]@(1,7,30,90))
     $script:HistoryRange.SelectedIndex=1
     $hbar.Controls.Add($script:HistoryRange)
+    $logButton=New-MiButton '操作记录' 118
+    $logButton.SetBounds(252,3,118,31);$hbar.Controls.Add($logButton)
+    $logButton.Add_Click({Show-MiActionLog})
     $hReload=New-MiButton '读取历史' 122
     $hReload.SetBounds(120,3,122,31);$hbar.Controls.Add($hReload)
-    $script:HistoryNote=New-MiLabel '后台加载 90 天五分钟聚合数据；尚无操作记录（只读阶段）。' 9
+    $script:HistoryNote=New-MiLabel '后台加载 90 天五分钟聚合数据；进程操作记录可通过右上按钮查看。' 9
     $script:HistoryNote.Dock='Bottom';$script:HistoryNote.Height=26;$hbar.Controls.Add($script:HistoryNote)
     $script:HistoryChart=New-MiV4Chart
     $historyPage.Controls.Add($script:HistoryChart);$script:HistoryChart.BringToFront()
@@ -529,7 +550,7 @@ function Initialize-MiV4Gui {
     $script:TraySetting.Checked=$script:CloseToTray
     $script:TraySetting.Size=[Drawing.Size]::new(650,43);$settingsPanel.Controls.Add($script:TraySetting)
     $save=New-MiButton '保存 GUI 设置' 170;$settingsPanel.Controls.Add($save)
-    $script:SettingsNote=New-MiLabel '固定诊断窗口为 30 分钟、覆盖率至少 85%；历史保留期 7 天原始 / 90 天聚合（可在持久化 settings.json 调整）。服务管理只读。' 9
+    $script:SettingsNote=New-MiLabel '固定诊断窗口为 30 分钟、覆盖率至少 85%；历史保留期 7 天原始 / 90 天聚合（可在持久化 settings.json 调整）。服务仍只读；普通进程操作必须人工确认。' 9
     $script:SettingsNote.Size=[Drawing.Size]::new(740,60);$settingsPanel.Controls.Add($script:SettingsNote)
     $save.Add_Click({
         try { Save-MiV4Settings }
@@ -546,7 +567,7 @@ function Initialize-MiV4Gui {
     $exitItem=$script:TrayMenu.Items.Add('完全退出')
     $script:TrayIcon=New-Object System.Windows.Forms.NotifyIcon
     $script:TrayIcon.Icon=[Drawing.SystemIcons]::Information
-    $script:TrayIcon.Text='MemoryInspector v0.0.4 · 只读监控'
+    $script:TrayIcon.Text='MemoryInspector v0.0.5 · 手动安全操作'
     $script:TrayIcon.ContextMenuStrip=$script:TrayMenu
     $script:TrayIcon.Visible=$true
     $showItem.Add_Click({$script:Form.Show();$script:Form.WindowState='Normal';$script:Form.Activate()})

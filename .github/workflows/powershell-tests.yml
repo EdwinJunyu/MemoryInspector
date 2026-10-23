@@ -18,3 +18,4 @@ jobs:
           .\PersistenceTest.ps1
           .\AnalyzerTest.ps1
           .\GuiV4Test.ps1
+          .\ProcessActionsTest.ps1
