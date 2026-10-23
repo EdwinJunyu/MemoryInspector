@@ -60,9 +60,9 @@ try {
         AuditPath=(Join-Path $logDir 'actions.jsonl')
     }
     $sample.Processes.Items=@($record)
-    $sample.System=[pscustomobject]@{
+    $sample | Add-Member -NotePropertyName System -NotePropertyValue ([pscustomobject]@{
         Status='Success';CommittedBytes=[long](6GB);AvailablePhysicalBytes=[long](3GB)
-    }
+    }) -Force
     $blocked=Invoke-MiProcessAction -Mode Force -Item $record -Snapshot $sample -DangerEnabled $false
     if ($blocked.Outcome -ne 'Rejected' -or $script:FakeKills -ne 0) {throw 'Danger-disabled force was not blocked.'}
     $allowed=Invoke-MiProcessAction -Mode Force -Item $record -Snapshot $sample -DangerEnabled $true
