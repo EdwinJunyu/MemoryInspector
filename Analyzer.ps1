@@ -34,6 +34,8 @@ function New-MiAnalyzer {
         HistoricalLoadedUtc = [datetime]::MinValue
         LastCaptureUtc = [datetime]::MinValue
         WindowMinutes = $WindowMinutes
+        GrowthThresholdBytes = [long]512MB
+        GrowthThresholdRatio = [double]0.20
     }
 }
 
@@ -260,7 +262,7 @@ function Get-MiProcessAnomaly {
     for($i=1;$i -lt 6;$i++) { if ($medians[$i] -gt $medians[$i-1]) { $upward++ } }
     $report.UpwardSegments = $upward
     $report.EvidenceQuality = $(if ($report.CoverageRatio -ge 0.95) {'High'} else {'Moderate'})
-    if ($baseline -gt 0 -and $growth -ge 512MB -and ($growth/$baseline) -ge 0.20 -and $upward -ge 4) {
+    if ($baseline -gt 0 -and $growth -ge [long]$Analyzer.GrowthThresholdBytes -and ($growth/$baseline) -ge [double]$Analyzer.GrowthThresholdRatio -and $upward -ge 4) {
         $report.AnomalyState = 'SuspectedSustainedGrowth'
         $report.Explanation = ('六段中 {0}/5 段上升，窗口中位数增长 {1:N0} MiB（{2:N1}%）；仅为疑似增长，不代表确认泄漏。' -f
             $upward,($growth/1MB),$report.GrowthPercentage)

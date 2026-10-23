@@ -7,7 +7,8 @@ param(
     [System.Collections.Concurrent.ConcurrentQueue[object]]$Mailbox,
     [System.Threading.CancellationTokenSource]$Cancellation,
     [int]$IntervalMs,
-    [int]$QueueLimit
+    [int]$QueueLimit,
+    [string]$UiSettingsPath
 )
 $ErrorActionPreference = 'Stop'
 . $CollectorPath
@@ -15,6 +16,19 @@ $ErrorActionPreference = 'Stop'
 . $AnalyzerPath
 $storage = New-MiPersistence
 $analyzer = New-MiAnalyzer -BootId $storage.BootId -Root $storage.Root
+if (-not [string]::IsNullOrWhiteSpace($UiSettingsPath) -and [IO.File]::Exists($UiSettingsPath)) {
+    try {
+        $preferences=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($UiSettingsPath,[Text.Encoding]::UTF8)) -ErrorAction Stop
+        if ([int]$preferences.SchemaVersion -eq 1) {
+            if ($null -ne $preferences.GrowthMiB -and [int]$preferences.GrowthMiB -ge 64 -and [int]$preferences.GrowthMiB -le 8192) {
+                $analyzer.GrowthThresholdBytes=[long]$preferences.GrowthMiB * 1MB
+            }
+            if ($null -ne $preferences.GrowthPercent -and [int]$preferences.GrowthPercent -ge 5 -and [int]$preferences.GrowthPercent -le 200) {
+                $analyzer.GrowthThresholdRatio=[double]$preferences.GrowthPercent / 100.0
+            }
+        }
+    } catch { } # Invalid preferences must not stop collection; use safe defaults.
+}
 try {
     [void](Restore-MiAnalyzer -Analyzer $analyzer)
     Update-MiHistoricalBaselines -Analyzer $analyzer

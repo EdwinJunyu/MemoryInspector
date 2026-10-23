@@ -17,3 +17,4 @@ jobs:
           .\SmokeTest.ps1
           .\PersistenceTest.ps1
           .\AnalyzerTest.ps1
+          .\GuiV4Test.ps1

@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1 + 2 + 3 (v0.0.3)
+MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 (v0.0.4)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 READ ONLY. No process close/kill, service modifications, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
@@ -23,7 +23,8 @@ $script:CollectorPath = Join-Path $script:Root 'Collector.ps1'
 $script:WorkerPath = Join-Path $script:Root 'Worker.ps1'
 $script:PersistencePath = Join-Path $script:Root 'Persistence.ps1'
 $script:AnalyzerPath = Join-Path $script:Root 'Analyzer.ps1'
-foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath)) {
+$script:GuiPath = Join-Path $script:Root 'GuiV4.ps1'
+foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath,$script:GuiPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('缺少项目文件：' + $path) }
 }
 
@@ -32,6 +33,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms.DataVisualization
 [System.Windows.Forms.Application]::EnableVisualStyles()
+. $script:GuiPath
 
 $script:PeriodMs = 10000
 $script:QueueLimit = 3
@@ -143,6 +145,7 @@ function Start-MiWorker {
         [void]$powershell.AddArgument($cancellation)
         [void]$powershell.AddArgument($script:PeriodMs)
         [void]$powershell.AddArgument($script:QueueLimit)
+        [void]$powershell.AddArgument($script:UiSettingsPath)
         $handle = $powershell.BeginInvoke()
 
         $script:Mailbox = $queue
@@ -205,6 +208,7 @@ function Update-MiSelectedProcess {
     if ($null -eq $item) {
         $script:Details.Text = '选择一条进程记录查看其内存信息。' + [Environment]::NewLine +
             '本阶段为只读监控，不包含任何结束进程或停止服务的操作。'
+        Update-MiV4ProcessChart
         return
     }
     $startString = '不可读取'
@@ -235,6 +239,7 @@ function Update-MiSelectedProcess {
         ('本轮增长：{0}' -f $growth),
         '',
         ('30 分钟诊断：{0}' -f $diagText),
+        ('操作风险：{0}' -f (Get-MiV4Risk -Item $item)),
         $diagExplain,
         ('跨日程序基线：{0}' -f $historyExplain),
         '历史比较按同名程序合计，不代表本进程实例泄漏。',
@@ -242,8 +247,9 @@ function Update-MiSelectedProcess {
         'Private Bytes 是进程的私有提交量，不等于目前实际驻留 RAM。',
         '高占用不等于无用，也不能凭一次增长认定 Memory Leak。',
         '',
-        'Milestone 3：只读趋势诊断；安全操作仍未开放。'
+        'Milestone 4：五页 GUI 与只读安全风险显示；进程/服务操作暂未开放。'
     ) -join [Environment]::NewLine
+    Update-MiV4ProcessChart
 }
 function Update-MiKpi {
     param($Snapshot)
@@ -276,49 +282,7 @@ function Update-MiKpi {
 }
 function Update-MiGrid {
     param($ProcessCollection)
-    if ($ProcessCollection.Status -eq 'Failed') {
-        $script:Grid.Rows.Clear()
-        $script:CurrentProcesses = @()
-        $script:Details.Text = '本轮进程扫描失败：' + [string]$ProcessCollection.Error
-        return
-    }
-    $selected = Get-MiSelectedProcess
-    $selectedPid = -1; $selectedStart = $null
-    if ($null -ne $selected) { $selectedPid = $selected.PID; $selectedStart = $selected.StartUtcTicks }
-    $next = @{}
-    $rows = @($ProcessCollection.Items | Sort-Object -Property @{Expression={ if ($null -eq $_.PrivateBytes) {-1L} else {[long]$_.PrivateBytes} }} -Descending | Select-Object -First 60)
-    $script:UiUpdating = $true
-    $script:Grid.SuspendLayout()
-    try {
-        $script:Grid.Rows.Clear()
-        foreach ($item in $rows) {
-            $item | Add-Member -NotePropertyName DeltaBytes -NotePropertyValue $null -Force
-            if ($null -ne $item.StartUtcTicks) {
-                $key = '{0}:{1}' -f $item.PID,$item.StartUtcTicks
-                if ($script:PreviousInstances.ContainsKey($key) -and $null -ne $item.PrivateBytes -and
-                    $null -ne $script:PreviousInstances[$key].PrivateBytes) {
-                    $item.DeltaBytes = [long]($item.PrivateBytes - $script:PreviousInstances[$key].PrivateBytes)
-                }
-                $next[$key] = $item
-            }
-            $deltaText = '—'
-            if ($null -ne $item.DeltaBytes) { $deltaText = ('{0:+0.0;-0.0;0.0}' -f ([double]$item.DeltaBytes / 1MB)) }
-            $anomalyText = Format-MiDiagnosisState -Report (Get-MiDiagnosisReport -Item $item)
-            $index = $script:Grid.Rows.Add([object[]]@($item.PID,$item.Name,(Format-MiGiB $item.PrivateBytes),
-                (Format-MiGiB $item.WorkingBytes),$deltaText,$anomalyText,$item.Status))
-            $script:Grid.Rows[$index].Tag = $item
-            if ($item.PID -eq $selectedPid -and $null -ne $selectedStart -and $item.StartUtcTicks -eq $selectedStart) {
-                $script:Grid.Rows[$index].Selected = $true
-            }
-        }
-        $script:CurrentProcesses = $rows
-        $script:PreviousInstances = $next
-        if ($script:Grid.SelectedRows.Count -eq 0) { $script:Grid.ClearSelection() }
-    } finally {
-        $script:Grid.ResumeLayout()
-        $script:UiUpdating = $false
-    }
-    Update-MiSelectedProcess
+    Update-MiV4Grid -ProcessCollection $ProcessCollection
 }
 function Update-MiCharts {
     $seriesCommit = $script:LineChart.Series['Committed']
@@ -371,6 +335,7 @@ function Process-MiMailbox {
     $script:LastSequence = $latest.Sequence
     $script:LastReceiveUtc = [datetime]::UtcNow
     Add-MiHistory -Snapshot $latest
+    Add-MiV4ProcessHistory -Snapshot $latest
     Update-MiKpi -Snapshot $latest
     Update-MiGrid -ProcessCollection $latest.Processes
     Update-MiCharts
@@ -396,7 +361,7 @@ function Process-MiMailbox {
 
 # ---- WinForms layout, all created and updated on GUI thread ----
 $script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = 'MemoryInspector v0.0.3 · 异常诊断（只读）'
+$script:Form.Text = 'MemoryInspector v0.0.4 · 多页面诊断（只读）'
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.Size = [System.Drawing.Size]::new(1300,850)
 $script:Form.MinimumSize = [System.Drawing.Size]::new(1020,690)
@@ -536,6 +501,7 @@ $statusBar.Dock='Fill';$root.Controls.Add($statusBar,0,4)
 $script:StatusLabel=New-MiLabel '初始化中…' 8
 $script:StatusLabel.Dock='Fill';$script:StatusLabel.ForeColor=$script:Muted
 $script:StatusLabel.TextAlign='MiddleLeft';$statusBar.Controls.Add($script:StatusLabel)
+Initialize-MiV4Gui -Root $root -Cards $cards -Charts $chartLayout -Bottom $bottom -StatusBar $statusBar
 
 $script:UiTimer = New-Object System.Windows.Forms.Timer
 $script:UiTimer.Interval=400
@@ -543,10 +509,12 @@ $script:UiTimer.Add_Tick({
     if ($script:Closing) { return }
     try {
         Process-MiMailbox
+        Poll-MiV4Jobs
         if ($script:RestartPending) {
             if (Dispose-MiCompletedWorker) {
                 Restore-MiGuiHistory
                 $script:PreviousInstances=@{}
+                $script:ProcessTrend=@{}
                 $script:CurrentProcesses=@()
                 $script:LatestSnapshot=$null
                 $script:CurrentDiagnosis=$null
@@ -594,6 +562,13 @@ $script:Form.Add_Shown({
     }
 })
 $script:Form.Add_FormClosing({
+    param($sender,$e)
+    if ($script:CloseToTray -and -not $script:ExitRequested -and
+        $e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+        $e.Cancel=$true
+        $script:Form.Hide()
+        return
+    }
     $script:Closing=$true
     $script:UiTimer.Stop()
     Stop-MiWorker
@@ -614,6 +589,7 @@ try {
             try { [void]$script:WorkerPs.BeginStop($null,$null) } catch {}
         }
     }
+    Close-MiV4Gui
     $script:UiTimer.Dispose()
     $script:Form.Dispose()
 }
