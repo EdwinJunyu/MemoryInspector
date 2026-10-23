@@ -2,6 +2,7 @@
 <# Independent background runspace; never touches Windows Forms controls. #>
 param(
     [string]$CollectorPath,
+    [string]$PersistencePath,
     [System.Collections.Concurrent.ConcurrentQueue[object]]$Mailbox,
     [System.Threading.CancellationTokenSource]$Cancellation,
     [int]$IntervalMs,
@@ -9,6 +10,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 . $CollectorPath
+. $PersistencePath
+$storage = New-MiPersistence
 $sequence = 0
 while (-not $Cancellation.IsCancellationRequested) {
     $sequence++
@@ -25,6 +28,10 @@ while (-not $Cancellation.IsCancellationRequested) {
             Processes = [pscustomobject]@{Status='Failed';Items=@();Total=0;Incomplete=0;Error='采样中断'}
         }
     }
+    $written = $false
+    if ($storage.Healthy) { $written = Save-MiSnapshot -State $storage -Snapshot $snapshot }
+    $snapshot | Add-Member -NotePropertyName PersistenceStatus -NotePropertyValue $(if ($written) { 'Saved' } else { 'Unavailable' }) -Force
+    $snapshot | Add-Member -NotePropertyName PersistenceError -NotePropertyValue $storage.Warning -Force
     $Mailbox.Enqueue($snapshot)
     # Bounded mailbox: discard old UI updates rather than accumulating snapshots.
     while ($Mailbox.Count -gt $QueueLimit) {
@@ -37,3 +44,5 @@ while (-not $Cancellation.IsCancellationRequested) {
         [void]$Cancellation.Token.WaitHandle.WaitOne([int]$remaining)
     }
 }
+
+Close-MiPersistence -State $storage

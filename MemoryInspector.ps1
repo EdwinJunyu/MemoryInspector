@@ -1,10 +1,10 @@
 #requires -Version 5.1
 <#
-MemoryInspector v2 / Milestone 1 only
+MemoryInspector v2 / Milestones 1 + 2 (v0.0.2)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 READ ONLY. No process close/kill, service modifications, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
-Milestone 2 (disk persistence) and Milestone 3 (anomaly analysis) are NOT implemented.
+Milestone 2 JSONL persistence is enabled; anomaly analysis and privileged operations are NOT implemented.
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -21,10 +21,12 @@ if (-not [Environment]::OSVersion.Platform.Equals([PlatformID]::Win32NT)) {
 $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:CollectorPath = Join-Path $script:Root 'Collector.ps1'
 $script:WorkerPath = Join-Path $script:Root 'Worker.ps1'
-foreach ($path in @($script:CollectorPath,$script:WorkerPath)) {
+$script:PersistencePath = Join-Path $script:Root 'Persistence.ps1'
+foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('缺少项目文件：' + $path) }
 }
 
+. $script:PersistencePath
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms.DataVisualization
@@ -133,6 +135,7 @@ function Start-MiWorker {
         $workerCode = [System.IO.File]::ReadAllText($script:WorkerPath,[System.Text.Encoding]::UTF8)
         [void]$powershell.AddScript($workerCode)
         [void]$powershell.AddArgument($script:CollectorPath)
+        [void]$powershell.AddArgument($script:PersistencePath)
         [void]$powershell.AddArgument($queue)
         [void]$powershell.AddArgument($cancellation)
         [void]$powershell.AddArgument($script:PeriodMs)
@@ -154,6 +157,16 @@ function Start-MiWorker {
         if ($null -ne $runspace) { try { $runspace.Dispose() } catch {} }
         throw
     }
+}
+function Restore-MiGuiHistory {
+    try {
+        $root = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MemoryInspector'
+        $readState = [pscustomobject]@{Root=$root}
+        $restored = @(Get-MiRecentSystemHistory -State $readState -Limit $script:HistoryLimit)
+        $script:History.Clear()
+        foreach ($row in $restored) { $script:History.Add($row) }
+        if ($restored.Count -gt 0) { Update-MiCharts }
+    } catch { Set-MiStatus ('历史读取失败；实时监控仍可使用：' + $_.Exception.Message) $true }
 }
 function Add-MiHistory {
     param($Snapshot)
@@ -191,7 +204,7 @@ function Update-MiSelectedProcess {
         'Private Bytes 是进程的私有提交量，不等于目前实际驻留 RAM。',
         '高占用不等于无用，也不能凭一次增长认定 Memory Leak。',
         '',
-        'Milestone 1：只读，安全操作尚未开放。'
+        'Milestone 2：历史存储；安全操作尚未开放。'
     ) -join [Environment]::NewLine
 }
 function Update-MiKpi {
@@ -327,12 +340,15 @@ function Process-MiMailbox {
     if ($latest.Status -ne 'Success') {
         $text += (' | {0} {1}' -f $latest.System.Error,$latest.Processes.Error)
     }
-    Set-MiStatus $text ($latest.Status -ne 'Success')
+    if ($latest.PersistenceStatus -ne 'Saved') {
+        $text += (' | 历史未保存：{0}' -f $latest.PersistenceError)
+    }
+    Set-MiStatus $text ($latest.Status -ne 'Success' -or $latest.PersistenceStatus -ne 'Saved')
 }
 
 # ---- WinForms layout, all created and updated on GUI thread ----
 $script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = 'MemoryInspector v2 · Milestone 1（只读监控）'
+$script:Form.Text = 'MemoryInspector v0.0.2 · 持久化监控（只读）'
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.Size = [System.Drawing.Size]::new(1300,850)
 $script:Form.MinimumSize = [System.Drawing.Size]::new(1020,690)
@@ -390,7 +406,7 @@ $chartLayout.Dock='Fill'; $chartLayout.RowCount=1; $chartLayout.ColumnCount=2
 [void]$chartLayout.ColumnStyles.Add(([System.Windows.Forms.ColumnStyle]::new([System.Windows.Forms.SizeType]::Percent,[single]43)))
 $root.Controls.Add($chartLayout,0,2)
 $linePanel = New-MiPanel; $linePanel.Dock='Fill'; $chartLayout.Controls.Add($linePanel,0,0)
-$lineHeader=New-MiLabel '系统内存趋势 · 最多 180 个采样点（GiB）' 10 $true
+$lineHeader=New-MiLabel '系统内存趋势 · 最近 30 分钟（GiB）' 10 $true
 $lineHeader.Dock='Top';$lineHeader.Height=30;$lineHeader.Padding=[System.Windows.Forms.Padding]::new(10,6,0,0)
 $linePanel.Controls.Add($lineHeader)
 $script:LineChart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
@@ -480,7 +496,7 @@ $script:UiTimer.Add_Tick({
         Process-MiMailbox
         if ($script:RestartPending) {
             if (Dispose-MiCompletedWorker) {
-                $script:History.Clear()
+                Restore-MiGuiHistory
                 $script:PreviousInstances=@{}
                 $script:CurrentProcesses=@()
                 $script:LatestSnapshot=$null
@@ -521,7 +537,7 @@ $btnRestart.Add_Click({
     Set-MiStatus '正在取消当前采样；待后台采样器退出后自动重新启动。'
 })
 $script:Form.Add_Shown({
-    try { Start-MiWorker; $script:UiTimer.Start() }
+    try { Restore-MiGuiHistory; Start-MiWorker; $script:UiTimer.Start() }
     catch {
         Set-MiStatus ('采样器启动失败：' + $_.Exception.Message) $true
         $script:UiTimer.Start()
