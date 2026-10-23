@@ -230,7 +230,7 @@ function Get-MiProcessAnomaly {
         $_.Utc -ge $NowUtc.AddMinutes(-30) -and $_.Utc -le $NowUtc
     } | Sort-Object Utc)
     $report.ValidSampleCount = $samples.Count
-    $report.CoverageRatio = [math]::Round(([double]$samples.Count / 180.0),3)
+    $report.CoverageRatio = [math]::Round([math]::Min([double]1.0,([double]$samples.Count / 180.0)),3)
     if ($samples.Count -lt 153 -or ($samples[$samples.Count-1].Utc-$samples[0].Utc).TotalMinutes -lt 29.0) {
         $report.Explanation = ('30 分钟窗口需要至少 153/180 个有效样本并覆盖约 29 分钟；当前 {0}/180。' -f $samples.Count)
         return [pscustomobject]$report
@@ -294,7 +294,7 @@ function Get-MiMemoryPressure {
     $ramRatio = $available / $total
     $result.CommitRatio = [math]::Round($commitRatio,3)
     $result.AvailableRamRatio = [math]::Round($ramRatio,3)
-    $result.CommitHeadroomBytes = [long][math]::Max(0,$limit-$committed)
+    $result.CommitHeadroomBytes = [long][math]::Max([double]0.0,([double]$limit-[double]$committed))
     if ($commitRatio -ge 0.90 -or $ramRatio -le 0.05) { $result.State='High' }
     elseif ($commitRatio -ge 0.80 -or $ramRatio -le 0.10) { $result.State='Elevated' }
     else { $result.State='Normal' }
