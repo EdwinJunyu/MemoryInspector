@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <# Independent background runspace; never touches Windows Forms controls. #>
 param(
     [string]$CollectorPath,

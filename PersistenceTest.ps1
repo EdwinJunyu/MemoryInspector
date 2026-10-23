@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # v0.0.2 persistence regression test: disposable temp directory only.
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Persistence.ps1')

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 Milestone 3 / v0.0.3: READ-ONLY anomaly detection.
 No process/service actions. Private Bytes trends are heuristics, NOT leak proof.

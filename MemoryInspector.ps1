@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 MemoryInspector v2 / Milestones 1 + 2 + 3 (v0.0.3)
 Windows PowerShell 5.1 + built-in WinForms and Charting.

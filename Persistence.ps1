@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 MemoryInspector v0.0.2 - user-scoped JSONL persistence.
 Writes only to %LOCALAPPDATA%\MemoryInspector. No process/service operations.

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 Milestone 1 read-only collector.
 All outputs are scalar snapshots. Never return live System.Diagnostics.Process objects.

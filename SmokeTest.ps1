@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <# Read-only smoke test, run on Windows PowerShell 5.1. #>
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Collector.ps1')

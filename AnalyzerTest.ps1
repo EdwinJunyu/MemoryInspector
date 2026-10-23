@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # Milestone 3 deterministic read-only fixtures. Does not touch real processes or services.
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Analyzer.ps1')
