@@ -13,7 +13,7 @@ foreach ($file in @('ServiceManagement.ps1','ServiceBridge.ps1','ElevatedExecuto
 foreach ($good in @('Spooler','TestService_123','Vendor.Agent-1','W32Time')) {
     if (-not (Test-MiServiceName $good)) { throw ('Valid service name rejected: '+$good) }
 }
-foreach ($bad in @('','../Bad','Name With Space',"Name';Remove-Item",'a'*129)) {
+foreach ($bad in @('','../Bad','Name With Space',"Name';Remove-Item",('a' * 129))) {
     if (Test-MiServiceName $bad) { throw ('Unsafe service name allowed: '+$bad) }
 }
 foreach ($critical in @('RpcSs','WinDefend','SamSs','Schedule','BFE','PlugPlay','EventLog')) {
