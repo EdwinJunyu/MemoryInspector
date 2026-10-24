@@ -20,3 +20,14 @@ jobs:
           .\GuiV4Test.ps1
           .\ProcessActionsTest.ps1
           .\PrivilegeSecurityTest.ps1
+  protected-install:
+    needs: regression
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test protected installation on disposable runner
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\PrivilegeInstallTest.ps1
