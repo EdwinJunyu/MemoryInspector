@@ -1,48 +1,61 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
-Milestone 6 privileged executor: PROBE ONLY.
-Service STOP/START/APPROVE/REVOKE are intentionally NOT implemented here.
-Never accepts arbitrary command text, a target executable or a service name.
+M7 protected, short-lived executor. Probe plus explicitly approved Windows service
+operations only. Unknown identity, invalid ACL, changed binary, missing audit or
+running dependents always fails closed. Never kills a service host process.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$Operation,
-    [Parameter(Mandatory=$true)][string]$RequestId
+    [Parameter(Mandatory=$true)][string]$RequestId,
+    [string]$ServiceName=''
 )
 $ErrorActionPreference='Stop'
-$exitCode=1
+$exitCode=2
+$trusted=$false
 try {
     if ($PSVersionTable.PSVersion.Major -ne 5 -or
         -not [Environment]::OSVersion.Platform.Equals([PlatformID]::Win32NT)) {
-        throw 'Unsupported host.'
+        throw 'Unsupported Windows PowerShell host.'
     }
     if ($MyInvocation.UnboundArguments.Count -gt 0) { throw 'Unexpected arguments.' }
-    . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'PrivilegeSecurity.ps1')
+    $root=Split-Path -Parent $MyInvocation.MyCommand.Path
+    . (Join-Path $root 'PrivilegeSecurity.ps1')
     if (-not (Test-MiAdminToken)) { throw 'Elevated administrator token required.' }
-    if (-not (Test-MiPrivilegedOperation -Operation $Operation -RequestId $RequestId)) {
-        throw 'Denied operation or invalid request ID.'
+    if (-not (Test-MiPrivilegedOperation -Operation $Operation -RequestId $RequestId -ServiceName $ServiceName)) {
+        throw 'Unsupported operation, invalid request ID, or invalid service name.'
     }
     $paths=Assert-MiTrustedInstallation
     if (-not [string]::Equals(
-        [IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path)).TrimEnd('\'),
+        [IO.Path]::GetFullPath($root).TrimEnd('\'),
         [IO.Path]::GetFullPath($paths.Install).TrimEnd('\'),
         [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Executor must run from the protected installation.'
+        throw 'Executor must run from verified protected installation.'
     }
-    # CreateNew is atomic and prevents replay even across concurrent processes.
+    $trusted=$true
+    # Atomic CreateNew claim prevents replay, including concurrent elevated processes.
     $marker=Join-Path $paths.Replay ($RequestId.ToLowerInvariant()+'.nonce')
-    $fs=[IO.File]::Open($marker,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    $stream=[IO.File]::Open($marker,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
     try {
-        $bytes=[Text.Encoding]::UTF8.GetBytes(([datetime]::UtcNow.ToString('o')))
-        $fs.Write($bytes,0,$bytes.Length);$fs.Flush($true)
-    } finally { $fs.Dispose() }
+        $content=[Text.UTF8Encoding]::new($false).GetBytes([datetime]::UtcNow.ToString('o'))
+        $stream.Write($content,0,$content.Length);$stream.Flush($true)
+    } finally { $stream.Dispose() }
     Set-MiProtectedFileAcl -Path $marker
-    # An audit failure blocks even the harmless probe.
-    Write-MiPrivilegedAudit -RequestId $RequestId -State 'REQUESTED' -Reason 'M6 UAC readiness probe'
-    Write-MiPrivilegedAudit -RequestId $RequestId -State 'CONFIRMED' -Reason 'Trusted installation / elevation / replay checks passed'
-    $exitCode=0
+    if ($Operation -ceq 'Probe') {
+        Write-MiPrivilegedAudit -RequestId $RequestId -State 'REQUESTED' -Reason 'UAC readiness probe'
+        Write-MiPrivilegedAudit -RequestId $RequestId -State 'CONFIRMED' -Reason 'Protected install/replay/audit checks passed'
+        $exitCode=0
+    } else {
+        . (Join-Path $root 'ServiceManagement.ps1')
+        $outcome=Invoke-MiServiceMutation -Operation $Operation -ServiceName $ServiceName -RequestId $RequestId
+        $exitCode=if ($outcome -eq 'Confirmed') {0} elseif ($outcome -eq 'TimedOut') {3} else {2}
+    }
 } catch {
-    # Fail closed. Reject reasons are not exposed as an instruction to retry destructively.
-    Write-Error ('Privileged probe refused: '+$_.Exception.Message) -ErrorAction Continue
+    if ($trusted) {
+        try {
+            Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -ServiceName $ServiceName -State 'FAILED_OR_CANCELLED' -Reason ([string]$_.Exception.Message)
+        } catch {}
+    }
+    Write-Error ('Privileged operation refused: '+$_.Exception.Message) -ErrorAction Continue
     $exitCode=2
 }
 exit $exitCode

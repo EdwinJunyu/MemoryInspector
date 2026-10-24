@@ -13,19 +13,20 @@ $paths=Get-MiSecurityPaths
 $names=@(
     'MemoryInspector.ps1','Collector.ps1','Worker.ps1','Persistence.ps1',
     'Analyzer.ps1','GuiV4.ps1','ProcessActions.ps1','PrivilegeSecurity.ps1',
-    'PrivilegeBridge.ps1','ElevatedExecutor.ps1','Run_MemoryInspector.cmd',
+    'PrivilegeBridge.ps1','ServiceBridge.ps1','ServiceManagement.ps1',
+    'ElevatedExecutor.ps1','Run_MemoryInspector.cmd',
     'Installer.ps1','Uninstaller.ps1','VERSION'
 )
 foreach ($name in $names) {
     $f=Join-Path $source $name
     if (-not [IO.File]::Exists($f) -or -not (Test-MiNoReparse $f)) { throw ('Missing or reparse source: '+$name) }
 }
-if (([IO.File]::ReadAllText((Join-Path $source 'VERSION'))).Trim() -cne '0.0.6') {
-    throw 'Expected VERSION 0.0.6; installation canceled.'
+if (([IO.File]::ReadAllText((Join-Path $source 'VERSION'))).Trim() -cne '0.0.7') {
+    throw 'Expected VERSION 0.0.7; installation canceled.'
 }
 # Never replace an untrusted directory: refuse to overwrite arbitrary existing files.
 if ([IO.Directory]::Exists($paths.Install)) {
-    [void](Assert-MiTrustedInstallation)
+    [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.6','0.0.7'))
 }
 $parent=Split-Path -Parent $paths.Install
 if (-not [IO.Directory]::Exists($parent)) { throw 'Program Files parent folder missing.' }
@@ -61,12 +62,23 @@ try {
             throw 'Untrusted existing protected subdirectory.'
         }
     }
-    # Create immutable default policy and protected audit; no service approval in M6.
+    # Read/traverse access only for standard users; all protected writes remain admin-only.
+    Set-MiAdminDirectoryAcl -Path $paths.Data -AllowUsersRead $true
+    Set-MiAdminDirectoryAcl -Path $paths.PolicyFolder -AllowUsersRead $true
+    # Create empty administrator-approved service allowlist and recovery ledger.
     if (-not [IO.File]::Exists($paths.Policy)) {
         [IO.File]::WriteAllText($paths.Policy,'{"SchemaVersion":1,"Services":[]}',[Text.UTF8Encoding]::new($false))
-        Set-MiProtectedFileAcl -Path $paths.Policy
+        Set-MiProtectedFileAcl -Path $paths.Policy -AllowUsersRead $true
     } elseif (-not (Test-MiNoReparse $paths.Policy) -or -not (Test-MiAclRestricted $paths.Policy $true)) {
         throw 'Service policy is untrusted.'
+    }
+    # Standard users may read the allowlist for UI only; writes stay administrator-only.
+    Set-MiProtectedFileAcl -Path $paths.Policy -AllowUsersRead $true
+    if (-not [IO.File]::Exists($paths.Recovery)) {
+        [IO.File]::WriteAllText($paths.Recovery,'{"SchemaVersion":1,"Records":[]}',[Text.UTF8Encoding]::new($false))
+        Set-MiProtectedFileAcl -Path $paths.Recovery
+    } elseif (-not (Test-MiNoReparse $paths.Recovery) -or -not (Test-MiAclRestricted $paths.Recovery $true)) {
+        throw 'Service recovery ledger is untrusted.'
     }
     if (-not [IO.File]::Exists($paths.Audit)) {
         [IO.File]::WriteAllText($paths.Audit,'',[Text.UTF8Encoding]::new($false))
@@ -76,7 +88,7 @@ try {
     }
     $dataReady=$true
     $manifest=[pscustomobject]@{
-        SchemaVersion=1; Version='0.0.6'; InstalledUtc=[datetime]::UtcNow.ToString('o')
+        SchemaVersion=1; Version='0.0.7'; InstalledUtc=[datetime]::UtcNow.ToString('o')
         Files=@($entries.ToArray())
     }
     $newManifest=Join-Path $paths.Data ('install-manifest-'+[guid]::NewGuid().ToString('N')+'.tmp')
@@ -100,8 +112,8 @@ try {
         [IO.Directory]::Delete($backup,$true)
     }
     if ($null -ne $oldManifest -and [IO.File]::Exists($oldManifest)) { [IO.File]::Delete($oldManifest) }
-    Write-Host ('Installed MemoryInspector 0.0.6 in '+$paths.Install) -ForegroundColor Green
-    Write-Host 'Milestone 6 only: elevated executor supports Probe, NOT service stopping.'
+    Write-Host ('Installed MemoryInspector 0.0.7 in '+$paths.Install) -ForegroundColor Green
+    Write-Host 'M7: service operations require explicit admin approval, UAC and protected executor verification.'
     Write-Host ('Launch the protected GUI using: '+(Join-Path $paths.Install 'Run_MemoryInspector.cmd'))
 } catch {
     $err=$_.Exception.Message

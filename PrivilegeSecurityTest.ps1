@@ -4,7 +4,8 @@ No UAC prompt, service modification, process termination, or install performed. 
 $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $MyInvocation.MyCommand.Path
 $files=@('PrivilegeSecurity.ps1','PrivilegeBridge.ps1','ElevatedExecutor.ps1',
-    'Installer.ps1','Uninstaller.ps1','MemoryInspector.ps1','GuiV4.ps1')
+    'Installer.ps1','Uninstaller.ps1','MemoryInspector.ps1','GuiV4.ps1',
+    'ServiceManagement.ps1','ServiceBridge.ps1')
 foreach ($f in $files) {
     $tokens=$null;$errors=$null
     [void][Management.Automation.Language.Parser]::ParseFile(
@@ -40,7 +41,7 @@ if ($bridge -notmatch 'Start-Process' -or $bridge -notmatch 'RunAs' -or
 $install=Get-Content -LiteralPath (Join-Path $root 'Installer.ps1') -Raw -Encoding UTF8
 if ($install -notmatch 'Set-MiAdminDirectoryAcl' -or $install -notmatch 'Set-MiProtectedFileAcl' -or
     $install -notmatch 'Assert-MiTrustedInstallation') { throw 'Protected installer safeguards missing.' }
-if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.6') {
+if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.7') {
     throw 'VERSION mismatch.'
 }
 # Lightweight ACL smoke test in a uniquely named throwaway temp directory.
@@ -64,4 +65,4 @@ if (Test-MiAdminToken) {
 } else {
     Write-Host 'INFO: non-admin CI host; disposable ACL fixture skipped.'
 }
-Write-Host 'PASS: M6 protected installer, allow-only Probe, anti-replay and ACL contract.' -ForegroundColor Green
+Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact target name.' -ForegroundColor Green

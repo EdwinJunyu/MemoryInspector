@@ -38,6 +38,18 @@ $audit=Get-Content -LiteralPath $paths.Audit -Raw -Encoding UTF8 -ErrorAction St
 if ($audit -notmatch 'REQUESTED' -or $audit -notmatch 'CONFIRMED') {
     throw 'Protected audit records missing.'
 }
+# M7 protected defaults: no services approved and recovery record empty.
+$policy=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($paths.Policy,[Text.Encoding]::UTF8)) -ErrorAction Stop
+$recovery=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($paths.Recovery,[Text.Encoding]::UTF8)) -ErrorAction Stop
+if (@($policy.Services).Count -ne 0 -or @($recovery.Records).Count -ne 0) { throw 'Unsafe nonempty initial service state.' }
+if (-not (Test-MiAclRestricted $paths.Policy $true) -or -not (Test-MiAclRestricted $paths.Recovery $true)) { throw 'Unprotected service state.' }
+$svcExe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$svcId=[guid]::NewGuid().ToString('N')
+$svcArgs='-NoProfile -ExecutionPolicy RemoteSigned -File "'+$paths.Executor+
+    '" -Operation StopApprovedService -RequestId '+$svcId+' -ServiceName RpcSs'
+$svcProc=Start-Process -FilePath $svcExe -ArgumentList $svcArgs -PassThru -Wait -ErrorAction Stop
+try { if ($svcProc.ExitCode -eq 0) { throw 'Critical service stop should be rejected.' } }
+finally { $svcProc.Dispose() }
 # Modify one installed file as administrator, verify manifest check rejects the next probe,
 # then restore identical bytes. This does NOT run any service operations.
 $target=Join-Path $paths.Install 'PrivilegeBridge.ps1'

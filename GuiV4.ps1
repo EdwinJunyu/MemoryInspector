@@ -233,22 +233,84 @@ function Poll-MiV4Jobs {
 function Show-MiV4Services {
     param([object[]]$Rows)
     $script:ServiceRows=@($Rows)
+    $script:ServiceApprovals=Get-MiServiceApprovalMap
     $script:ServicePids=@{}
     foreach ($s in $Rows) {
         if ([int]$s.ProcessId -gt 0) { $script:ServicePids[[int]$s.ProcessId]=$true }
     }
-    $script:ServiceNote.Text=('{0} 个服务 · 列表只读；Allowlist/停止/恢复属于 Milestone 6-7' -f $Rows.Count)
+    $script:ServiceNote.Text=('{0} 个服务 · M7 服务操作需审核名单、UAC 和独立高权限检查；此列表仅供参考' -f $Rows.Count)
     Render-MiV4Services
     if ($script:AllProcesses.Count -gt 0) { Render-MiV4Grid }
 }
 function Render-MiV4Services {
     $query=$script:ServiceSearch.Text.Trim()
-    $script:ServiceGrid.Rows.Clear()
-    foreach ($s in $script:ServiceRows) {
-        if ($query -and ([string]$s.Name).IndexOf($query,[StringComparison]::OrdinalIgnoreCase) -lt 0 -and
-            ([string]$s.DisplayName).IndexOf($query,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-        [void]$script:ServiceGrid.Rows.Add([object[]]@($s.Name,$s.DisplayName,$s.State,$s.StartMode,$s.ProcessId,'只读 / 未授权'))
+    $previous=Get-MiSelectedService
+    $previousName=if ($null -ne $previous) {[string]$previous.Name} else {''}
+    $script:MiServiceRendering=$true
+    try {
+        $script:ServiceGrid.Rows.Clear()
+        foreach ($service in $script:ServiceRows) {
+            if ($query -and ([string]$service.Name).IndexOf($query,[StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                ([string]$service.DisplayName).IndexOf($query,[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            $approved=$script:ServiceApprovals.ContainsKey([string]$service.Name)
+            $status=if ($approved) {'已批准（仍需逐项安全检查）'} else {'未批准 / 受限'}
+            $index=$script:ServiceGrid.Rows.Add([object[]]@(
+                $service.Name,$service.DisplayName,$service.State,$service.StartMode,$service.ProcessId,$status))
+            $script:ServiceGrid.Rows[$index].Tag=$service
+            if ($previousName -and [string]::Equals($previousName,[string]$service.Name,[StringComparison]::OrdinalIgnoreCase)) {
+                $script:ServiceGrid.Rows[$index].Selected=$true
+            }
+        }
+    } finally { $script:MiServiceRendering=$false }
+    Update-MiV4ServiceButtons
+}
+function Get-MiSelectedService {
+    if ($null -eq $script:ServiceGrid -or $script:ServiceGrid.SelectedRows.Count -lt 1) { return $null }
+    return $script:ServiceGrid.SelectedRows[0].Tag
+}
+function Update-MiV4ServiceButtons {
+    if ($script:MiServiceRendering -or $null -eq $script:MiServiceButtons) { return }
+    $service=Get-MiSelectedService
+    $installed=(Test-MiPrivilegeBridgeInstalled)
+    $busy=($null -ne $script:MiServiceRequest -or $null -ne $script:MiPrivilegeProbe)
+    $enabled=($installed -and -not $busy -and -not (Test-MiElevated) -and $null -ne $service)
+    $approved=$false
+    if ($null -ne $service) { $approved=$script:ServiceApprovals.ContainsKey([string]$service.Name) }
+    $script:MiServiceButtons.Approve.Enabled=$enabled -and -not $approved
+    $script:MiServiceButtons.Revoke.Enabled=$enabled -and $approved
+    $script:MiServiceButtons.Stop.Enabled=$enabled -and $approved -and $service.State -eq 'Running' -and [bool]$service.CanStop
+    $script:MiServiceButtons.Restore.Enabled=$enabled -and $approved -and $service.State -eq 'Stopped'
+}
+function Request-MiV4ServiceAction {
+    param([ValidateSet('ApproveService','RevokeServiceApproval','StopApprovedService','StartPreviouslyStoppedService')][string]$Operation)
+    $service=Get-MiSelectedService
+    if ($null -eq $service -or $null -ne $script:MiServiceRequest -or $null -ne $script:MiPrivilegeProbe) { return }
+    $label=switch ($Operation) {
+        'ApproveService' {'APPROVE'} 'RevokeServiceApproval' {'REVOKE'}
+        'StopApprovedService' {'STOP'} 'StartPreviouslyStoppedService' {'START'}
     }
+    $message=('目标服务：{0} ({1})' -f $service.Name,$service.DisplayName)+[Environment]::NewLine+
+        ('当前状态：{0} · 宿主 PID：{1}' -f $service.State,$service.ProcessId)+[Environment]::NewLine+
+        '系统服务操作可能影响其他软件；即使服务重新启动也不能恢复所有会话状态。'+
+        [Environment]::NewLine+'只有执行器完成独立安全核验后才会执行，继续？'
+    if ([Windows.Forms.MessageBox]::Show($script:Form,$message,'M7 服务操作风险确认',
+        'YesNo','Warning') -ne [Windows.Forms.DialogResult]::Yes) { return }
+    if (-not (Show-MiActionTypedDialog -Prompt ('输入 '+$label+' '+$service.Name+' 确认目标') -Expected ($label+' '+$service.Name))) {
+        return
+    }
+    try {
+        $status=Start-MiServiceRequest -Operation $Operation -ServiceName ([string]$service.Name)
+        if ($status -eq 'UacCancelled') {
+            $script:ServiceNote.Text='用户拒绝 UAC；没有执行服务操作。'
+        } else {
+            $script:ServiceNote.Text=('UAC 已启动：'+$label+' '+$service.Name+'；请在提升权限的窗口中再次输入确认。')
+        }
+        Set-MiStatus $script:ServiceNote.Text
+    } catch {
+        $script:ServiceNote.Text='服务操作未启动：'+$_.Exception.Message
+        Set-MiStatus $script:ServiceNote.Text $true
+    }
+    Update-MiV4ServiceButtons
 }
 function Show-MiV4History {
     param([object[]]$Rows)
@@ -359,6 +421,8 @@ function Initialize-MiV4Gui {
     $script:AllProcesses=@()
     $script:ServicePids=@{}
     $script:ServiceRows=@()
+    $script:ServiceApprovals=@{}
+    $script:MiServiceRendering=$false
     $script:AggregateHistory=@()
     $script:AuxJobs=@{}
     $script:ExitRequested=$false
@@ -485,20 +549,36 @@ function Initialize-MiV4Gui {
     $serviceHeader=New-Object System.Windows.Forms.Panel
     $serviceHeader.Dock='Top';$serviceHeader.Height=68
     $servicePage.Controls.Add($serviceHeader)
-    $script:ServiceNote=New-MiLabel 'Milestone 5：服务页仍然只读；仅普通 GUI 进程可手动安全管理。' 9
+    $script:ServiceNote=New-MiLabel 'M7：受保护服务管理 · 需先安装 0.0.7，并经管理员逐项批准。' 9
     $script:ServiceNote.Dock='Bottom';$script:ServiceNote.Height=26
     $serviceHeader.Controls.Add($script:ServiceNote)
     $script:ServiceSearch=New-Object System.Windows.Forms.TextBox
     $script:ServiceSearch.SetBounds(10,7,245,27);$serviceHeader.Controls.Add($script:ServiceSearch)
     $serviceRefresh=New-MiButton '刷新服务（只读）' 160
     $serviceRefresh.SetBounds(270,5,160,30);$serviceHeader.Controls.Add($serviceRefresh)
+    $script:ServiceActions=New-Object System.Windows.Forms.FlowLayoutPanel
+    $script:ServiceActions.Dock='Bottom';$script:ServiceActions.Height=46
+    $script:ServiceActions.Padding=[Windows.Forms.Padding]::new(10,5,0,0)
+    $serviceApprove=New-MiButton '管理员批准' 120
+    $serviceRevoke=New-MiButton '撤销批准' 120
+    $serviceStop=New-MiButton '受控停止' 120
+    $serviceRestore=New-MiButton '手动恢复' 120
+    foreach ($control in @($serviceApprove,$serviceRevoke,$serviceStop,$serviceRestore)) { $script:ServiceActions.Controls.Add($control) }
+    $script:MiServiceButtons=[pscustomobject]@{Approve=$serviceApprove;Revoke=$serviceRevoke;Stop=$serviceStop;Restore=$serviceRestore}
+    $servicePage.Controls.Add($script:ServiceActions)
     $script:ServiceGrid=New-MiV4DataGrid -Defs @(
         @('Name','ServiceName',25),@('Display','显示名',28),@('State','状态',12),
         @('Start','启动类型',12),@('PID','宿主 PID',9),@('Risk','安全状态',14)
     )
     $servicePage.Controls.Add($script:ServiceGrid);$script:ServiceGrid.BringToFront()
     $script:ServiceSearch.Add_TextChanged({ Render-MiV4Services })
+    $script:ServiceGrid.Add_SelectionChanged({Update-MiV4ServiceButtons})
     $serviceRefresh.Add_Click({Start-MiV4ServicesLoad})
+    $serviceApprove.Add_Click({Request-MiV4ServiceAction -Operation ApproveService})
+    $serviceRevoke.Add_Click({Request-MiV4ServiceAction -Operation RevokeServiceApproval})
+    $serviceStop.Add_Click({Request-MiV4ServiceAction -Operation StopApprovedService})
+    $serviceRestore.Add_Click({Request-MiV4ServiceAction -Operation StartPreviouslyStoppedService})
+    Update-MiV4ServiceButtons
 
     $historyPage=$script:Tabs.TabPages[3]
     $hbar=New-Object System.Windows.Forms.Panel
@@ -549,7 +629,7 @@ function Initialize-MiV4Gui {
     $script:TraySetting.Text='点击 X 时最小化到系统托盘；使用托盘菜单“完全退出”结束程序。'
     $script:TraySetting.Checked=$script:CloseToTray
     $script:TraySetting.Size=[Drawing.Size]::new(650,43);$settingsPanel.Controls.Add($script:TraySetting)
-    $script:MiPrivilegeNote=New-MiLabel 'M6：请先使用 Installer.ps1 完成受保护安装；当前仅支持 UAC Probe，不允许停止服务。' 9
+    $script:MiPrivilegeNote=New-MiLabel 'M7：使用 Installer.ps1 安装 0.0.7。受保护服务操作须 UAC + 管理员再次确认。' 9
     $script:MiPrivilegeNote.Size=[Drawing.Size]::new(750,45)
     $settingsPanel.Controls.Add($script:MiPrivilegeNote)
     $verifyButton=New-MiButton '验证管理员执行器（UAC）' 260
@@ -567,7 +647,7 @@ function Initialize-MiV4Gui {
         }
     })
     $save=New-MiButton '保存 GUI 设置' 170;$settingsPanel.Controls.Add($save)
-    $script:SettingsNote=New-MiLabel '固定诊断窗口为 30 分钟、覆盖率至少 85%；历史保留期 7 天原始 / 90 天聚合（可在持久化 settings.json 调整）。服务仍只读；普通进程操作必须人工确认。' 9
+    $script:SettingsNote=New-MiLabel '诊断窗口 30 分钟，至少 85% 有效样本；历史 7 天原始 / 90 天聚合。M7 服务操作仅能在受保护安装下授权执行；不会直接 Kill 服务宿主。' 9
     $script:SettingsNote.Size=[Drawing.Size]::new(740,60);$settingsPanel.Controls.Add($script:SettingsNote)
     $save.Add_Click({
         try { Save-MiV4Settings }
@@ -584,7 +664,7 @@ function Initialize-MiV4Gui {
     $exitItem=$script:TrayMenu.Items.Add('完全退出')
     $script:TrayIcon=New-Object System.Windows.Forms.NotifyIcon
     $script:TrayIcon.Icon=[Drawing.SystemIcons]::Information
-    $script:TrayIcon.Text='MemoryInspector v0.0.6 · 手动安全操作'
+    $script:TrayIcon.Text='MemoryInspector v0.0.7 · 受控操作'
     $script:TrayIcon.ContextMenuStrip=$script:TrayMenu
     $script:TrayIcon.Visible=$true
     $showItem.Add_Click({$script:Form.Show();$script:Form.WindowState='Normal';$script:Form.Activate()})

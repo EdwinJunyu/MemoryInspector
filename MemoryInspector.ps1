@@ -1,10 +1,10 @@
 ﻿#requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 + 5 + 6 (v0.0.6)
+MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 + 5 + 6 + 7 (v0.0.7)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 Read-only diagnostics plus explicitly confirmed, safety-checked USER GUI process actions. No service changes, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
-Milestone 6 adds a protected UAC Probe executor only. Service mutations remain disabled.
+Milestone 7 adds explicit, admin-approved Windows service operations via the protected executor.
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -27,7 +27,8 @@ $script:GuiPath = Join-Path $script:Root 'GuiV4.ps1'
 $script:ActionPath = Join-Path $script:Root 'ProcessActions.ps1'
 $script:PrivilegeSecurityPath = Join-Path $script:Root 'PrivilegeSecurity.ps1'
 $script:PrivilegeBridgePath = Join-Path $script:Root 'PrivilegeBridge.ps1'
-foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath,$script:GuiPath,$script:ActionPath,$script:PrivilegeSecurityPath,$script:PrivilegeBridgePath)) {
+$script:ServiceBridgePath = Join-Path $script:Root 'ServiceBridge.ps1'
+foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath,$script:GuiPath,$script:ActionPath,$script:PrivilegeSecurityPath,$script:PrivilegeBridgePath,$script:ServiceBridgePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('缺少项目文件：' + $path) }
 }
 
@@ -41,6 +42,7 @@ Add-Type -AssemblyName System.Windows.Forms.DataVisualization
 Initialize-MiActions
 . $script:PrivilegeSecurityPath
 . $script:PrivilegeBridgePath
+. $script:ServiceBridgePath
 
 $script:PeriodMs = 10000
 $script:QueueLimit = 3
@@ -535,6 +537,22 @@ $script:UiTimer.Add_Tick({
             if ($null -ne $script:MiPrivilegeNote) { $script:MiPrivilegeNote.Text=$message }
             Set-MiStatus $message ($probeStatus -ne 'ProbeVerified')
         }
+        $serviceOutcome=Poll-MiServiceRequest
+        if ($null -ne $serviceOutcome) {
+            if ($serviceOutcome.State -eq 'StillPending') {
+                if ($script:MiServiceLastStatus -ne 'StillPending') {
+                    $script:ServiceNote.Text='高权限服务操作仍在执行或等待用户确认；不会自动重试或强制结束。'
+                    Set-MiStatus $script:ServiceNote.Text $true
+                }
+            } else {
+                $script:ServiceNote.Text=('服务操作 '+$serviceOutcome.Operation+' / '+$serviceOutcome.Name+
+                    '：'+$serviceOutcome.State+'。TimedOut/Unknown 不代表服务未发生变化。')
+                Set-MiStatus $script:ServiceNote.Text ($serviceOutcome.State -ne 'Confirmed')
+                Start-MiV4ServicesLoad
+            }
+            $script:MiServiceLastStatus=$serviceOutcome.State
+            Update-MiV4ServiceButtons
+        }
         $timed=Update-MiActionObservation -Snapshot $null
         if ($null -ne $timed) { Set-MiStatus '进程操作观察已超时；已保留已有样本，结果未确认。' $true; Update-MiActionButtons }
         if ($script:RestartPending) {
@@ -688,6 +706,7 @@ try {
     }
     Stop-MiActionObservation
     Close-MiPrivilegeBridge
+    Close-MiServiceBridge
     Close-MiV4Gui
     $script:UiTimer.Dispose()
     $script:Form.Dispose()

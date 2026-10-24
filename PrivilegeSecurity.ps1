@@ -20,6 +20,7 @@ function Get-MiSecurityPaths {
         Results=(Join-Path $data 'results')
         PolicyFolder=(Join-Path $data 'policy')
         Policy=(Join-Path $data 'policy\approved-services.json')
+        Recovery=(Join-Path $data 'policy\service-recovery.json')
         Executor=(Join-Path $install 'ElevatedExecutor.ps1')
     }
 }
@@ -37,9 +38,14 @@ function Test-MiGuidN {
         $Value -cne '00000000000000000000000000000000'
 }
 function Test-MiPrivilegedOperation {
-    param([string]$Operation,[string]$RequestId)
-    # M6 intentionally permits ONLY a harmless UAC readiness probe.
-    return ($Operation -ceq 'Probe') -and (Test-MiGuidN $RequestId)
+    param([string]$Operation,[string]$RequestId,[string]$ServiceName='')
+    if (-not (Test-MiGuidN $RequestId)) { return $false }
+    if ($Operation -ceq 'Probe') { return [string]::IsNullOrWhiteSpace($ServiceName) }
+    if ($Operation -cnotin @('ApproveService','RevokeServiceApproval','StopApprovedService','StartPreviouslyStoppedService')) {
+        return $false
+    }
+    return (-not [string]::IsNullOrWhiteSpace($ServiceName) -and
+        $ServiceName -cmatch '^[A-Za-z0-9_.-]{1,128}$')
 }
 function Test-MiNoReparse {
     param([string]$Path)
@@ -70,6 +76,7 @@ function Test-MiAclRestricted {
     } catch { return $false }
 }
 function Assert-MiTrustedInstallation {
+    param([string[]]$AllowedVersions=@('0.0.7'))
     $paths=Get-MiSecurityPaths
     foreach ($folder in @($paths.Install,$paths.Data,$paths.Replay,(Split-Path -Parent $paths.Audit),$paths.Results,$paths.PolicyFolder)) {
         if (-not (Test-Path -LiteralPath $folder -PathType Container) -or
@@ -86,8 +93,17 @@ function Assert-MiTrustedInstallation {
         -not (Test-MiNoReparse $paths.Manifest) -or
         -not (Test-MiAclRestricted $paths.Manifest $true)) { throw 'Missing or untrusted protected manifest.' }
     $manifest=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($paths.Manifest,[Text.Encoding]::UTF8)) -ErrorAction Stop
-    if ($manifest.SchemaVersion -ne 1 -or $manifest.Version -ne '0.0.6' -or
-        $null -eq $manifest.Files -or @($manifest.Files).Count -lt 8) { throw 'Invalid installation manifest.' }
+    if ($manifest.SchemaVersion -ne 1 -or $AllowedVersions -cnotcontains [string]$manifest.Version -or
+        $null -eq $manifest.Files -or @($manifest.Files).Count -lt 8) { throw 'Invalid installation manifest/version.' }
+    if ($manifest.Version -ceq '0.0.7') {
+        $names=@($manifest.Files | ForEach-Object { [string]$_.Name })
+        foreach ($essential in @('ElevatedExecutor.ps1','PrivilegeSecurity.ps1','ServiceManagement.ps1','ServiceBridge.ps1','VERSION')) {
+            if ($names -cnotcontains $essential) { throw ('Missing M7 component: '+$essential) }
+        }
+        if (-not (Test-Path -LiteralPath $paths.Recovery -PathType Leaf) -or
+            -not (Test-MiNoReparse $paths.Recovery) -or
+            -not (Test-MiAclRestricted $paths.Recovery $true)) { throw 'Untrusted service recovery ledger.' }
+    }
     foreach ($entry in @($manifest.Files)) {
         $name=[string]$entry.Name
         if ($name -cnotmatch '^[A-Za-z0-9_-]+\.(ps1|cmd)$' -and $name -cne 'VERSION') {
@@ -150,11 +166,12 @@ function Set-MiProtectedFileAcl {
     if (-not (Test-MiAclRestricted $Path $true)) { throw 'Protected file ACL verification failed.' }
 }
 function Write-MiPrivilegedAudit {
-    param([string]$RequestId,[string]$State,[string]$Reason)
+    param([string]$RequestId,[string]$State,[string]$Reason,
+        [string]$Action='Probe',[string]$ServiceName='')
     $paths=Get-MiSecurityPaths
     $obj=[ordered]@{
         SchemaVersion=1; Utc=[datetime]::UtcNow.ToString('o'); RequestId=$RequestId
-        Action='Probe'; State=$State; Reason=$Reason
+        Action=$Action; ServiceName=$ServiceName; State=$State; Reason=$Reason
         ExecutorSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     }
     $line=($obj | ConvertTo-Json -Compress -Depth 4)+[Environment]::NewLine

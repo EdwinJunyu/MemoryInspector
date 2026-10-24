@@ -20,6 +20,7 @@ jobs:
           .\GuiV4Test.ps1
           .\ProcessActionsTest.ps1
           .\PrivilegeSecurityTest.ps1
+          .\ServiceManagementTest.ps1
   protected-install:
     needs: regression
     runs-on: windows-latest
