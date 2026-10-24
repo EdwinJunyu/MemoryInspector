@@ -65,3 +65,12 @@ try {
 }
 [void](Assert-MiTrustedInstallation)
 Write-Host 'PASS: actual M6 protected install, UAC execution contract, replay denial, audit, and SHA256 rejection.' -ForegroundColor Green
+
+# M8 disposable-runner uninstall test: no production installation involved.
+function Read-Host { param([string]$Prompt) return 'UNINSTALL MEMORYINSPECTOR' }
+& (Join-Path $root 'Uninstaller.ps1')
+if ([IO.Directory]::Exists($paths.Install)) { throw 'Protected uninstall left the application files behind.' }
+if (-not [IO.File]::Exists($paths.Audit) -or -not [IO.File]::Exists($paths.Policy)) {
+    throw 'Uninstall unexpectedly removed protected audit / allowlist records.'
+}
+Write-Host 'PASS: M8 protected uninstall retained privileged audit and policy data.' -ForegroundColor Green

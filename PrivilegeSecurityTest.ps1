@@ -41,7 +41,7 @@ if ($bridge -notmatch 'Start-Process' -or $bridge -notmatch 'RunAs' -or
 $install=Get-Content -LiteralPath (Join-Path $root 'Installer.ps1') -Raw -Encoding UTF8
 if ($install -notmatch 'Set-MiAdminDirectoryAcl' -or $install -notmatch 'Set-MiProtectedFileAcl' -or
     $install -notmatch 'Assert-MiTrustedInstallation') { throw 'Protected installer safeguards missing.' }
-if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.7') {
+if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.8') {
     throw 'VERSION mismatch.'
 }
 # Lightweight ACL smoke test in a uniquely named throwaway temp directory.

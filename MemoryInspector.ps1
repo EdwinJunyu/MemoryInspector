@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 + 5 + 6 + 7 (v0.0.7)
+MemoryInspector v2 / Milestones 1–8 (v0.0.8 release candidate)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 Read-only diagnostics plus explicitly confirmed, safety-checked USER GUI process actions. No service changes, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.

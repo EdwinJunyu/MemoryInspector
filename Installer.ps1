@@ -21,12 +21,12 @@ foreach ($name in $names) {
     $f=Join-Path $source $name
     if (-not [IO.File]::Exists($f) -or -not (Test-MiNoReparse $f)) { throw ('Missing or reparse source: '+$name) }
 }
-if (([IO.File]::ReadAllText((Join-Path $source 'VERSION'))).Trim() -cne '0.0.7') {
-    throw 'Expected VERSION 0.0.7; installation canceled.'
+if (([IO.File]::ReadAllText((Join-Path $source 'VERSION'))).Trim() -cne '0.0.8') {
+    throw 'Expected VERSION 0.0.8; installation canceled.'
 }
 # Never replace an untrusted directory: refuse to overwrite arbitrary existing files.
 if ([IO.Directory]::Exists($paths.Install)) {
-    [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.6','0.0.7'))
+    [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8'))
 }
 $parent=Split-Path -Parent $paths.Install
 if (-not [IO.Directory]::Exists($parent)) { throw 'Program Files parent folder missing.' }
@@ -88,7 +88,7 @@ try {
     }
     $dataReady=$true
     $manifest=[pscustomobject]@{
-        SchemaVersion=1; Version='0.0.7'; InstalledUtc=[datetime]::UtcNow.ToString('o')
+        SchemaVersion=1; Version='0.0.8'; InstalledUtc=[datetime]::UtcNow.ToString('o')
         Files=@($entries.ToArray())
     }
     $newManifest=Join-Path $paths.Data ('install-manifest-'+[guid]::NewGuid().ToString('N')+'.tmp')
@@ -112,8 +112,8 @@ try {
         [IO.Directory]::Delete($backup,$true)
     }
     if ($null -ne $oldManifest -and [IO.File]::Exists($oldManifest)) { [IO.File]::Delete($oldManifest) }
-    Write-Host ('Installed MemoryInspector 0.0.7 in '+$paths.Install) -ForegroundColor Green
-    Write-Host 'M7: service operations require explicit admin approval, UAC and protected executor verification.'
+    Write-Host ('Installed MemoryInspector 0.0.8 in '+$paths.Install) -ForegroundColor Green
+    Write-Host 'M8 release-candidate: run complete acceptance before stable release.'
     Write-Host ('Launch the protected GUI using: '+(Join-Path $paths.Install 'Run_MemoryInspector.cmd'))
 } catch {
     $err=$_.Exception.Message
