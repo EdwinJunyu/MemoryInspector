@@ -48,6 +48,8 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          . .\PrivilegeSecurity.ps1
+          if (-not (Test-MiAdminToken)) { throw 'Runner must be elevated; a skipped protected install is NOT a passing acceptance test.' }
           .\PrivilegeInstallTest.ps1
 
 # Hosted runner runs Windows Server 2022, not Windows 10 or 11 desktop.
