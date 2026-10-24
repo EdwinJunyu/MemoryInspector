@@ -44,9 +44,10 @@ Initialize-MiActions
 . $script:PrivilegeBridgePath
 . $script:ServiceBridgePath
 
-$script:PeriodMs = 10000
+$script:PeriodMs = 5000
 $script:QueueLimit = 3
-$script:HistoryLimit = 180
+# 图表保留完整的 30 分钟；按最密 5 秒周期预留边界容量，切换周期不会截短旧窗口。
+$script:HistoryLimit = [int][math]::Ceiling(1800.0 / 5.0) + 2
 $script:History = New-Object 'System.Collections.Generic.List[object]'
 $script:PreviousInstances = @{}
 $script:CurrentProcesses = @()
@@ -186,7 +187,11 @@ function Restore-MiGuiHistory {
 function Add-MiHistory {
     param($Snapshot)
     $script:History.Add($Snapshot)
-    if ($script:History.Count -gt $script:HistoryLimit) { $script:History.RemoveAt(0) }
+    $cutoff = ([datetime]$Snapshot.CaptureEndUtc).AddMinutes(-30)
+    while ($script:History.Count -gt 0 -and
+        ([datetime]$script:History[0].CaptureEndUtc -lt $cutoff -or $script:History.Count -gt $script:HistoryLimit)) {
+        $script:History.RemoveAt(0)
+    }
 }
 function Get-MiSelectedProcess {
     if ($script:Grid.SelectedRows.Count -eq 0) { return $null }
@@ -580,8 +585,8 @@ $script:UiTimer.Add_Tick({
             Set-MiStatus ('后台采样器意外退出。可点击“重启采样器”。' + $extra) $true
             [void](Dispose-MiCompletedWorker)
         } elseif ($null -ne $script:LastReceiveUtc -and
-            ([datetime]::UtcNow-$script:LastReceiveUtc).TotalSeconds -gt 25) {
-            Set-MiStatus '超过 25 秒未收到新样本：后台采样可能很慢或已卡住，当前画面可能过期。' $true
+            ([datetime]::UtcNow-$script:LastReceiveUtc).TotalSeconds -gt [math]::Max(25,2.5*$script:PeriodMs/1000.0)) {
+            Set-MiStatus '已超过当前采样周期的等待上限：后台采样可能很慢或已卡住，当前画面可能过期。' $true
         }
     } catch {
         Set-MiStatus ('界面更新失败：' + $_.Exception.Message) $true

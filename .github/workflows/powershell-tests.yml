@@ -28,7 +28,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          .\AcceptanceSoak.ps1 -DurationMinutes 1 -IntervalSeconds 10 -OutputDirectory '.acceptance-ci'
+          .\AcceptanceSoak.ps1 -DurationMinutes 1 -IntervalSeconds 5 -OutputDirectory '.acceptance-ci'
       - name: Upload collector evidence
         if: always()
         uses: actions/upload-artifact@v4

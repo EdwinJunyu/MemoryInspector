@@ -24,6 +24,26 @@ function Invoke-MiTestExecutor {
 }
 & (Join-Path $root 'Installer.ps1')
 [void](Assert-MiTrustedInstallation)
+# P1-03：仅 disposable runner，验证真实受保护目录内持有独占句柄时的 ACL 设置及锁释放。
+# 不请求任何 SCM 变更，不删除锁文件；该部分覆盖单元测试中模拟 ACL 无法验证的 Windows 行为。
+. (Join-Path $paths.Install 'ServiceManagement.ps1')
+foreach ($kind in @('Target','Policy','Recovery')) {
+    $held=Enter-MiServiceLock -Kind $kind -Name 'MemoryInspector.P1DedicatedFixture'
+    try {
+        $leaf=if ($kind -eq 'Target') {'service-memoryinspector.p1dedicatedfixture.lock'} else {$kind.ToLowerInvariant()+'.lock'}
+        $lockPath=Join-Path $paths.PolicyFolder $leaf
+        if (-not (Test-MiAclRestricted $lockPath $true) -or -not (Test-MiNoReparse $lockPath)) {
+            throw 'Protected operation lock ACL/path check failed.'
+        }
+        $refused=$false
+        try {$unexpected=Enter-MiServiceLock -Kind $kind -Name 'memoryinspector.p1dedicatedfixture' -TimeoutMilliseconds 0}
+        catch {$refused=$true}
+        if (-not $refused) {$unexpected.Dispose();throw 'Held protected lock was acquired twice.'}
+    } finally {$held.Dispose()}
+    $reopened=Enter-MiServiceLock -Kind $kind -Name 'memoryinspector.p1dedicatedfixture'
+    $reopened.Dispose()
+}
+Write-Host 'PASS: protected target/policy/recovery lock ACLs, exclusion and release.' -ForegroundColor Green
 $id=[guid]::NewGuid().ToString('N')
 if ((Invoke-MiTestExecutor -Operation Probe -RequestId $id) -ne 0) {
     throw 'Real protected Probe failed.'

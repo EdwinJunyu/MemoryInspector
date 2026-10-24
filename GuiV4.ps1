@@ -132,7 +132,9 @@ function Add-MiV4ProcessHistory {
             $list.Add([pscustomobject]@{Utc=$time;PrivateBytes=$p.PrivateBytes;WorkingBytes=$p.WorkingBytes})
         }
         while ($list.Count -gt 0 -and $list[0].Utc -lt $cutoff) { $list.RemoveAt(0) }
-        while ($list.Count -gt 180) { $list.RemoveAt(0) }
+        # 显示缓存按支持的最密周期保留全窗口；诊断仍由后台分析器独立审核证据。
+        $capacity=[int][math]::Ceiling(1800.0/5.0)+2
+        while ($list.Count -gt $capacity) { $list.RemoveAt(0) }
     }
     foreach ($key in @($script:ProcessTrend.Keys)) {
         $list=$script:ProcessTrend[$key]
@@ -351,7 +353,8 @@ function Save-MiV4Settings {
     try {
         [IO.File]::WriteAllText($tmp,($new|ConvertTo-Json -Depth 3),[Text.UTF8Encoding]::new($false))
         if ([IO.File]::Exists($script:UiSettingsPath)) {
-            [IO.File]::Replace($tmp,$script:UiSettingsPath,$null)
+            # PS5.1 的重载绑定会把普通 $null 转成空路径，必须传入真正的空字符串引用。
+            [IO.File]::Replace($tmp,$script:UiSettingsPath,[NullString]::Value)
         } else { [IO.File]::Move($tmp,$script:UiSettingsPath) }
     } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
     $script:PeriodMs=[int]$new.SamplingSeconds*1000
@@ -609,7 +612,7 @@ function Initialize-MiV4Gui {
     $settingsPage.Controls.Add($settingsPanel)
     $head=New-MiLabel '用户界面与监控偏好（仅影响当前用户）' 12 $true
     $head.Size=[Drawing.Size]::new(640,44);$settingsPanel.Controls.Add($head)
-    $periodLabel=New-MiLabel '采样间隔（秒）：保存后重启采样器生效，默认 10 秒。' 9
+    $periodLabel=New-MiLabel '采样间隔（秒）：保存后重启采样器生效，默认 5 秒。' 9
     $periodLabel.Size=[Drawing.Size]::new(640,28);$settingsPanel.Controls.Add($periodLabel)
     $script:SampleSetting=New-Object System.Windows.Forms.NumericUpDown
     $script:SampleSetting.Minimum=5;$script:SampleSetting.Maximum=60

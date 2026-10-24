@@ -20,8 +20,24 @@ function Get-MiInstanceKey {
     return ('{0}:{1}:{2}' -f $BootId,[int]$Process.PID,[long]$Process.StartUtcTicks)
 }
 
+function Get-MiAnalysisParameters {
+    param([ValidateRange(5,60)][int]$IntervalSeconds=5)
+    # 窗口包含首尾采样点；不能把 1800 / 周期的近似值当成精确样本数。
+    $expected = [int][math]::Floor(1800.0 / $IntervalSeconds) + 1
+    return [pscustomobject]@{
+        IntervalSeconds=$IntervalSeconds;WindowSeconds=1800;BinSeconds=300
+        ExpectedSampleCount=$expected
+        MinimumSampleCount=[int][math]::Ceiling($expected*0.85)
+        HistoryCapacity=($expected+[int][math]::Ceiling($expected*0.20)+2)
+        MinimumCoverageRatio=0.85
+        BoundaryToleranceSeconds=($IntervalSeconds/2.0)
+        MaximumGapSeconds=[math]::Max(60,3*$IntervalSeconds)
+    }
+}
+
 function New-MiAnalyzer {
-    param([string]$BootId,[string]$Root,[int]$WindowMinutes=30)
+    param([string]$BootId,[string]$Root,[int]$WindowMinutes=30,
+        [ValidateRange(5,60)][int]$IntervalSeconds=5)
     if ($WindowMinutes -ne 30) { throw 'Milestone 3 uses a fixed 30-minute diagnostic window.' }
     $usableBoot = -not [string]::IsNullOrWhiteSpace($BootId) -and $BootId -ne 'BootUnavailable'
     return [pscustomobject]@{
@@ -34,9 +50,52 @@ function New-MiAnalyzer {
         HistoricalLoadedUtc = [datetime]::MinValue
         LastCaptureUtc = [datetime]::MinValue
         WindowMinutes = $WindowMinutes
+        Parameters = (Get-MiAnalysisParameters -IntervalSeconds $IntervalSeconds)
+        IntervalSeconds = $IntervalSeconds
+        ContinuityReason = $null
+        WindowResetCount = 0
         GrowthThresholdBytes = [long]512MB
         GrowthThresholdRatio = [double]0.20
     }
+}
+
+function Set-MiAnalyzerInterval {
+    param($Analyzer,[ValidateRange(5,60)][int]$IntervalSeconds)
+    if ($Analyzer.IntervalSeconds -eq $IntervalSeconds) { return }
+    # 改变周期后重新积累完整窗口，防止旧高密度样本伪装成新周期的充分证据。
+    $Analyzer.ContinuityReason = ('采样周期由 {0} 秒变为 {1} 秒，已重新建立分析窗口。' -f $Analyzer.IntervalSeconds,$IntervalSeconds)
+    $Analyzer.IntervalSeconds=$IntervalSeconds
+    $Analyzer.Parameters=Get-MiAnalysisParameters -IntervalSeconds $IntervalSeconds
+    $Analyzer.Tracks.Clear()
+    $Analyzer.PoolHistory.Clear()
+    $Analyzer.LastCaptureUtc=[datetime]::MinValue
+    $Analyzer.WindowResetCount++
+}
+
+function Limit-MiAnalysisHistory {
+    param($Analyzer,$Samples,[datetime]$NowUtc)
+    $cutoff=$NowUtc.AddSeconds(-$Analyzer.Parameters.WindowSeconds-$Analyzer.Parameters.BoundaryToleranceSeconds)
+    while ($Samples.Count -gt 0 -and $Samples[0].Utc -lt $cutoff) { $Samples.RemoveAt(0) }
+    if ($Samples.Count -le $Analyzer.Parameters.HistoryCapacity) { return }
+    # 旧文件没有周期字段时，按实际时间戳中最密的受支持周期增加容量，不能只留下当前周期的尾部数量。
+    $retentionInterval=$Analyzer.IntervalSeconds
+    for ($i=1;$i -lt $Samples.Count;$i++) {
+        $delta=($Samples[$i].Utc-$Samples[$i-1].Utc).TotalSeconds
+        if ($delta -gt 0 -and $delta -lt $retentionInterval) {
+            $retentionInterval=[math]::Max(5,[int][math]::Floor($delta))
+        }
+    }
+    $Analyzer.Parameters.HistoryCapacity=[math]::Max($Analyzer.Parameters.HistoryCapacity,
+        (Get-MiAnalysisParameters -IntervalSeconds $retentionInterval).HistoryCapacity)
+    if ($Samples.Count -le $Analyzer.Parameters.HistoryCapacity) { return }
+    # 超过 5 秒上限密度的突发样本按固定 UTC 时间槽合并，避免随窗口锚点移动反复合并造成历史缺口。
+    $slots=@{}
+    foreach ($point in $Samples) {
+        $slot=[long][math]::Floor($point.Utc.Ticks/([double][timespan]::TicksPerSecond*5))
+        $slots[$slot]=$point
+    }
+    $Samples.Clear()
+    foreach ($slot in @($slots.Keys | Sort-Object)) { $Samples.Add($slots[$slot]) }
 }
 
 function Add-MiTrackSample {
@@ -61,9 +120,7 @@ function Add-MiTrackSample {
         $list = $Analyzer.Tracks[$key].Samples
         if ($list.Count -gt 0 -and $utc -le $list[$list.Count-1].Utc) { continue }
         $list.Add([pscustomobject]@{Utc=$utc;Bytes=$bytes})
-        $cutoff = $utc.AddMinutes(-30)
-        while ($list.Count -gt 0 -and $list[0].Utc -lt $cutoff) { $list.RemoveAt(0) }
-        while ($list.Count -gt 185) { $list.RemoveAt(0) }
+        Limit-MiAnalysisHistory -Analyzer $Analyzer -Samples $list -NowUtc $utc
     }
     # A process can exit, but stale traces must not accumulate indefinitely.
     if (-not $Historical) {
@@ -78,8 +135,10 @@ function Add-MiTrackSample {
 }
 
 function Get-MiRecentProcessRecords {
-    param([string]$Root,[datetime]$NowUtc)
+    param([string]$Root,[datetime]$NowUtc,[ValidateRange(5,60)][int]$IntervalSeconds=5)
     if ([string]::IsNullOrWhiteSpace($Root)) { return @() }
+    # 旧 schema=1 没有周期字段，恢复读取量按所有受支持周期中最密的 5 秒计算。
+    $tailCapacity=(Get-MiAnalysisParameters -IntervalSeconds 5).HistoryCapacity
     $records = New-Object 'System.Collections.Generic.List[object]'
     foreach ($day in @($NowUtc.Date.AddDays(-1),$NowUtc.Date)) {
         $date = $day.ToString('yyyy-MM-dd')
@@ -87,8 +146,7 @@ function Get-MiRecentProcessRecords {
         $raw = Join-Path (Join-Path $Root 'process') $filename
         $recent = @()
         if ([IO.File]::Exists($raw)) {
-            # 240 records covers a 30-minute window at 10-second cadence.
-            $recent = @(Read-MiJsonTail -Path $raw -Count 240)
+            $recent = @(Read-MiJsonTail -Path $raw -Count $tailCapacity)
         } else {
             # M2 may compress yesterday's JSONL after midnight.
             $archive = Join-Path (Join-Path $Root 'archives') ('raw-'+$date+'.zip')
@@ -106,7 +164,7 @@ function Get-MiRecentProcessRecords {
                             while (-not $reader.EndOfStream) {
                                 $line = $reader.ReadLine()
                                 $tail.Enqueue($line)
-                                if ($tail.Count -gt 240) { [void]$tail.Dequeue() }
+                                if ($tail.Count -gt $tailCapacity) { [void]$tail.Dequeue() }
                             }
                             foreach ($line in $tail) {
                                 try {
@@ -122,7 +180,7 @@ function Get-MiRecentProcessRecords {
         foreach ($r in $recent) {
             try {
                 $utc = ([datetime]$r.CaptureEndUtc).ToUniversalTime()
-                if ($utc -ge $NowUtc.AddMinutes(-30) -and $utc -le $NowUtc -and $r.RecordType -eq 'ProcessSnapshot') {
+                if ($utc -ge $NowUtc.AddSeconds(-1800-$IntervalSeconds/2.0) -and $utc -le $NowUtc -and $r.RecordType -eq 'ProcessSnapshot') {
                     $records.Add($r)
                 }
             } catch {}
@@ -135,8 +193,19 @@ function Restore-MiAnalyzer {
     param($Analyzer,[datetime]$NowUtc=[datetime]::UtcNow)
     if (-not $Analyzer.CanRestore -or [string]::IsNullOrWhiteSpace($Analyzer.Root)) { return 0 }
     $count = 0
-    foreach ($r in @(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc)) {
+    foreach ($r in @(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc -IntervalSeconds $Analyzer.IntervalSeconds)) {
         if ($r.ProcessStatus -eq 'Failed') { continue }
+        if ($null -ne $r.IntervalSeconds) {
+            $savedInterval=0
+            if (-not [int]::TryParse([string]$r.IntervalSeconds,[ref]$savedInterval) -or $savedInterval -lt 5 -or $savedInterval -gt 60) { continue }
+            if ($savedInterval -ne $Analyzer.IntervalSeconds) {
+                # 持久化记录中的明确周期切换也是连续性边界，不能把切换前后同周期的两段历史拼接起来。
+                $Analyzer.Tracks.Clear()
+                $Analyzer.PoolHistory.Clear()
+                $Analyzer.ContinuityReason='历史中检测到其他采样周期，已从该断点后重新建立分析窗口。'
+                continue
+            }
+        }
         # Existing M2 ProcessInstanceId contains the boot id, PID and start time.
         $matching = New-Object 'System.Collections.Generic.List[object]'
         foreach ($p in @($r.Items)) {
@@ -215,6 +284,14 @@ function Get-MiProcessAnomaly {
         AnomalyState = 'InsufficientEvidence'
         EvidenceQuality = 'Insufficient'
         ValidSampleCount = 0
+        RawSampleCount = 0
+        ExpectedSampleCount = $Analyzer.Parameters.ExpectedSampleCount
+        MinimumSampleCount = $Analyzer.Parameters.MinimumSampleCount
+        IntervalSeconds = $Analyzer.IntervalSeconds
+        MaximumGapSeconds = $null
+        SegmentExpectedSampleCounts = @()
+        SegmentValidSampleCounts = @()
+        ContinuityReason = $Analyzer.ContinuityReason
         CoverageRatio = 0.0
         AnalysisWindowMinutes = 30
         BaselinePrivateBytes = $null
@@ -229,29 +306,65 @@ function Get-MiProcessAnomaly {
     }
     if ($null -eq $key -or -not $Analyzer.Tracks.ContainsKey($key)) { return [pscustomobject]$report }
     $samples = @($Analyzer.Tracks[$key].Samples.ToArray() | Where-Object {
-        $_.Utc -ge $NowUtc.AddMinutes(-30) -and $_.Utc -le $NowUtc
+        $_.Utc -ge $NowUtc.AddSeconds(-$Analyzer.Parameters.WindowSeconds-$Analyzer.Parameters.BoundaryToleranceSeconds) -and $_.Utc -le $NowUtc
     } | Sort-Object Utc)
-    $report.ValidSampleCount = $samples.Count
-    $report.CoverageRatio = [math]::Round([math]::Min([double]1.0,([double]$samples.Count / 180.0)),3)
-    if ($samples.Count -lt 153 -or ($samples[$samples.Count-1].Utc-$samples[0].Utc).TotalMinutes -lt 29.0) {
-        $report.Explanation = ('30 分钟窗口需要至少 153/180 个有效样本并覆盖约 29 分钟；当前 {0}/180。' -f $samples.Count)
-        return [pscustomobject]$report
+    $report.RawSampleCount=$samples.Count
+    # 按当前调度周期的时间槽计算覆盖，一个时间槽至多贡献一份证据。
+    # 最新时刻是调度锚点，四舍五入允许小幅采集完成时间抖动，不能靠密集补采填平休眠缺口。
+    $slots=@{}
+    $lastSlot=$Analyzer.Parameters.ExpectedSampleCount-1
+    foreach ($point in $samples) {
+        $slot=[int][math]::Round(($NowUtc-$point.Utc).TotalSeconds/$Analyzer.IntervalSeconds,
+            [MidpointRounding]::AwayFromZero)
+        if ($slot -ge 0 -and $slot -le $lastSlot) { $slots[$slot]=$point }
     }
+    # 半周期只用于端点的槽归属，所有跨度和缺口验证都使用真正归入预期槽的代表点。
+    $evidence=@($slots.Values | Sort-Object Utc)
+    $report.ValidSampleCount=$slots.Count
+    $coverage=[double]$slots.Count/$Analyzer.Parameters.ExpectedSampleCount
+    $report.CoverageRatio=[math]::Round($coverage,3)
     $bins = @()
     for ($i=0;$i -lt 6;$i++) { $bins += ,(New-Object 'System.Collections.Generic.List[object]') }
-    $windowStart = $NowUtc.AddMinutes(-30)
-    foreach ($point in $samples) {
-        $slot = [int][math]::Floor(($point.Utc-$windowStart).TotalSeconds / 300.0)
-        $slot = [math]::Max(0,[math]::Min(5,$slot))
-        $bins[$slot].Add([double]$point.Bytes)
+    $expectedBins=@(0,0,0,0,0,0)
+    $windowStart=$NowUtc.AddSeconds(-$Analyzer.Parameters.WindowSeconds)
+    for ($slot=0;$slot -le $lastSlot;$slot++) {
+        # 分段边界用预期调度点归属；最后分段包含 NowUtc，避免任意周期的边界重复计数。
+        $nominalUtc=$NowUtc.AddSeconds(-$slot*$Analyzer.IntervalSeconds)
+        $bin=[int][math]::Floor(($nominalUtc-$windowStart).TotalSeconds/$Analyzer.Parameters.BinSeconds)
+        $bin=[math]::Max(0,[math]::Min(5,$bin))
+        $expectedBins[$bin]++
+        if ($slots.ContainsKey($slot)) { $bins[$bin].Add([double]$slots[$slot].Bytes) }
+    }
+    $report.SegmentExpectedSampleCounts=$expectedBins
+    $report.SegmentValidSampleCounts=@($bins | ForEach-Object { $_.Count })
+    if ($evidence.Count -eq 0) { return [pscustomobject]$report }
+    $span=($evidence[$evidence.Count-1].Utc-$evidence[0].Utc).TotalSeconds
+    $latestAge=($NowUtc-$evidence[$evidence.Count-1].Utc).TotalSeconds
+    $largestGap=0.0
+    for ($i=1;$i -lt $evidence.Count;$i++) {
+        $largestGap=[math]::Max($largestGap,($evidence[$i].Utc-$evidence[$i-1].Utc).TotalSeconds)
+    }
+    $report.MaximumGapSeconds=$largestGap
+    if ($coverage -lt $Analyzer.Parameters.MinimumCoverageRatio -or
+        $span -lt ($Analyzer.Parameters.WindowSeconds-$Analyzer.IntervalSeconds) -or
+        $latestAge -gt $Analyzer.IntervalSeconds) {
+        $report.Explanation=('30 分钟窗口需 {0}/{1} 个独立时间槽且覆盖完整跨度；当前 {2}/{1}，跨度 {3:N0} 秒。' -f
+            $Analyzer.Parameters.MinimumSampleCount,$Analyzer.Parameters.ExpectedSampleCount,$slots.Count,$span)
+        return [pscustomobject]$report
+    }
+    if ($largestGap -gt $Analyzer.Parameters.MaximumGapSeconds) {
+        $report.Explanation=('采样存在 {0:N0} 秒时间缺口，超过当前周期允许的 {1:N0} 秒，继续收集连续证据。' -f
+            $largestGap,$Analyzer.Parameters.MaximumGapSeconds)
+        return [pscustomobject]$report
     }
     $medians = @()
-    foreach ($bin in $bins) {
-        if ($bin.Count -lt 15) {
+    for ($i=0;$i -lt 6;$i++) {
+        $minimum=[int][math]::Ceiling($expectedBins[$i]*$Analyzer.Parameters.MinimumCoverageRatio)
+        if ($bins[$i].Count -lt $minimum) {
             $report.Explanation = '至少一个五分钟分段的有效样本不足，暂不判断增长趋势。'
             return [pscustomobject]$report
         }
-        $medians += [double](Get-MiMedian -Values $bin.ToArray())
+        $medians += [double](Get-MiMedian -Values $bins[$i].ToArray())
     }
     $baseline = [double]$medians[0]
     $growth = [double]($medians[5]-$baseline)
@@ -307,8 +420,7 @@ function Get-MiMemoryPressure {
         if ($list.Count -eq 0 -or $NowUtc -gt $list[$list.Count-1].Utc) {
             $list.Add([pscustomobject]@{Utc=$NowUtc;Bytes=[long]$System.NonpagedPoolBytes})
         }
-        while($list.Count -gt 0 -and $list[0].Utc -lt $NowUtc.AddMinutes(-30)) { $list.RemoveAt(0) }
-        while($list.Count -gt 185) { $list.RemoveAt(0) }
+        Limit-MiAnalysisHistory -Analyzer $Analyzer -Samples $list -NowUtc $NowUtc
         if ($list.Count -gt 1 -and ($NowUtc-$list[0].Utc).TotalMinutes -ge 20) {
             $poolDelta = [long]$System.NonpagedPoolBytes - [long]$list[0].Bytes
             $result.NonpagedPoolTrend = $(if ($poolDelta -ge 128MB) {'Rising'} else {'NotRising'})
@@ -319,8 +431,26 @@ function Get-MiMemoryPressure {
 
 function Invoke-MiDiagnosis {
     param($Analyzer,$Snapshot)
+    if ($null -ne $Snapshot.IntervalSeconds) {
+        $interval=0
+        if (-not [int]::TryParse([string]$Snapshot.IntervalSeconds,[ref]$interval) -or $interval -lt 5 -or $interval -gt 60) {
+            return [pscustomobject]@{
+                Status='InvalidCadence';Reports=@();Pressure=[pscustomobject]@{State='Unknown'}
+                Error='采样周期无效，未使用该样本进行诊断。'
+            }
+        }
+        Set-MiAnalyzerInterval -Analyzer $Analyzer -IntervalSeconds $interval
+    }
     $utc = ([datetime]$Snapshot.CaptureEndUtc).ToUniversalTime()
     if ($Analyzer.LastCaptureUtc -ne [datetime]::MinValue -and $utc -le $Analyzer.LastCaptureUtc) {
+        if ($utc -lt $Analyzer.LastCaptureUtc) {
+            # 回拨产生时间断点，拒绝本轮并清空窗口；后续新样本可以重新积累，避免永久停滞。
+            $Analyzer.Tracks.Clear()
+            $Analyzer.PoolHistory.Clear()
+            $Analyzer.LastCaptureUtc=[datetime]::MinValue
+            $Analyzer.ContinuityReason='检测到采样时间回拨，已重新建立分析窗口。'
+            $Analyzer.WindowResetCount++
+        }
         return [pscustomobject]@{
             Status='Stale';Reports=@();Pressure=[pscustomobject]@{State='Unknown'}
             Error='检测到倒退或重复的采样时间，已忽略本轮诊断。'

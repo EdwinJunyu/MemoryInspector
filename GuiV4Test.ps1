@@ -37,4 +37,130 @@ $main=Get-Content -LiteralPath (Join-Path $root 'MemoryInspector.ps1') -Raw -Enc
 if ($main -notmatch 'Initialize-MiV4Gui' -or $main -notmatch 'Poll-MiV4Jobs' -or $main -notmatch 'Close-MiV4Gui') {
     throw 'GUI integration missing lifecycle calls.'
 }
-Write-Host 'PASS: M4 syntax, safe classification, search, sorting, CSV guards and integration.' -ForegroundColor Green
+# P1：真正调用现有 GUI 缓存函数，最密周期必须保留 30 分钟，旧数据按时间淘汰。
+$script:ProcessTrend=@{}
+$base=[datetime]::SpecifyKind([datetime]'2026-10-23T10:00:00',[DateTimeKind]::Utc)
+for ($i=0;$i -le 360;$i++) {
+    Add-MiV4ProcessHistory -Snapshot ([pscustomobject]@{
+        CaptureEndUtc=$base.AddSeconds($i*5)
+        Processes=[pscustomobject]@{Status='Success';Items=@($process)}
+    })
+}
+$trace=$script:ProcessTrend['42:100']
+if ($trace.Count -ne 361 -or ($trace[$trace.Count-1].Utc-$trace[0].Utc).TotalMinutes -ne 30) {
+    throw '5-second process chart history cannot retain the full 30-minute window.'
+}
+Add-MiV4ProcessHistory -Snapshot ([pscustomobject]@{
+    CaptureEndUtc=$base.AddHours(2)
+    Processes=[pscustomobject]@{Status='Success';Items=@($process)}
+})
+if ($script:ProcessTrend['42:100'].Count -ne 1) { throw 'Expired process chart data was not removed.' }
+
+# 仅提取纯缓存函数，不启动 WinForms，验证总览图表保持相同的时间窗口。
+$tokens=$null;$errors=$null
+$mainAst=[Management.Automation.Language.Parser]::ParseInput($main,[ref]$tokens,[ref]$errors)
+$historyFunction=$mainAst.Find({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Add-MiHistory'
+},$true)
+. ([scriptblock]::Create($historyFunction.Extent.Text))
+$script:History=New-Object 'System.Collections.Generic.List[object]'
+$script:HistoryLimit=362
+for ($i=0;$i -le 360;$i++) { Add-MiHistory ([pscustomobject]@{CaptureEndUtc=$base.AddSeconds($i*5)}) }
+if ($script:History.Count -ne 361) { throw 'Overview chart truncated 5-second history.' }
+Add-MiHistory ([pscustomobject]@{CaptureEndUtc=$base.AddHours(2)})
+if ($script:History.Count -ne 1) { throw 'Overview chart kept expired data.' }
+if ($main -notmatch '\$script:PeriodMs = 5000' -or $gui -notmatch '默认 5 秒') {
+    throw 'Default sampling period is inconsistent between controller and settings.'
+}
+
+# 保存已有设置也必须在 PS5.1 成功；测试资料留在项目专用文件夹，不触及真实用户偏好。
+$settingsFixture=Join-Path (Join-Path $root '_test-artifacts') ('GuiSettings-'+[guid]::NewGuid().ToString('N'))
+$script:UiSettingsPath=Join-Path $settingsFixture 'ui-settings.json'
+$script:SampleSetting=[pscustomobject]@{Value=10}
+$script:TraySetting=[pscustomobject]@{Checked=$true}
+$script:GrowthSetting=[pscustomobject]@{Value=512}
+$script:GrowthPercentSetting=[pscustomobject]@{Value=20}
+$script:SettingsNote=[pscustomobject]@{Text=''}
+Save-MiV4Settings
+$script:SampleSetting.Value=5
+Save-MiV4Settings
+$savedSettings=[IO.File]::ReadAllText($script:UiSettingsPath,[Text.Encoding]::UTF8)|ConvertFrom-Json
+if ($savedSettings.SamplingSeconds -ne 5 -or $script:PeriodMs -ne 5000 -or $savedSettings.GrowthMiB -ne 512) {
+    throw 'Existing GUI settings could not be updated without losing preferences.'
+}
+
+# 独立后台 runspace 执行原 Worker 循环，仅替换磁盘/采集依赖为测试对象。
+# 第一轮故意超过5秒，第二轮取消：验证不并行补排、继续尝试保存、队列有界且finally释放资源。
+$worker=[IO.File]::ReadAllText((Join-Path $root 'Worker.ps1'),[Text.Encoding]::UTF8)
+$mockDependencies=@'
+function New-MiPersistence {
+    return [pscustomobject]@{Healthy=$true;BootId='test';Root='';Warning=$null;FailureKind='None';RecoveredUtc=$null}
+}
+function New-MiAnalyzer {
+    param($BootId,$Root,$IntervalSeconds)
+    $MiWorkerTest.Cadence=$IntervalSeconds
+    return [pscustomobject]@{Historical=@{};HistoricalLoadedUtc=[datetime]::UtcNow}
+}
+function Restore-MiAnalyzer { return 0 }
+function Update-MiHistoricalBaselines {}
+function Invoke-MiDiagnosis {
+    param($Analyzer,$Snapshot)
+    if ($Snapshot.IntervalSeconds -ne 5) { throw 'Missing cadence metadata.' }
+    return [pscustomobject]@{Status='Success';Reports=@();Pressure=[pscustomobject]@{State='Normal'}}
+}
+function Get-MiSnapshot {
+    param($Sequence)
+    $MiWorkerTest.Collects++
+    $MiWorkerTest.Active++
+    $MiWorkerTest.Peak=[math]::Max($MiWorkerTest.Peak,$MiWorkerTest.Active)
+    try {
+        if ($Sequence -eq 1) { Start-Sleep -Milliseconds 5100 }
+        return [pscustomobject]@{
+            Sequence=$Sequence;CaptureEndUtc=[datetime]::UtcNow;Status='Success'
+            System=[pscustomobject]@{Status='Success'}
+            Processes=[pscustomobject]@{Status='Success';Items=@();Total=0}
+        }
+    } finally { $MiWorkerTest.Active-- }
+}
+function Save-MiSnapshot {
+    param($State,$Snapshot)
+    $MiWorkerTest.Saves++
+    if ($MiWorkerTest.Saves -eq 1) {
+        $State.Healthy=$false;$State.Warning='Injected transient failure';$State.FailureKind='Transient'
+        return $false
+    }
+    $State.Healthy=$true;$State.Warning=$null;$State.FailureKind='None';$State.RecoveredUtc=[datetime]::UtcNow
+    $Cancellation.Cancel()
+    return $true
+}
+function Close-MiPersistence { $MiWorkerTest.Closed=$true }
+'@
+$worker=$worker.Replace('. $CollectorPath',$mockDependencies).Replace('. $PersistencePath','').Replace('. $AnalyzerPath','')
+$stats=[hashtable]::Synchronized(@{Collects=0;Active=0;Peak=0;Saves=0;Closed=$false;Cadence=0})
+$queue=[Collections.Concurrent.ConcurrentQueue[object]]::new()
+$cancel=[Threading.CancellationTokenSource]::new()
+$testRunspace=[runspacefactory]::CreateRunspace()
+$testRunspace.Open()
+$runner=[Management.Automation.PowerShell]::Create()
+$runner.Runspace=$testRunspace
+try {
+    $testRunspace.SessionStateProxy.SetVariable('MiWorkerTest',$stats)
+    [void]$runner.AddScript($worker).AddArgument('').AddArgument('').AddArgument('').AddArgument($queue).AddArgument($cancel).AddArgument(5000).AddArgument(1).AddArgument('')
+    $pending=$runner.BeginInvoke()
+    if (-not $pending.AsyncWaitHandle.WaitOne(20000)) {
+        $cancel.Cancel();$runner.Stop();throw 'Worker fixture failed to stop within its bounded deadline.'
+    }
+    [void]$runner.EndInvoke($pending)
+    if ($runner.HadErrors) { throw ('Worker regression failed: '+($runner.Streams.Error|Out-String)) }
+    if ($stats.Collects -ne 2 -or $stats.Saves -ne 2 -or $stats.Peak -ne 1 -or -not $stats.Closed -or $stats.Cadence -ne 5) {
+        throw ('Worker scheduling/recovery/cleanup failed: '+($stats|ConvertTo-Json -Compress))
+    }
+    $latest=$null
+    if ($queue.Count -ne 1 -or -not $queue.TryDequeue([ref]$latest) -or $latest.Sequence -ne 2 -or
+        $latest.PersistenceStatus -ne 'Saved' -or $null -eq $latest.PersistenceRecoveredUtc) {
+        throw 'Bounded mailbox did not publish the latest recovered persistence status.'
+    }
+} finally {
+    $cancel.Cancel();$runner.Dispose();$testRunspace.Dispose();$cancel.Dispose()
+}
+Write-Host 'PASS: M4 syntax, classification, CSV, 5-second full-window charts, bounded sequential Worker and persistence retry/status.' -ForegroundColor Green

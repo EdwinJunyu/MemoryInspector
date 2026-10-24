@@ -122,6 +122,75 @@ function Assert-MiProcessTarget {
         throw
     }
 }
+function Enter-MiProcessTargetLock {
+    param($Item,[string]$Mode)
+    if ($null -eq $Item -or [int]$Item.PID -le 4 -or [long]$Item.StartUtcTicks -le 0) { throw '目标进程锁身份无效。' }
+    $folder=Split-Path -Parent $script:MiActions.AuditPath
+    $path=Join-Path $folder ('process-'+[int]$Item.PID+'-'+[long]$Item.StartUtcTicks+'.lock')
+    # CreateNew 原子区分首次创建与已有状态。已有空文件可能来自崩溃，不能把它当成首次请求。
+    $created=$false;$stream=$null
+    try {
+        try {
+            $stream=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            $created=$true
+        } catch [IO.IOException] {
+            if (-not [IO.File]::Exists($path)) { throw }
+            $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        }
+        if ($created) {
+            # 尚未执行目标检查或发送请求，先落盘允许重试的初始状态；初始化中断则保留未知状态并拒绝后续请求。
+            Write-MiProcessTargetState -Stream $stream -OperationId '' -Mode $Mode -Status 'RejectedBeforeDispatch'
+        } else {
+            if ($stream.Length -le 0 -or $stream.Length -gt 16384) { throw '目标操作状态为空或过大，拒绝重试。' }
+            $buffer=New-Object byte[] ([int]$stream.Length)
+            $offset=0
+            while ($offset -lt $buffer.Length) {
+                $read=$stream.Read($buffer,$offset,$buffer.Length-$offset)
+                if ($read -le 0) { throw '目标操作状态无法完整读取。' }
+                $offset+=$read
+            }
+            # 状态仅追加完整 UTF-8 JSON 行。任意截断尾部、损坏字符或未知状态一律拒绝，不能回退到前一条宽松状态。
+            $text=[Text.UTF8Encoding]::new($false,$true).GetString($buffer)
+            if (-not $text.EndsWith([Environment]::NewLine,[StringComparison]::Ordinal)) { throw '目标操作状态尾部不完整，拒绝重试。' }
+            $lines=$text.Split([string[]]@([Environment]::NewLine),[StringSplitOptions]::None)
+            if ($lines.Count -gt 33) { throw '目标操作状态行数超出限制。' }
+            $prior=$null
+            foreach ($line in $lines[0..($lines.Count-2)]) {
+                if ([string]::IsNullOrWhiteSpace($line)) { throw '目标操作状态包含空行。' }
+                $prior=ConvertFrom-Json -InputObject $line -ErrorAction Stop
+                if ($prior.Mode -cnotin @('Graceful','Force') -or $prior.Status -cnotin @('RejectedBeforeDispatch',
+                    'Dispatching','Requested','ObservationComplete','UnknownOutcome')) { throw '目标操作状态无法识别。' }
+            }
+            # Graceful 未能退出后仍允许用户明确启用 Force；普通重复关闭及任何未知结果都不自动重发。
+            $escalation=($Mode -eq 'Force' -and $prior.Mode -ceq 'Graceful' -and $prior.Status -ceq 'ObservationComplete')
+            if ($prior.Status -cne 'RejectedBeforeDispatch' -and -not $escalation) {
+                throw '该进程实例已有关闭请求或结果未知，禁止重复发送。'
+            }
+        }
+        return $stream
+    } catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        throw
+    }
+}
+function Write-MiProcessTargetState {
+    param([IO.FileStream]$Stream,[string]$OperationId,[string]$Mode,[string]$Status)
+    if ($Mode -cnotin @('Graceful','Force') -or $Status -cnotin @('RejectedBeforeDispatch',
+        'Dispatching','Requested','ObservationComplete','UnknownOutcome')) { throw '目标操作状态写入参数无效。' }
+    $state=[pscustomobject]@{OperationId=$OperationId;Mode=$Mode;Status=$Status;Utc=[datetime]::UtcNow.ToString('o')}
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($state | ConvertTo-Json -Compress)+[Environment]::NewLine)
+    if (($Stream.Length+$bytes.Length) -gt 16384) { throw '目标操作状态容量不足，拒绝发送请求。' }
+    # 永不截断旧状态；即使追加过程中崩溃，之前的发送证据仍在，未完成的新行会阻止后续重复操作。
+    $Stream.Position=$Stream.Length
+    $Stream.Write($bytes,0,$bytes.Length);$Stream.Flush($true)
+}
+function Close-MiProcessTargetLock {
+    param($Operation,[string]$Status)
+    if ($null -ne $Operation.TargetLock) {
+        try { Write-MiProcessTargetState -Stream $Operation.TargetLock -OperationId $Operation.OperationId -Mode $Operation.Mode -Status $Status }
+        finally { $Operation.TargetLock.Dispose();$Operation.TargetLock=$null }
+    }
+}
 function Invoke-MiProcessAction {
     param([ValidateSet('Graceful','Force')][string]$Mode,$Item,$Snapshot,[bool]$DangerEnabled)
     $id = [guid]::NewGuid().ToString('N')
@@ -129,7 +198,7 @@ function Invoke-MiProcessAction {
     $result = [pscustomobject]@{
         OperationId=$id; Mode=$Mode; PID=[int]$Item.PID; Name=[string]$Item.Name
         StartUtcTicks=$Item.StartUtcTicks; StartedUtc=$started
-        Outcome='Rejected'; Error=$null
+        Outcome='Rejected'; Error=$null;TargetLock=$null
         BeforeCommitted=$null; BeforeAvailable=$null; BeforePrivate=$Item.PrivateBytes
         Observations=(New-Object 'System.Collections.Generic.List[object]')
     }
@@ -141,13 +210,10 @@ function Invoke-MiProcessAction {
     if ($script:MiActions.Busy) { $result.Error='已有操作正在执行。'; return $result }
     if ($Mode -eq 'Force' -and -not $DangerEnabled) { $result.Error='危险模式尚未明确启用。'; return $result }
     if ($null -eq $script:MiActions -or -not $script:MiActions.CanAudit) { $result.Error='审计未就绪。'; return $result }
-    $mutex = $null; $acquired=$false; $proc=$null
+    $targetLock=$null; $proc=$null; $definitelyNotSent=$false
     $script:MiActions.Busy=$true
     try {
-        $mutex=[Threading.Mutex]::new($false,'Local\MemoryInspector.M5.ProcessMutation')
-        try { $acquired=$mutex.WaitOne(0) }
-        catch [Threading.AbandonedMutexException] { throw '检测到异常退出的操作锁，请重新启动应用并检查进程状态。' }
-        if (-not $acquired) { throw '另一个实例正在执行管理操作。' }
+        $targetLock=Enter-MiProcessTargetLock -Item $Item -Mode $Mode
         $proc=Assert-MiProcessTarget -Item $Item -Snapshot $Snapshot
         if (-not (Write-MiProcessAudit -OperationId $id -State 'REQUESTED' -Mode $Mode -TargetPid $Item.PID -Name $Item.Name -Details @{
             StartUtcTicks=$Item.StartUtcTicks; BeforeCommitted=$result.BeforeCommitted
@@ -159,14 +225,22 @@ function Invoke-MiProcessAction {
             [long]$proc.StartTime.ToUniversalTime().Ticks -ne [long]$Item.StartUtcTicks) {
             throw '执行前目标身份已改变。'
         }
+        # 先持久记录 Dispatching。若此后进程崩溃，其他 GUI 即使拿到释放的锁也会因未知结果拒绝重发。
+        Write-MiProcessTargetState -Stream $targetLock -OperationId $id -Mode $Mode -Status 'Dispatching'
         if ($Mode -eq 'Graceful') {
-            if (-not $proc.CloseMainWindow()) { throw '主窗口无法响应正常退出请求，未尝试强制终止。' }
+            if (-not $proc.CloseMainWindow()) {
+                $definitelyNotSent=$true
+                throw '主窗口无法响应正常退出请求，未尝试强制终止。'
+            }
             $result.Outcome='Requested'
         } else {
             $proc.Kill()
             $result.Outcome='Requested'
         }
         [void](Write-MiProcessAudit -OperationId $id -State 'SENT_NOT_CONFIRMED_EXIT' -Mode $Mode -TargetPid $Item.PID -Name $Item.Name -Details @{Note='等待后续采样核验，不声称已退出'})
+        Write-MiProcessTargetState -Stream $targetLock -OperationId $id -Mode $Mode -Status 'Requested'
+        $result.TargetLock=$targetLock
+        $targetLock=$null
         $script:MiActions.Pending = $result
     } catch {
         $result.Error=[string]$_.Exception.Message
@@ -177,8 +251,11 @@ function Invoke-MiProcessAction {
         }
     } finally {
         if ($null -ne $proc) { $proc.Dispose() }
-        if ($acquired) { try { $mutex.ReleaseMutex() } catch {} }
-        if ($null -ne $mutex) { $mutex.Dispose() }
+        if ($null -ne $targetLock) {
+            try {
+                if ($definitelyNotSent) { Write-MiProcessTargetState -Stream $targetLock -OperationId $id -Mode $Mode -Status 'RejectedBeforeDispatch' }
+            } finally { $targetLock.Dispose() }
+        }
         $script:MiActions.Busy=$false
     }
     return $result
@@ -235,6 +312,7 @@ function Update-MiActionObservation {
             Observations=@($p.Observations.ToArray())
         }
         [void](Write-MiProcessAudit -OperationId $p.OperationId -State 'OBSERVATION_COMPLETE' -Mode $p.Mode -TargetPid $p.PID -Name $p.Name -Details $details)
+        Close-MiProcessTargetLock -Operation $p -Status 'ObservationComplete'
         $script:MiActions.Pending=$null
         return [pscustomobject]@{State='Complete';Operation=$p;NetCommitBytes=$net;TargetStatus=$last.TargetStatus}
     }
@@ -242,6 +320,7 @@ function Update-MiActionObservation {
         [void](Write-MiProcessAudit -OperationId $p.OperationId -State 'OBSERVATION_INCOMPLETE' -Mode $p.Mode -TargetPid $p.PID -Name $p.Name -Details @{
             Reason='Monitoring timeout or sampling gaps';Observations=@($p.Observations.ToArray())
         })
+        Close-MiProcessTargetLock -Operation $p -Status 'UnknownOutcome'
         $script:MiActions.Pending=$null
         return [pscustomobject]@{State='Incomplete';Operation=$p;NetCommitBytes=$null;TargetStatus='Unknown'}
     }
@@ -255,5 +334,6 @@ function Stop-MiActionObservation {
         Reason='GUI exited before follow-up measurements were complete'
         Observations=@($p.Observations.ToArray())
     })
+    Close-MiProcessTargetLock -Operation $p -Status 'UnknownOutcome'
     $script:MiActions.Pending=$null
 }

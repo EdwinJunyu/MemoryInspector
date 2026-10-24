@@ -1,12 +1,12 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 Read-only collector stability probe. For desktop acceptance use:
-    AcceptanceSoak.ps1 -DurationMinutes 1440 -IntervalSeconds 10
+    AcceptanceSoak.ps1 -DurationMinutes 1440 -IntervalSeconds 5
 This does not exercise the GUI, elevated executor, installer, or service state.
 #>
 param(
     [ValidateRange(1,2880)][int]$DurationMinutes = 5,
-    [ValidateRange(5,3600)][int]$IntervalSeconds = 10,
+    [ValidateRange(5,3600)][int]$IntervalSeconds = 5,
     [string]$OutputDirectory = (Join-Path ([IO.Path]::GetTempPath()) 'MemoryInspectorAcceptance')
 )
 $ErrorActionPreference = 'Stop'
