@@ -1,15 +1,17 @@
-name: MemoryInspector PowerShell tests
+name: MemoryInspector M8 Windows validation
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+
 jobs:
   regression:
-    runs-on: windows-latest
-    timeout-minutes: 15
+    runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Run Windows PowerShell 5.1 regression tests
+      - name: Run regression, parser and fault-injection tests
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -21,14 +23,32 @@ jobs:
           .\ProcessActionsTest.ps1
           .\PrivilegeSecurityTest.ps1
           .\ServiceManagementTest.ps1
+          .\Milestone8Test.ps1
+      - name: Run short read-only collector probe (NOT 24 hour acceptance)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\AcceptanceSoak.ps1 -DurationMinutes 1 -IntervalSeconds 10 -OutputDirectory '.acceptance-ci'
+      - name: Upload collector evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-windows-server-2022-collector
+          path: .acceptance-ci/
+          if-no-files-found: warn
+          retention-days: 14
+
   protected-install:
     needs: regression
-    runs-on: windows-latest
-    timeout-minutes: 12
+    runs-on: windows-2022
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Test protected installation on disposable runner
+      - name: Test protected install, replay, tamper and safe uninstall
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           .\PrivilegeInstallTest.ps1
+
+# Hosted runner runs Windows Server 2022, not Windows 10 or 11 desktop.
+# The 24h GUI test and desktop matrix are manual release blockers.
