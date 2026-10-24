@@ -19,3 +19,4 @@ jobs:
           .\AnalyzerTest.ps1
           .\GuiV4Test.ps1
           .\ProcessActionsTest.ps1
+          .\PrivilegeSecurityTest.ps1

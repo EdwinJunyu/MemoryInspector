@@ -549,6 +549,23 @@ function Initialize-MiV4Gui {
     $script:TraySetting.Text='点击 X 时最小化到系统托盘；使用托盘菜单“完全退出”结束程序。'
     $script:TraySetting.Checked=$script:CloseToTray
     $script:TraySetting.Size=[Drawing.Size]::new(650,43);$settingsPanel.Controls.Add($script:TraySetting)
+    $script:MiPrivilegeNote=New-MiLabel 'M6：请先使用 Installer.ps1 完成受保护安装；当前仅支持 UAC Probe，不允许停止服务。' 9
+    $script:MiPrivilegeNote.Size=[Drawing.Size]::new(750,45)
+    $settingsPanel.Controls.Add($script:MiPrivilegeNote)
+    $verifyButton=New-MiButton '验证管理员执行器（UAC）' 260
+    $verifyButton.Enabled=(Test-MiPrivilegeBridgeInstalled)
+    $settingsPanel.Controls.Add($verifyButton)
+    $verifyButton.Add_Click({
+        try {
+            $state=Start-MiPrivilegeProbe
+            if ($state -eq 'UacCancelled') { $script:MiPrivilegeNote.Text='用户取消 UAC；未执行高权限操作。' }
+            else { $script:MiPrivilegeNote.Text='已请求一次性 UAC Probe；等待受保护执行器核验。' }
+            Set-MiStatus $script:MiPrivilegeNote.Text
+        } catch {
+            $script:MiPrivilegeNote.Text='UAC Probe 被阻止：'+$_.Exception.Message
+            Set-MiStatus $script:MiPrivilegeNote.Text $true
+        }
+    })
     $save=New-MiButton '保存 GUI 设置' 170;$settingsPanel.Controls.Add($save)
     $script:SettingsNote=New-MiLabel '固定诊断窗口为 30 分钟、覆盖率至少 85%；历史保留期 7 天原始 / 90 天聚合（可在持久化 settings.json 调整）。服务仍只读；普通进程操作必须人工确认。' 9
     $script:SettingsNote.Size=[Drawing.Size]::new(740,60);$settingsPanel.Controls.Add($script:SettingsNote)
@@ -567,7 +584,7 @@ function Initialize-MiV4Gui {
     $exitItem=$script:TrayMenu.Items.Add('完全退出')
     $script:TrayIcon=New-Object System.Windows.Forms.NotifyIcon
     $script:TrayIcon.Icon=[Drawing.SystemIcons]::Information
-    $script:TrayIcon.Text='MemoryInspector v0.0.5 · 手动安全操作'
+    $script:TrayIcon.Text='MemoryInspector v0.0.6 · 手动安全操作'
     $script:TrayIcon.ContextMenuStrip=$script:TrayMenu
     $script:TrayIcon.Visible=$true
     $showItem.Add_Click({$script:Form.Show();$script:Form.WindowState='Normal';$script:Form.Activate()})

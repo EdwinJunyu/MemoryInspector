@@ -1,10 +1,10 @@
 ﻿#requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 + 5 (v0.0.5)
+MemoryInspector v2 / Milestones 1 + 2 + 3 + 4 + 5 + 6 (v0.0.6)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
 Read-only diagnostics plus explicitly confirmed, safety-checked USER GUI process actions. No service changes, elevation, cache purge or registry writes.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
-Milestone 3 read-only anomaly analysis is enabled; privileged operations are NOT implemented.
+Milestone 6 adds a protected UAC Probe executor only. Service mutations remain disabled.
 #>
 $ErrorActionPreference = 'Stop'
 
@@ -25,7 +25,9 @@ $script:PersistencePath = Join-Path $script:Root 'Persistence.ps1'
 $script:AnalyzerPath = Join-Path $script:Root 'Analyzer.ps1'
 $script:GuiPath = Join-Path $script:Root 'GuiV4.ps1'
 $script:ActionPath = Join-Path $script:Root 'ProcessActions.ps1'
-foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath,$script:GuiPath,$script:ActionPath)) {
+$script:PrivilegeSecurityPath = Join-Path $script:Root 'PrivilegeSecurity.ps1'
+$script:PrivilegeBridgePath = Join-Path $script:Root 'PrivilegeBridge.ps1'
+foreach ($path in @($script:CollectorPath,$script:WorkerPath,$script:PersistencePath,$script:AnalyzerPath,$script:GuiPath,$script:ActionPath,$script:PrivilegeSecurityPath,$script:PrivilegeBridgePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw ('缺少项目文件：' + $path) }
 }
 
@@ -37,6 +39,8 @@ Add-Type -AssemblyName System.Windows.Forms.DataVisualization
 . $script:GuiPath
 . $script:ActionPath
 Initialize-MiActions
+. $script:PrivilegeSecurityPath
+. $script:PrivilegeBridgePath
 
 $script:PeriodMs = 10000
 $script:QueueLimit = 3
@@ -521,6 +525,16 @@ $script:UiTimer.Add_Tick({
     try {
         Process-MiMailbox
         Poll-MiV4Jobs
+        $probeStatus=Poll-MiPrivilegeProbe
+        if ($null -ne $probeStatus) {
+            switch ($probeStatus) {
+                'ProbeVerified' { $message='M6 UAC 验证成功：安装完整性、ACL、防重放和管理员审计已通过。' }
+                'ProbeRejected' { $message='M6 UAC 验证被安全执行器拒绝；请检查安装与权限配置。' }
+                default { $message='M6 UAC 验证结果未确认，未执行任何服务管理操作。' }
+            }
+            if ($null -ne $script:MiPrivilegeNote) { $script:MiPrivilegeNote.Text=$message }
+            Set-MiStatus $message ($probeStatus -ne 'ProbeVerified')
+        }
         $timed=Update-MiActionObservation -Snapshot $null
         if ($null -ne $timed) { Set-MiStatus '进程操作观察已超时；已保留已有样本，结果未确认。' $true; Update-MiActionButtons }
         if ($script:RestartPending) {
@@ -673,6 +687,7 @@ try {
         }
     }
     Stop-MiActionObservation
+    Close-MiPrivilegeBridge
     Close-MiV4Gui
     $script:UiTimer.Dispose()
     $script:Form.Dispose()
