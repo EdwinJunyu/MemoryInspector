@@ -26,3 +26,48 @@ if ($sample.Status -eq 'Failed') {
         $sample.System.Error,$sample.Processes.Error)
 }
 Write-Host 'PASS: snapshot schema and available collection sources.' -ForegroundColor Green
+
+
+# P2-01：独立模拟 CIM 来源，绝不修改真实计数器；每个无效值都必须保持 null。
+& {
+    $script:MemoryFixture=[pscustomobject]@{CommittedBytes=4GB;CommitLimit=16GB;AvailableBytes=3GB;PoolPagedBytes=64MB;PoolNonpagedBytes=32MB}
+    $script:OsFixture=[pscustomobject]@{TotalVisibleMemorySize=8GB/1KB;FreePhysicalMemory=3GB/1KB}
+    $script:FailSource=''
+    function Get-CimInstance {
+        param($ClassName,$ErrorAction)
+        if ($script:FailSource -eq 'All' -or $script:FailSource -eq $ClassName) { throw 'Injected CIM failure' }
+        if ($ClassName -eq 'Win32_OperatingSystem') { return $script:OsFixture }
+        return $script:MemoryFixture
+    }
+    foreach ($field in @('CommittedBytes','CommitLimit','PoolPagedBytes','PoolNonpagedBytes')) {
+        $saved=$script:MemoryFixture.$field
+        $outputField=switch ($field) {'CommitLimit' {'CommitLimitBytes'} 'PoolPagedBytes' {'PagedPoolBytes'} 'PoolNonpagedBytes' {'NonpagedPoolBytes'} default {$field}}
+        foreach ($invalid in @($null,'','bad',-1,'NaN','Infinity',1.5,$true,[decimal]::MaxValue)) {
+            $script:MemoryFixture.$field=$invalid
+            $result=Get-MiSystemSnapshot
+            if ($result.Status -ne 'Partial' -or $null -ne $result.$outputField -or $result.Error -notmatch 'Unavailable') {
+                throw ('Invalid memory counter became available: '+$field+' / '+[string]$invalid)
+            }
+        }
+        $script:MemoryFixture.$field=$saved
+    }
+    $script:MemoryFixture.CommittedBytes=0L
+    if ((Get-MiSystemSnapshot).CommittedBytes -cne 0L) { throw 'Legitimate zero commit was rejected.' }
+    $script:MemoryFixture.CommitLimit=0L
+    if ($null -ne (Get-MiSystemSnapshot).CommitLimitBytes) { throw 'Zero commit limit was accepted.' }
+    $script:MemoryFixture.CommitLimit=16GB
+    $script:MemoryFixture.AvailableBytes='invalid'
+    if ((Get-MiSystemSnapshot).AvailablePhysicalBytes -ne 3GB) { throw 'Validated OS fallback failed.' }
+    $script:MemoryFixture.AvailableBytes=9GB
+    if ($null -ne (Get-MiSystemSnapshot).AvailablePhysicalBytes) { throw 'Available RAM exceeded physical total.' }
+    $script:FailSource='Win32_PerfFormattedData_PerfOS_Memory'
+    $result=Get-MiSystemSnapshot
+    if ($result.Status -ne 'Partial' -or $null -ne $result.CommittedBytes -or $result.TotalPhysicalBytes -ne 8GB) { throw 'CIM failure fabricated commit or lost valid RAM.' }
+    $script:FailSource='All'
+    $result=Get-MiSystemSnapshot
+    if ($result.Status -ne 'Failed' -or $null -ne $result.CommittedBytes -or $null -ne $result.TotalPhysicalBytes) { throw 'Complete CIM failure fabricated zero memory.' }
+    $script:FailSource=''
+    $script:MemoryFixture=$null;$script:OsFixture=$null
+    if ((Get-MiSystemSnapshot).Status -ne 'Failed') { throw 'Empty CIM records were accepted.' }
+}
+Write-Host 'PASS: P2-01 null/invalid/overflow/zero counters, partial sources, fallback and CIM failures.' -ForegroundColor Green

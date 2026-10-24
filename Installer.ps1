@@ -21,7 +21,9 @@ foreach ($name in $names) {
     $f=Join-Path $source $name
     if (-not [IO.File]::Exists($f) -or -not (Test-MiNoReparse $f)) { throw ('Missing or reparse source: '+$name) }
 }
-if (([IO.File]::ReadAllText((Join-Path $source 'VERSION'))).Trim() -cne '0.0.8') {
+$sourceVersion=([IO.File]::ReadAllText((Join-Path $source 'VERSION'),[Text.Encoding]::UTF8)).Trim()
+# 明确受支持的发行版是安全约束，不能因显示版本动态化而自动信任任意版本。
+if ($sourceVersion -cne '0.0.8') {
     throw 'Expected VERSION 0.0.8; installation canceled.'
 }
 # Never replace an untrusted directory: refuse to overwrite arbitrary existing files.
@@ -88,7 +90,7 @@ try {
     }
     $dataReady=$true
     $manifest=[pscustomobject]@{
-        SchemaVersion=1; Version='0.0.8'; InstalledUtc=[datetime]::UtcNow.ToString('o')
+        SchemaVersion=1; Version=$sourceVersion; InstalledUtc=[datetime]::UtcNow.ToString('o')
         Files=@($entries.ToArray())
     }
     $newManifest=Join-Path $paths.Data ('install-manifest-'+[guid]::NewGuid().ToString('N')+'.tmp')
@@ -112,7 +114,7 @@ try {
         [IO.Directory]::Delete($backup,$true)
     }
     if ($null -ne $oldManifest -and [IO.File]::Exists($oldManifest)) { [IO.File]::Delete($oldManifest) }
-    Write-Host ('Installed MemoryInspector 0.0.8 in '+$paths.Install) -ForegroundColor Green
+    Write-Host ('Installed MemoryInspector '+$sourceVersion+' in '+$paths.Install) -ForegroundColor Green
     Write-Host 'M8 release-candidate: run complete acceptance before stable release.'
     Write-Host ('Launch the protected GUI using: '+(Join-Path $paths.Install 'Run_MemoryInspector.cmd'))
 } catch {

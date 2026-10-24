@@ -58,6 +58,8 @@ while (-not $Cancellation.IsCancellationRequested) {
     }
     # 可选元数据不改变 schema=1 的原有字段；分析和历史恢复以真实配置周期审核覆盖率。
     $snapshot | Add-Member -NotePropertyName IntervalSeconds -NotePropertyValue ($IntervalMs/1000.0) -Force
+    # 与 UTC 并存的单调时间只作连续性校验，不替代历史时间戳。
+    $snapshot | Add-Member -NotePropertyName MonotonicSeconds -NotePropertyValue ([Diagnostics.Stopwatch]::GetTimestamp()/[double][Diagnostics.Stopwatch]::Frequency) -Force
     # Diagnosis only reads scalar measurements. It must never modify processes.
     try {
         $diagnosis = Invoke-MiDiagnosis -Analyzer $analyzer -Snapshot $snapshot

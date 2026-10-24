@@ -314,3 +314,73 @@ try {
         Write-Host ('Analyzer test artifacts retained: '+$root)
     }
 }
+
+
+# P2-02：两小时回拨后仍能在新的 UTC 段完成完整分析；序号重复不能触发错误清窗。
+$clockAnalyzer=New-MiAnalyzer -BootId TestBoot -Root ''
+$origin=[datetime]::SpecifyKind([datetime]'2026-10-24T12:00:00',[DateTimeKind]::Utc)
+function New-ClockFixture($Utc,$Sequence,$Monotonic,$Bytes=400MB) {
+    $fixture=New-Fixture -Utc $Utc -PrivateBytes $Bytes
+    $fixture | Add-Member -NotePropertyName Sequence -NotePropertyValue $Sequence
+    $fixture | Add-Member -NotePropertyName MonotonicSeconds -NotePropertyValue $Monotonic
+    return $fixture
+}
+[void](Invoke-MiDiagnosis $clockAnalyzer (New-ClockFixture $origin 1 100))
+$segmentId=$clockAnalyzer.ContinuityId
+$rollbackSample=New-ClockFixture ($origin.AddHours(-2)) 2 105
+$rollbackResult=Invoke-MiDiagnosis $clockAnalyzer $rollbackSample
+Assert-Mi ($rollbackResult.Status -eq 'Stale' -and $rollbackSample.TimeDiscontinuity -and $clockAnalyzer.ContinuityId -ne $segmentId) 'Rollback did not mark a new historical continuity segment.'
+$newOrigin=$origin.AddHours(-2).AddSeconds(5)
+for ($i=0;$i -le 360;$i++) {
+    $lastClock=Invoke-MiDiagnosis $clockAnalyzer (New-ClockFixture ($newOrigin.AddSeconds($i*5)) ($i+3) (110+$i*5) (400MB+$i*3MB))
+}
+Assert-Mi ($lastClock.Reports[0].AnomalyState -eq 'SuspectedSustainedGrowth' -and $lastClock.Reports[0].ValidSampleCount -eq 361) 'Rollback recovery could not build a complete new window.'
+$resetCount=$clockAnalyzer.WindowResetCount
+$late=Invoke-MiDiagnosis $clockAnalyzer (New-ClockFixture $origin.AddHours(-3) 2 105)
+Assert-Mi ($late.Status -eq 'Stale' -and $clockAnalyzer.WindowResetCount -eq $resetCount -and $clockAnalyzer.Tracks.Count -eq 1) 'Late sequence destroyed a valid current window.'
+$hidden=New-MiAnalyzer -BootId TestBoot -Root ''
+[void](Invoke-MiDiagnosis $hidden (New-ClockFixture $origin 1 100))
+$hiddenRollback=New-ClockFixture ($origin.AddSeconds(1)) 2 105
+[void](Invoke-MiDiagnosis $hidden $hiddenRollback)
+Assert-Mi ($hiddenRollback.TimeDiscontinuity -and $hidden.WindowResetCount -eq 1) 'Monotonic time failed to detect a backward correction while UTC still increased.'
+[void](Invoke-MiDiagnosis $hidden (New-ClockFixture ($origin.AddSeconds(6)) 3 110))
+Assert-Mi ($hidden.Tracks['TestBoot:321:987654321'].Samples.Count -eq 1) 'Hidden rollback did not restart collection.'
+# JSONL/ZIP 恢复仍使用 UTC，按追加顺序读取最后连续段，不排序后拼接回拨前后的增长。
+$historyRoot=Join-Path $PSScriptRoot ('test-artifacts\p2-clock-'+[guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory((Join-Path $historyRoot 'process'))
+$historyPath=Join-Path $historyRoot 'process\process-2026-10-24.jsonl'
+$historyLines=@()
+foreach ($entry in @(
+    @{Utc=$origin.AddMinutes(-10);Segment='before'},
+    @{Utc=$origin;Segment='before'},
+    @{Utc=$origin.AddMinutes(-5);Segment='after'},
+    @{Utc=$origin.AddMinutes(-4);Segment='after'})) {
+    $historyLines+=([pscustomobject]@{SchemaVersion=1;RecordType='ProcessSnapshot';CaptureEndUtc=$entry.Utc.ToString('o');ContinuityId=$entry.Segment
+        ProcessStatus='Success';Items=@([pscustomobject]@{PID=321;Name='fixture';StartUtcTicks=987654321L;PrivateBytes=400MB;ProcessInstanceId='TestBoot:321:987654321'})} | ConvertTo-Json -Compress -Depth 6)
+}
+[IO.File]::WriteAllLines($historyPath,[string[]]$historyLines,[Text.UTF8Encoding]::new($false))
+$historyAnalyzer=New-MiAnalyzer -BootId TestBoot -Root $historyRoot
+Assert-Mi ((Restore-MiAnalyzer $historyAnalyzer $origin) -eq 2 -and $historyAnalyzer.Tracks['TestBoot:321:987654321'].Samples.Count -eq 2) 'Historical rollback spliced continuity segments.'
+Write-Host 'PASS: P2-02 UTC/monotonic rollback, sequence replay, full-window recovery and historical discontinuity.' -ForegroundColor Green
+
+
+# 跨午夜回拨：按日期文件遍历会把新段排到旧段之前，必须由单调时间纠正。
+$midRoot=Join-Path $historyRoot 'midnight'
+[void][IO.Directory]::CreateDirectory((Join-Path $midRoot 'process'))
+$midEnd=[datetime]::SpecifyKind([datetime]'2026-10-24T00:15:00',[DateTimeKind]::Utc)
+foreach ($entry in @(
+    @{Utc=$midEnd.AddMinutes(-15);Mono=100;Id='before'},
+    @{Utc=$midEnd.AddMinutes(-5);Mono=200;Id='before'},
+    @{Utc=$midEnd.AddMinutes(-20);Mono=205;Id='after'},
+    @{Utc=$midEnd.AddMinutes(-10);Mono=805;Id='after'})) {
+    $row=[pscustomobject]@{SchemaVersion=1;RecordType='ProcessSnapshot';CaptureEndUtc=$entry.Utc.ToString('o')
+        MonotonicSeconds=$entry.Mono;ContinuityId=$entry.Id;ProcessStatus='Success'
+        Items=@([pscustomobject]@{PID=321;Name='fixture';StartUtcTicks=987654321L;PrivateBytes=400MB;ProcessInstanceId='TestBoot:321:987654321'})}
+    $file=Join-Path $midRoot ('process\process-'+$entry.Utc.ToString('yyyy-MM-dd')+'.jsonl')
+    [IO.File]::AppendAllText($file,($row|ConvertTo-Json -Compress -Depth 6)+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
+}
+$midAnalyzer=New-MiAnalyzer -BootId TestBoot -Root $midRoot
+Assert-Mi ((Restore-MiAnalyzer $midAnalyzer $midEnd) -eq 2 -and $midAnalyzer.ContinuityId -eq 'after') 'Cross-midnight rollback restored the wrong continuity segment.'
+$resumed=Invoke-MiDiagnosis $midAnalyzer (New-ClockFixture ($midEnd.AddMinutes(-10).AddSeconds(5)) 1 810)
+Assert-Mi ($resumed.Status -eq 'Success' -and $resumed.Reports[0].ValidSampleCount -eq 3 -and $midAnalyzer.ContinuityId -eq 'after') 'Normal restart failed to preserve the recovered segment.'
+Write-Host 'PASS: P2 cross-midnight historical ordering and restart continuity.' -ForegroundColor Green

@@ -19,6 +19,7 @@ try {
         $stamp=if ($i -eq 0) {$t1} else {$t2}
         $sample=[pscustomobject]@{
             Sequence=$i+1; CaptureEndUtc=$stamp; DurationMs=15;Status='Success'
+            ContinuityId='p2-fixture';TimeDiscontinuity=($i -eq 1);MonotonicSeconds=(100+$i*5)
             System=[pscustomobject]@{
                 Status='Success';Error=$null;TotalPhysicalBytes=8589934592L
                 AvailablePhysicalBytes=4294967296L;UsedPhysicalBytes=4294967296L
@@ -34,6 +35,13 @@ try {
             }
         }
         Assert-Mi (Save-MiSnapshot -State $s -Snapshot $sample) ('Cannot save sample: '+$s.Warning)
+        foreach ($type in @('system','process')) {
+            $savedPath=Join-Path (Join-Path $s.Root $type) ($type+'-'+$stamp.ToString('yyyy-MM-dd')+'.jsonl')
+            $savedRecord=@(Read-MiJsonTail $savedPath 1)[0]
+            Assert-Mi ($savedRecord.SchemaVersion -eq 1 -and $savedRecord.ContinuityId -eq 'p2-fixture' -and
+                $savedRecord.TimeDiscontinuity -eq ($i -eq 1) -and $savedRecord.MonotonicSeconds -eq (100+$i*5) -and
+                ([datetime]$savedRecord.CaptureEndUtc).ToUniversalTime() -eq $stamp) 'P2 continuity metadata or UTC round trip failed.'
+        }
     }
     $aggregateFile=Get-MiAggregatePath -State $s -Key (Get-MiBucketKey -Utc $t1)
     Assert-Mi ([IO.File]::Exists($aggregateFile)) 'Rolled five-minute bucket missing.'

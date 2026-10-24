@@ -5,53 +5,56 @@ All outputs are scalar snapshots. Never return live System.Diagnostics.Process o
 No mutating operations, no process termination, no privilege elevation.
 #>
 
-function Get-MiSystemSnapshot {
-    $result = [ordered]@{
-        Status                 = 'Failed'
-        TotalPhysicalBytes     = $null
-        AvailablePhysicalBytes = $null
-        UsedPhysicalBytes      = $null
-        CommittedBytes         = $null
-        CommitLimitBytes       = $null
-        PagedPoolBytes         = $null
-        NonpagedPoolBytes      = $null
-        Error                  = $null
-    }
+function Get-MiMemoryCounter {
+    param($Source,[string]$Property,[long]$Scale=1,[long]$Minimum=0)
+    # 先检查空值和整数格式再转换，避免 PowerShell 将 $null、空串或无效计数器变成合法的 0。
     try {
-        $memory = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        if ($null -eq $memory -or $null -eq $os) { throw 'CIM 返回了空记录。' }
-
-        $total = [long]$os.TotalVisibleMemorySize * 1024L
-        # Prefer the performance counter for Available RAM; Win32_OperatingSystem is fallback.
-        $available = $null
-        if ($null -ne $memory.AvailableBytes) {
-            $available = [long]$memory.AvailableBytes
-        } elseif ($null -ne $os.FreePhysicalMemory) {
-            $available = [long]$os.FreePhysicalMemory * 1024L
-        }
-        $committed = [long]$memory.CommittedBytes
-        $limit = [long]$memory.CommitLimit
-        if ($total -le 0 -or $null -eq $available -or $available -lt 0 -or
-            $available -gt $total -or $limit -le 0 -or $committed -lt 0) {
-            throw 'CIM 内存计数器缺失或数值无效。'
-        }
-
-        $result.TotalPhysicalBytes = $total
-        $result.AvailablePhysicalBytes = $available
-        $result.UsedPhysicalBytes = $total - $available
-        $result.CommittedBytes = $committed
-        $result.CommitLimitBytes = $limit
-        if ($null -ne $memory.PoolPagedBytes) { $result.PagedPoolBytes = [long]$memory.PoolPagedBytes }
-        if ($null -ne $memory.PoolNonpagedBytes) { $result.NonpagedPoolBytes = [long]$memory.PoolNonpagedBytes }
-        $result.Status = if ($null -ne $result.PagedPoolBytes -and $null -ne $result.NonpagedPoolBytes) { 'Success' } else { 'Partial' }
-        if ($result.Status -eq 'Partial') { $result.Error = '无法读取一个或多个内存池计数器。' }
-    } catch {
-        $result.Error = [string]$_.Exception.Message
-    }
-    return [pscustomobject]$result
+        $value=$Source.$Property
+        $number=0L
+        if ($null -eq $value -or $value -is [bool] -or
+            -not [long]::TryParse([string]$value,[Globalization.NumberStyles]::Integer,
+                [Globalization.CultureInfo]::InvariantCulture,[ref]$number) -or $number -lt $Minimum) { return $null }
+        $bytes=[decimal]$number*$Scale
+        if ($bytes -gt [long]::MaxValue) { return $null }
+        return [long]$bytes
+    } catch { return $null }
 }
 
+function Get-MiSystemSnapshot {
+    $result = [ordered]@{
+        Status='Failed';TotalPhysicalBytes=$null;AvailablePhysicalBytes=$null;UsedPhysicalBytes=$null
+        CommittedBytes=$null;CommitLimitBytes=$null;PagedPoolBytes=$null;NonpagedPoolBytes=$null;Error=$null
+    }
+    $errors=New-Object 'System.Collections.Generic.List[string]'
+    $memory=$null;$os=$null
+    # 两个只读来源独立失败；保留本轮仍可验证的字段，不回填上一轮数据。
+    try { $memory=Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop }
+    catch { $errors.Add('内存计数器读取失败：'+$_.Exception.Message) }
+    try { $os=Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop }
+    catch { $errors.Add('物理内存读取失败：'+$_.Exception.Message) }
+    $result.TotalPhysicalBytes=Get-MiMemoryCounter $os TotalVisibleMemorySize -Scale 1024 -Minimum 1
+    $result.AvailablePhysicalBytes=Get-MiMemoryCounter $memory AvailableBytes
+    if ($null -eq $result.AvailablePhysicalBytes) {
+        $result.AvailablePhysicalBytes=Get-MiMemoryCounter $os FreePhysicalMemory -Scale 1024
+    }
+    if ($null -ne $result.TotalPhysicalBytes -and $null -ne $result.AvailablePhysicalBytes) {
+        if ($result.AvailablePhysicalBytes -gt $result.TotalPhysicalBytes) {
+            $result.AvailablePhysicalBytes=$null
+            $errors.Add('可用物理内存超过总量。')
+        } else { $result.UsedPhysicalBytes=$result.TotalPhysicalBytes-$result.AvailablePhysicalBytes }
+    }
+    $result.CommittedBytes=Get-MiMemoryCounter $memory CommittedBytes
+    $result.CommitLimitBytes=Get-MiMemoryCounter $memory CommitLimit -Minimum 1
+    $result.PagedPoolBytes=Get-MiMemoryCounter $memory PoolPagedBytes
+    $result.NonpagedPoolBytes=Get-MiMemoryCounter $memory PoolNonpagedBytes
+    $missing=@('TotalPhysicalBytes','AvailablePhysicalBytes','UsedPhysicalBytes','CommittedBytes',
+        'CommitLimitBytes','PagedPoolBytes','NonpagedPoolBytes' | Where-Object { $null -eq $result[$_] })
+    if ($missing.Count -eq 0 -and $errors.Count -eq 0) { $result.Status='Success' }
+    elseif ($missing.Count -lt 7) { $result.Status='Partial' }
+    if ($missing.Count -gt 0) { $errors.Add('Unavailable：'+($missing -join ', ')) }
+    if ($errors.Count -gt 0) { $result.Error=$errors -join '；' }
+    return [pscustomobject]$result
+}
 function Get-MiProcessSnapshot {
     $items = New-Object 'System.Collections.Generic.List[object]'
     $incomplete = 0

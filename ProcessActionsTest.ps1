@@ -148,3 +148,114 @@ try {
 }
 Write-Host 'PASS: M5 simulated actions, cross-process target lock, append-only crash/corruption guards, explicit escalation, delayed samples and audit.' -ForegroundColor Green
 
+
+
+# P2-03：后台使用原有 Assert-MiProcessTarget，只替换系统读取和目标对象；从不打开真实 PID。
+. (Join-Path $root 'ProcessActions.ps1')
+$asyncDir=Join-Path $root ('test-artifacts\P2-process-'+[guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($asyncDir)
+$moduleFixture=Join-Path $asyncDir 'ProcessActions.fixture.ps1'
+$originalModule=[IO.File]::ReadAllText((Join-Path $root 'ProcessActions.ps1'),[Text.Encoding]::UTF8)
+$fakeOverrides=@'
+function Test-MiElevated { return $false }
+function Get-Process {
+    param($Id,$ErrorAction)
+    $p=[pscustomobject]@{
+        ProcessName='M5-TestApp';StartTime=[datetime]::new(__TICKS__,[DateTimeKind]::Utc)
+        Path='D:\MemoryInspectorFixture\App.exe';SessionId=1;MainWindowHandle=[intptr]1;HasExited=$false
+    }
+    $p | Add-Member ScriptMethod Refresh {}
+    $p | Add-Member ScriptMethod Dispose {}
+    $p | Add-Member ScriptMethod CloseMainWindow { [IO.File]::AppendAllText($script:MiActions.AuditPath+'.dispatch','Close');return $true }
+    $p | Add-Member ScriptMethod Kill { throw 'Fixture forbids Kill' }
+    return $p
+}
+function Get-CimInstance {
+    param($ClassName,$Filter,$OperationTimeoutSec,$ErrorAction)
+    if ($OperationTimeoutSec -ne 5) { throw 'Missing bounded CIM timeout.' }
+    if ($ClassName -eq 'Win32_Process') {
+        Start-Sleep -Milliseconds __DELAY__
+        __READ_FAILURE__
+        return [pscustomobject]@{CreationDate=[datetime]::new(__TICKS__,[DateTimeKind]::Utc);ExecutablePath='D:\MemoryInspectorFixture\App.exe';SessionId=1}
+    }
+    if (__SERVICE_HOST__) { return [pscustomobject]@{Name='FixtureService'} }
+    return @()
+}
+function Invoke-CimMethod {
+    param($InputObject,$MethodName,$OperationTimeoutSec,$ErrorAction)
+    if ($MethodName -ne 'GetOwnerSid' -or $OperationTimeoutSec -ne 5) { throw 'Owner lookup lost safety bounds.' }
+    return [pscustomobject]@{ReturnValue=0;Sid='S-1-5-21-Fixture'}
+}
+'@
+function Set-AsyncFixture([int]$Delay=0,[long]$Ticks=$record.StartUtcTicks,[bool]$ServiceHost=$false,[bool]$ReadFailure=$false) {
+    $text=$fakeOverrides.Replace('__TICKS__',[string]$Ticks).Replace('__DELAY__',[string]$Delay).
+        Replace('__SERVICE_HOST__',('$'+$ServiceHost.ToString().ToLowerInvariant())).
+        Replace('__READ_FAILURE__',$(if ($ReadFailure) {"throw 'Injected CIM read failure'"} else {''}))
+    [IO.File]::WriteAllText($moduleFixture,$originalModule+[Environment]::NewLine+$text,[Text.UTF8Encoding]::new($true))
+}
+function Wait-AsyncFixture {
+    $watch=[Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt 10) {
+        $reply=Poll-MiProcessJob
+        if ($null -ne $reply) { return $reply }
+        Start-Sleep -Milliseconds 20
+    }
+    throw 'Asynchronous fixture deadline exceeded.'
+}
+$script:MiActions=[pscustomobject]@{AuditPath=(Join-Path $asyncDir 'actions.jsonl');CanAudit=$true;CurrentSid='S-1-5-21-Fixture';CurrentSession=1;Busy=$false;Pending=$null}
+$sample.CaptureEndUtc=[datetime]::UtcNow
+$sample.Processes.Items=@($record)
+try {
+    Set-AsyncFixture -Delay 1500
+    $launch=[Diagnostics.Stopwatch]::StartNew()
+    Start-MiProcessJob Check $record $sample -ModulePath $moduleFixture
+    if ($launch.Elapsed.TotalMilliseconds -gt 1000 -or $script:MiProcessJob.Handle.IsCompleted) { throw 'Slow CIM blocked the caller.' }
+    Add-Type -AssemblyName System.Windows.Forms
+    $script:ResponsiveTicks=0
+    $uiTimer=[Windows.Forms.Timer]::new();$uiTimer.Interval=40
+    $uiTimer.Add_Tick({$script:ResponsiveTicks++})
+    $uiTimer.Start()
+    try {
+        $pump=[Diagnostics.Stopwatch]::StartNew()
+        while ($pump.Elapsed.TotalMilliseconds -lt 400) {
+            [Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 5
+        }
+        if ($script:ResponsiveTicks -lt 3 -or $script:MiProcessJob.Handle.IsCompleted) {
+            throw 'Slow CIM prevented the WinForms message pump from advancing.'
+        }
+    } finally { $uiTimer.Stop();$uiTimer.Dispose() }
+    $duplicateBlocked=$false
+    try { Start-MiProcessJob Check $record $sample -ModulePath $moduleFixture } catch { $duplicateBlocked=$true }
+    if (-not $duplicateBlocked) { throw 'Unbounded duplicate background queries were allowed.' }
+    if ((Wait-AsyncFixture).State -ne 'Verified') { throw 'Valid asynchronous preflight failed.' }
+    # 预验证通过后 PID 被复用，执行阶段必须重新读取身份并拒绝，不能复用预验证权限。
+    Set-AsyncFixture -Ticks ($record.StartUtcTicks+[timespan]::TicksPerSecond*5)
+    Start-MiProcessJob Execute $record $sample -ModulePath $moduleFixture
+    $changed=Wait-AsyncFixture
+    if ($changed.State -eq 'Requested' -or [IO.File]::Exists($script:MiActions.AuditPath+'.dispatch')) { throw 'Changed identity bypassed execution revalidation.' }
+    foreach ($fault in @('ServiceHost','ReadFailure')) {
+        Set-AsyncFixture -ServiceHost ($fault -eq 'ServiceHost') -ReadFailure ($fault -eq 'ReadFailure')
+        Start-MiProcessJob Check $record $sample -ModulePath $moduleFixture
+        if ((Wait-AsyncFixture).State -eq 'Verified') { throw ('Unsafe preflight accepted: '+$fault) }
+    }
+    Set-AsyncFixture -Delay 2000
+    Start-MiProcessJob Check $record $sample -ModulePath $moduleFixture
+    $timeout=Poll-MiProcessJob -TimeoutSeconds -1
+    if ($timeout.State -ne 'TimedOut' -or $null -eq $script:MiProcessJob) { throw 'Timeout lost the bounded pending task.' }
+    $stopped=Wait-AsyncFixture
+    if ($stopped.State -eq 'Verified' -or $null -ne $script:MiProcessJob) { throw 'Late timeout result re-enabled an action.' }
+    # 真实执行函数使用假的主窗口，跨线程交接后目标文件锁仍然被持有。
+    Set-AsyncFixture
+    Start-MiProcessJob Execute $record $sample -ModulePath $moduleFixture
+    $sent=Wait-AsyncFixture
+    if ($sent.State -ne 'Requested' -or $null -eq $script:MiActions.Pending -or
+        [IO.File]::ReadAllText($script:MiActions.AuditPath+'.dispatch') -cne 'Close') { throw 'Background dispatch or observation handoff failed.' }
+    $held=$false
+    try { $unexpected=Enter-MiProcessTargetLock $record Graceful } catch { $held=$true }
+    if (-not $held) { $unexpected.Dispose();throw 'Background-to-UI handoff released the P1 lock.' }
+    $sample.CaptureEndUtc=$sent.Result.StartedUtc.AddSeconds(61)
+    $observed=Update-MiActionObservation $sample $sent.Result.StartedUtc.AddSeconds(62)
+    if ($observed.State -ne 'Complete' -or $null -ne $script:MiActions.Pending) { throw 'Transferred observation did not finish and release lock.' }
+} finally { Close-MiProcessJob;Stop-MiActionObservation }
+Write-Host 'PASS: P2-03 slow CIM is asynchronous, bounded jobs/timeouts, identity revalidation, service rejection and lock handoff.' -ForegroundColor Green

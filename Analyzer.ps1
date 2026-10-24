@@ -49,6 +49,9 @@ function New-MiAnalyzer {
         Historical = @{}
         HistoricalLoadedUtc = [datetime]::MinValue
         LastCaptureUtc = [datetime]::MinValue
+        LastSequence = $null
+        LastMonotonicSeconds = $null
+        ContinuityId = [guid]::NewGuid().ToString('N')
         WindowMinutes = $WindowMinutes
         Parameters = (Get-MiAnalysisParameters -IntervalSeconds $IntervalSeconds)
         IntervalSeconds = $IntervalSeconds
@@ -69,6 +72,9 @@ function Set-MiAnalyzerInterval {
     $Analyzer.Tracks.Clear()
     $Analyzer.PoolHistory.Clear()
     $Analyzer.LastCaptureUtc=[datetime]::MinValue
+    $Analyzer.LastSequence=$null
+    $Analyzer.LastMonotonicSeconds=$null
+    $Analyzer.ContinuityId=[guid]::NewGuid().ToString('N')
     $Analyzer.WindowResetCount++
 }
 
@@ -186,14 +192,34 @@ function Get-MiRecentProcessRecords {
             } catch {}
         }
     }
-    return @($records.ToArray() | Sort-Object CaptureEndUtc)
+    # 保留 JSONL 的追加顺序；按 UTC 排序会掩盖回拨断点。
+    return @($records.ToArray())
 }
 
 function Restore-MiAnalyzer {
     param($Analyzer,[datetime]$NowUtc=[datetime]::UtcNow)
     if (-not $Analyzer.CanRestore -or [string]::IsNullOrWhiteSpace($Analyzer.Root)) { return 0 }
     $count = 0
-    foreach ($r in @(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc -IntervalSeconds $Analyzer.IntervalSeconds)) {
+    $previousUtc=[datetime]::MinValue;$previousContinuity=$null;$previousMonotonic=$null
+    $recent=@(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc -IntervalSeconds $Analyzer.IntervalSeconds)
+    # UTC 跨日回拨会把新行写入前一天的文件；同一启动内的单调时间恢复真实采样顺序。
+    # 旧记录没有此可选字段，仍保持原追加顺序，不猜测单调时间。
+    $ordered=New-Object 'System.Collections.Generic.List[object]'
+    $index=0
+    foreach ($record in $recent) {
+        $mono=-1.0
+        if ($null -ne $record.MonotonicSeconds) {
+            $parsed=0.0
+            if (-not [double]::TryParse([string]$record.MonotonicSeconds,[Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,[ref]$parsed) -or
+                [double]::IsNaN($parsed) -or [double]::IsInfinity($parsed) -or $parsed -lt 0) { continue }
+            $mono=$parsed
+        }
+        $ordered.Add([pscustomobject]@{Record=$record;Monotonic=$mono;Index=$index})
+        $index++
+    }
+    foreach ($orderedRecord in @($ordered | Sort-Object Monotonic,Index)) {
+        $r=$orderedRecord.Record
         if ($r.ProcessStatus -eq 'Failed') { continue }
         if ($null -ne $r.IntervalSeconds) {
             $savedInterval=0
@@ -213,11 +239,25 @@ function Restore-MiAnalyzer {
             if ($null -ne $key -and $key -ceq [string]$p.ProcessInstanceId) { $matching.Add($p) }
         }
         if ($matching.Count -eq 0) { continue }
+        # 新记录使用连续段 ID；旧 schema=1 仍可读，但必须按追加时间检测回拨，不能拼接两段趋势。
+        $recordUtc=([datetime]$r.CaptureEndUtc).ToUniversalTime()
+        if (($previousUtc -ne [datetime]::MinValue -and $recordUtc -le $previousUtc) -or
+            ($null -ne $previousContinuity -and $r.ContinuityId -ne $previousContinuity)) {
+            $Analyzer.Tracks.Clear();$Analyzer.PoolHistory.Clear();$count=0
+            $Analyzer.ContinuityReason='历史记录存在时间断点，仅恢复最后连续段。'
+        }
+        $previousUtc=$recordUtc;$previousContinuity=$r.ContinuityId;$previousMonotonic=$r.MonotonicSeconds
+
         Add-MiTrackSample -Analyzer $Analyzer -Historical $true -Snapshot ([pscustomobject]@{
             CaptureEndUtc=$r.CaptureEndUtc
             Processes=[pscustomobject]@{Status=$r.ProcessStatus;Items=$matching.ToArray()}
         })
         $count++
+    }
+    if ($count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$previousContinuity)) {
+        $Analyzer.ContinuityId=[string]$previousContinuity
+        $Analyzer.LastCaptureUtc=$previousUtc
+        $Analyzer.LastMonotonicSeconds=$previousMonotonic
     }
     return $count
 }
@@ -442,19 +482,41 @@ function Invoke-MiDiagnosis {
         Set-MiAnalyzerInterval -Analyzer $Analyzer -IntervalSeconds $interval
     }
     $utc = ([datetime]$Snapshot.CaptureEndUtc).ToUniversalTime()
-    if ($Analyzer.LastCaptureUtc -ne [datetime]::MinValue -and $utc -le $Analyzer.LastCaptureUtc) {
-        if ($utc -lt $Analyzer.LastCaptureUtc) {
-            # 回拨产生时间断点，拒绝本轮并清空窗口；后续新样本可以重新积累，避免永久停滞。
-            $Analyzer.Tracks.Clear()
-            $Analyzer.PoolHistory.Clear()
+    $sequence=$Snapshot.Sequence
+    $monotonic=$Snapshot.MonotonicSeconds
+    # 序号倒序属于迟到/重复消息，不应把旧消息误认为新时钟、清空有效窗口。
+    if ($null -ne $sequence -and $null -ne $Analyzer.LastSequence -and $sequence -le $Analyzer.LastSequence) {
+        return [pscustomobject]@{Status='Stale';Reports=@();Pressure=[pscustomobject]@{State='Unknown'};Error='忽略重复或倒序的采样序号。'}
+    }
+    $rollback=$false
+    if ($Analyzer.LastCaptureUtc -ne [datetime]::MinValue) {
+        $wallDelta=($utc-$Analyzer.LastCaptureUtc).TotalSeconds
+        $rollback=($wallDelta -lt 0)
+        if ($null -ne $monotonic -and $null -ne $Analyzer.LastMonotonicSeconds) {
+            $elapsed=[double]$monotonic-[double]$Analyzer.LastMonotonicSeconds
+            # 即使 UTC 仍在增加，也能发现采样期间被向后校正的明显时间差。
+            $rollback=$rollback -or $elapsed -lt 0 -or
+                ($wallDelta-$elapsed) -lt -[math]::Max(1,$Analyzer.IntervalSeconds/2.0)
+        }
+        if ($rollback) {
+            $Analyzer.Tracks.Clear();$Analyzer.PoolHistory.Clear()
             $Analyzer.LastCaptureUtc=[datetime]::MinValue
+            $Analyzer.ContinuityId=[guid]::NewGuid().ToString('N')
             $Analyzer.ContinuityReason='检测到采样时间回拨，已重新建立分析窗口。'
             $Analyzer.WindowResetCount++
+            # 历史基线的刷新节流也不能被旧的未来 UTC 时间永久阻塞。
+            $Analyzer.HistoricalLoadedUtc=[datetime]::MinValue
+        } elseif ($wallDelta -eq 0) {
+            return [pscustomobject]@{Status='Stale';Reports=@();Pressure=[pscustomobject]@{State='Unknown'};Error='忽略重复采样时间。'}
         }
-        return [pscustomobject]@{
-            Status='Stale';Reports=@();Pressure=[pscustomobject]@{State='Unknown'}
-            Error='检测到倒退或重复的采样时间，已忽略本轮诊断。'
-        }
+    }
+    $Analyzer.LastSequence=$sequence
+    $Analyzer.LastMonotonicSeconds=$monotonic
+    $Snapshot | Add-Member -NotePropertyName ContinuityId -NotePropertyValue $Analyzer.ContinuityId -Force
+    $Snapshot | Add-Member -NotePropertyName TimeDiscontinuity -NotePropertyValue $rollback -Force
+    if ($rollback) {
+        # 本轮只标记断点，下一轮从新的 UTC/单调时间锚点重新收集。
+        return [pscustomobject]@{Status='Stale';Reports=@();Pressure=[pscustomobject]@{State='Unknown'};Error=$Analyzer.ContinuityReason}
     }
     $Analyzer.LastCaptureUtc=$utc
     Add-MiTrackSample -Analyzer $Analyzer -Snapshot $Snapshot

@@ -1,8 +1,8 @@
 ﻿#requires -Version 5.1
 <#
-MemoryInspector v2 / Milestones 1–8 (v0.0.8 release candidate)
+MemoryInspector / Milestones 1–8 (release candidate; version from VERSION)
 Windows PowerShell 5.1 + built-in WinForms and Charting.
-Read-only diagnostics plus explicitly confirmed, safety-checked USER GUI process actions. No service changes, elevation, cache purge or registry writes.
+Read-only diagnostics plus explicitly confirmed, safety-checked USER GUI process actions. Service requests use the separate protected executor; no direct GUI service changes or cache purge.
 Architecture: asynchronous collector runspace -> bounded ConcurrentQueue -> UI timer.
 Milestone 7 adds explicit, admin-approved Windows service operations via the protected executor.
 #>
@@ -38,6 +38,7 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms.DataVisualization
 [System.Windows.Forms.Application]::EnableVisualStyles()
 . $script:GuiPath
+$script:VersionInfo = Get-MiVersionPresentation -Root $script:Root
 . $script:ActionPath
 Initialize-MiActions
 . $script:PrivilegeSecurityPath
@@ -105,8 +106,43 @@ function New-MiButton {
 }
 function Format-MiGiB {
     param($Bytes)
-    if ($null -eq $Bytes) { return '—' }
+    if ($null -eq $Bytes) { return '不可用' }
     return ('{0:N2}' -f ([double]$Bytes / 1GB))
+}
+
+function Set-MiOperationStatus {
+    param([string]$State,[string]$Text,[bool]$Warning=$false)
+    # 与监控状态分开，保持到下一次操作变化；采样和预验证不会清除此结果。
+    $script:LastOperationStatus=[pscustomobject]@{State=$State;Text=$Text;Utc=[datetime]::UtcNow;Warning=$Warning}
+    if ($script:Closing -or $null -eq $script:OperationLabel) { return }
+    $script:OperationLabel.Text=('{0:HH:mm:ss} [{1}] {2}' -f $script:LastOperationStatus.Utc.ToLocalTime(),$State,$Text)
+    $script:OperationLabel.ForeColor=if ($Warning) {$script:Amber} else {$script:Ink}
+}
+function Update-MiGuiProcessJob {
+    $outcome=Poll-MiProcessJob
+    if ($null -eq $outcome) { return }
+    if ($outcome.Kind -eq 'Check') {
+        if ($outcome.Key -ceq (Get-MiProcessCheckKey (Get-MiSelectedProcess))) {
+            $script:MiProcessCheck=[pscustomobject]@{Key=$outcome.Key;State=$outcome.State;Error=$outcome.Error;Clock=[Diagnostics.Stopwatch]::StartNew()}
+        } else { $script:MiProcessCheck=$null }
+    } else {
+        $script:MiProcessCheck=$null
+        if ($outcome.State -eq 'Requested') {
+            Set-MiOperationStatus 'Requested' ('已发送进程请求：'+$outcome.Result.Name+' (PID '+$outcome.Result.PID+')；观察 60 秒，退出尚未确认。')
+        } else { Set-MiOperationStatus $outcome.State ('进程操作未确认或被拒绝：'+$outcome.Error) $true }
+    }
+    Update-MiActionButtons
+}
+function Show-MiProcessObservation {
+    param($Observation)
+    if ($null -eq $Observation) { return }
+    $state='UnknownOutcome';$warning=$true
+    if ($Observation.State -eq 'Incomplete') { $state='TimedOut' }
+    elseif ($Observation.TargetStatus -eq 'NotObserved') { $state='NotObserved';$warning=$false }
+    elseif ($Observation.TargetStatus -eq 'Present') { $state='NotExited' }
+    $change='不可用'
+    if ($null -ne $Observation.NetCommitBytes) { $change=('{0:+0.00;-0.00;0.00} GiB' -f ([double]$Observation.NetCommitBytes/1GB)) }
+    Set-MiOperationStatus $state ('进程 '+$Observation.Operation.Name+' (PID '+$Observation.Operation.PID+')；观察：'+$Observation.TargetStatus+'；系统提交净变化 '+$change+'。完整记录请查看操作审计。') $warning
 }
 function Set-MiStatus {
     param([string]$Text,[bool]$Warning=$false)
@@ -186,6 +222,7 @@ function Restore-MiGuiHistory {
 }
 function Add-MiHistory {
     param($Snapshot)
+    if ($Snapshot.TimeDiscontinuity) { $script:History.Clear() }
     $script:History.Add($Snapshot)
     $cutoff = ([datetime]$Snapshot.CaptureEndUtc).AddMinutes(-30)
     while ($script:History.Count -gt 0 -and
@@ -221,7 +258,7 @@ function Update-MiSelectedProcess {
     $item = Get-MiSelectedProcess
     if ($null -eq $item) {
         $script:Details.Text = '选择一条进程记录查看其内存信息。' + [Environment]::NewLine +
-            '普通进程提供受限手动管理；Windows 服务仍为只读。'
+            '普通进程提供受限手动管理；服务操作须受保护执行器和管理员确认。'
         Update-MiV4ProcessChart
         Update-MiActionButtons
         return
@@ -262,7 +299,7 @@ function Update-MiSelectedProcess {
         'Private Bytes 是进程的私有提交量，不等于目前实际驻留 RAM。',
         '高占用不等于无用，也不能凭一次增长认定 Memory Leak。',
         '',
-        'Milestone 5：普通进程可手动申请关闭；Windows 服务仍然只读。'
+        '普通进程仅手动确认关闭；服务管理请在服务页逐项确认。'
     ) -join [Environment]::NewLine
     Update-MiV4ProcessChart
     Update-MiActionButtons
@@ -287,7 +324,7 @@ function Update-MiKpi {
             $first = $record; break
         }
     }
-    if ($null -eq $first) {
+    if ($null -eq $first -or $null -eq $sys.CommittedBytes) {
         $script:KpiValues[3].Text = '—'
         $script:KpiNotes[3].Text = '暂无有效基线'
     } else {
@@ -316,16 +353,16 @@ function Update-MiCharts {
             $gapRam.XValue = $gap.XValue; $gapRam.IsEmpty = $true
             [void]$seriesRam.Points.Add($gapRam)
         }
-        if ($sample.System.Status -eq 'Failed') {
-            $miss1 = New-Object System.Windows.Forms.DataVisualization.Charting.DataPoint
-            $miss1.XValue = $x; $miss1.IsEmpty = $true
-            [void]$seriesCommit.Points.Add($miss1)
-            $miss2 = New-Object System.Windows.Forms.DataVisualization.Charting.DataPoint
-            $miss2.XValue = $x; $miss2.IsEmpty = $true
-            [void]$seriesRam.Points.Add($miss2)
-        } else {
-            [void]$seriesCommit.Points.AddXY($x,[double]$sample.System.CommittedBytes / 1GB)
-            [void]$seriesRam.Points.AddXY($x,[double]$sample.System.UsedPhysicalBytes / 1GB)
+        # 每条曲线独立保留缺失点，不能把 Partial 中的空值画成 0 GiB。
+        foreach ($metric in @(
+            [pscustomobject]@{Series=$seriesCommit;Bytes=$sample.System.CommittedBytes},
+            [pscustomobject]@{Series=$seriesRam;Bytes=$sample.System.UsedPhysicalBytes}
+        )) {
+            if ($sample.System.Status -eq 'Failed' -or $null -eq $metric.Bytes) {
+                $missing=New-Object System.Windows.Forms.DataVisualization.Charting.DataPoint
+                $missing.XValue=$x;$missing.IsEmpty=$true
+                [void]$metric.Series.Points.Add($missing)
+            } else { [void]$metric.Series.Points.AddXY($x,[double]$metric.Bytes/1GB) }
         }
         $prevSequence = $sample.Sequence
     }
@@ -354,11 +391,7 @@ function Process-MiMailbox {
     Add-MiV4ProcessHistory -Snapshot $latest
     Update-MiKpi -Snapshot $latest
     $actionObservation=Update-MiActionObservation -Snapshot $latest
-    if ($null -ne $actionObservation) {
-        $change='unavailable'
-        if ($null -ne $actionObservation.NetCommitBytes) { $change=('{0:+0.00;-0.00;0.00} GiB' -f ([double]$actionObservation.NetCommitBytes/1GB)) }
-        Set-MiStatus ('进程操作观察：'+$actionObservation.State+'；系统提交净变化 '+$change)
-    }
+    Show-MiProcessObservation $actionObservation
     Update-MiGrid -ProcessCollection $latest.Processes
     Update-MiCharts
     $timeString = $latest.CaptureEndUtc.ToLocalTime().ToString('HH:mm:ss')
@@ -383,7 +416,7 @@ function Process-MiMailbox {
 
 # ---- WinForms layout, all created and updated on GUI thread ----
 $script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = 'MemoryInspector v0.0.5 · 安全进程管理'
+$script:Form.Text = $script:VersionInfo.WindowTitle
 $script:Form.StartPosition = 'CenterScreen'
 $script:Form.Size = [System.Drawing.Size]::new(1300,850)
 $script:Form.MinimumSize = [System.Drawing.Size]::new(1020,690)
@@ -409,7 +442,7 @@ $toolbar.Controls.Add($title)
 $btnRestart = New-MiButton '重启采样器' 114
 $btnRestart.Anchor = 'Top,Right'; $btnRestart.Location = [System.Drawing.Point]::new(0,0)
 $toolbar.Controls.Add($btnRestart)
-$readOnly = New-MiLabel 'MANUAL ACTIONS · 不操作服务' 9 $true
+$readOnly = New-MiLabel 'MANUAL ACTIONS · 逐项确认' 9 $true
 $readOnly.ForeColor = $script:Teal
 $readOnly.Size = [System.Drawing.Size]::new(200,33)
 $readOnly.TextAlign = 'MiddleRight'
@@ -532,6 +565,8 @@ $script:UiTimer.Add_Tick({
     try {
         Process-MiMailbox
         Poll-MiV4Jobs
+        Update-MiGuiProcessJob
+        Update-MiActionButtons
         $probeStatus=Poll-MiPrivilegeProbe
         if ($null -ne $probeStatus) {
             switch ($probeStatus) {
@@ -540,26 +575,26 @@ $script:UiTimer.Add_Tick({
                 default { $message='M6 UAC 验证结果未确认，未执行任何服务管理操作。' }
             }
             if ($null -ne $script:MiPrivilegeNote) { $script:MiPrivilegeNote.Text=$message }
-            Set-MiStatus $message ($probeStatus -ne 'ProbeVerified')
+            Set-MiOperationStatus 'PrivilegeProbe' $message ($probeStatus -ne 'ProbeVerified')
         }
         $serviceOutcome=Poll-MiServiceRequest
         if ($null -ne $serviceOutcome) {
             if ($serviceOutcome.State -eq 'StillPending') {
                 if ($script:MiServiceLastStatus -ne 'StillPending') {
                     $script:ServiceNote.Text='高权限服务操作仍在执行或等待用户确认；不会自动重试或强制结束。'
-                    Set-MiStatus $script:ServiceNote.Text $true
+                    Set-MiOperationStatus 'Pending' $script:ServiceNote.Text $true
                 }
             } else {
                 $script:ServiceNote.Text=('服务操作 '+$serviceOutcome.Operation+' / '+$serviceOutcome.Name+
                     '：'+$serviceOutcome.State+'。TimedOut/Unknown 不代表服务未发生变化。')
-                Set-MiStatus $script:ServiceNote.Text ($serviceOutcome.State -ne 'Confirmed')
+                Set-MiOperationStatus $serviceOutcome.State $script:ServiceNote.Text ($serviceOutcome.State -ne 'Confirmed')
                 Start-MiV4ServicesLoad
             }
             $script:MiServiceLastStatus=$serviceOutcome.State
             Update-MiV4ServiceButtons
         }
         $timed=Update-MiActionObservation -Snapshot $null
-        if ($null -ne $timed) { Set-MiStatus '进程操作观察已超时；已保留已有样本，结果未确认。' $true; Update-MiActionButtons }
+        if ($null -ne $timed) { Show-MiProcessObservation $timed; Update-MiActionButtons }
         if ($script:RestartPending) {
             if (Dispose-MiCompletedWorker) {
                 Restore-MiGuiHistory
@@ -611,56 +646,79 @@ function Show-MiActionTypedDialog {
 }
 function Update-MiActionButtons {
     if (-not $script:MiGracefulButton -or -not $script:MiForceButton) { return }
+    $script:MiGracefulButton.Enabled=$false;$script:MiForceButton.Enabled=$false
     $item=Get-MiSelectedProcess
-    $active=$false
-    if ($null -ne $item -and $null -ne $script:LatestSnapshot -and -not $script:MiActions.Busy -and
-        $null -eq $script:MiActions.Pending -and $script:MiActions.CanAudit -and -not (Test-MiElevated)) {
-        $active=((Test-MiActionSnapshot -Item $item -Snapshot $script:LatestSnapshot) -eq 'Pass')
-        if ($script:ServicePids.ContainsKey([int]$item.PID)) { $active=$false }
+    $eligible=($null -ne $item -and $null -ne $script:LatestSnapshot -and
+        -not $script:MiActions.Busy -and $null -eq $script:MiActions.Pending -and
+        $script:MiActions.CanAudit -and -not (Test-MiElevated))
+    if ($eligible) {
+        $eligible=((Test-MiActionSnapshot $item $script:LatestSnapshot) -eq 'Pass')
+        if ($script:ServicePids.ContainsKey([int]$item.PID)) { $eligible=$false }
     }
-    $script:MiGracefulButton.Enabled=$active
-    $script:MiForceButton.Enabled=$active -and $script:MiDangerCheck.Checked
+    $text='不可操作：目标、采样、权限或审计未就绪。'
+    if ($null -ne $script:MiProcessJob) { $text='正在后台检查或执行…危险操作暂不可用。' }
+    elseif ($eligible) {
+        $key=Get-MiProcessCheckKey $item
+        if ($null -eq $script:MiProcessCheck -or $script:MiProcessCheck.Key -cne $key -or
+            $script:MiProcessCheck.Clock.Elapsed.TotalSeconds -gt 15) {
+            try {
+                Start-MiProcessJob -Kind Check -Item $item -Snapshot $script:LatestSnapshot
+                $script:MiProcessCheck=[pscustomobject]@{Key=$key;State='Checking';Clock=[Diagnostics.Stopwatch]::StartNew()}
+                $text='正在后台检查进程身份…'
+            } catch { $text='检查未启动：'+$_.Exception.Message }
+        } elseif ($script:MiProcessCheck.State -eq 'Verified') {
+            $script:MiGracefulButton.Enabled=$true
+            $script:MiForceButton.Enabled=[bool]$script:MiDangerCheck.Checked
+            $text='身份预检查通过；执行前仍会独立复核。'
+        } else { $text='身份检查未通过或超时，禁止操作：'+$script:MiProcessCheck.Error }
+    }
+    if ($null -ne $script:ProcessCheckLabel) { $script:ProcessCheckLabel.Text=$text }
 }
 function Request-MiGuiProcessAction {
     param([ValidateSet('Graceful','Force')][string]$Mode)
-    if ($script:MiActions.Busy -or $null -ne $script:MiActions.Pending) { return }
+    Update-MiActionButtons
+    if (-not $script:MiGracefulButton.Enabled -or ($Mode -eq 'Force' -and -not $script:MiForceButton.Enabled)) { return }
     $item=Get-MiSelectedProcess
-    if ($null -eq $item -or $null -eq $script:LatestSnapshot) { return }
-    if ((Test-MiActionSnapshot -Item $item -Snapshot $script:LatestSnapshot) -ne 'Pass') {
-        Set-MiStatus '选中进程样本已经无效，请等待新扫描。' $true;return
-    }
-    if ($Mode -eq 'Force' -and -not $script:MiDangerCheck.Checked) { return }
+    $key=Get-MiProcessCheckKey $item
     $modeText=if ($Mode -eq 'Force') {'强制结束（可能丢失未保存的数据）'} else {'向主窗口发送普通关闭请求'}
     $answer=[Windows.Forms.MessageBox]::Show($script:Form,
         ('目标：{0} (PID {1})'+[Environment]::NewLine+'操作：{2}'+[Environment]::NewLine+'此操作不可撤销，提交内存高也不代表没有用。继续？' -f $item.Name,$item.PID,$modeText),
         '独立确认目标与后果','YesNo','Warning')
-    if ($answer -ne [Windows.Forms.DialogResult]::Yes) {return}
+    if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
     $word=if ($Mode -eq 'Force') {'KILL'} else {'CLOSE'}
-    if (-not (Show-MiActionTypedDialog -Prompt ('请输入 '+$word+' '+$item.PID+' 确认所选进程：'+$item.Name) -Expected ($word+' '+$item.PID))) {return}
-    if ($Mode -eq 'Force') {
-        if (-not (Show-MiActionTypedDialog -Prompt '最后确认：强制结束可能丢失未保存的数据。' -Expected 'I ACCEPT DATA LOSS')) {return}
+    if (-not (Show-MiActionTypedDialog -Prompt ('请输入 '+$word+' '+$item.PID+' 确认所选进程：'+$item.Name) -Expected ($word+' '+$item.PID))) { return }
+    if ($Mode -eq 'Force' -and -not (Show-MiActionTypedDialog -Prompt '最后确认：强制结束可能丢失未保存的数据。' -Expected 'I ACCEPT DATA LOSS')) { return }
+    # 模态确认期间仍可能刷新采样或选择：绝不把旧确认转移到另一个进程实例。
+    if ($key -cne (Get-MiProcessCheckKey (Get-MiSelectedProcess)) -or $null -ne $script:MiProcessJob -or
+        $null -ne $script:MiActions.Pending -or (Test-MiActionSnapshot $item $script:LatestSnapshot) -ne 'Pass') {
+        Set-MiOperationStatus 'Rejected' '确认期间目标或采样已变化，请重新选择并确认。' $true
+        return
     }
-    $result=Invoke-MiProcessAction -Mode $Mode -Item $item -Snapshot $script:LatestSnapshot -DangerEnabled ([bool]$script:MiDangerCheck.Checked)
+    try {
+        Start-MiProcessJob -Kind Execute -Item $item -Snapshot $script:LatestSnapshot -Mode $Mode -DangerEnabled ([bool]$script:MiDangerCheck.Checked)
+        Set-MiOperationStatus 'Checking' ('后台复核并执行：'+$item.Name+' (PID '+$item.PID+')')
+    } catch { Set-MiOperationStatus 'Rejected' ('操作未启动：'+$_.Exception.Message) $true }
     Update-MiActionButtons
-    if ($result.Outcome -eq 'Requested') {
-        Set-MiStatus ('已发送 '+$modeText+'：'+$item.Name+'；观察窗口 60 秒，不保证立刻退出。')
-    } else {
-        Set-MiStatus ('操作拒绝或失败：'+$result.Error) $true
-    }
 }
 function Show-MiActionLog {
-    $form=[Windows.Forms.Form]::new();$form.Text='进程操作审计（当前用户可修改的本地记录）'
-    $form.Size=[Drawing.Size]::new(850,530);$form.StartPosition='CenterParent'
-    $box=[Windows.Forms.TextBox]::new();$box.Multiline=$true;$box.ReadOnly=$true
-    $box.ScrollBars='Both';$box.WordWrap=$false;$box.Dock='Fill'
-    $box.Font=[Drawing.Font]::new('Consolas',[single]9)
-    try {
-        if ([IO.File]::Exists($script:MiActions.AuditPath)) {
-            $box.Lines=[string[]]@(Get-Content -LiteralPath $script:MiActions.AuditPath -Tail 100 -Encoding UTF8 -ErrorAction Stop)
-        } else { $box.Text='暂无普通进程操作记录。' }
-    } catch { $box.Text='读取日志失败：'+$_.Exception.Message }
-    $form.Controls.Add($box)
-    try {[void]$form.ShowDialog($script:Form)}finally{$form.Dispose()}
+    $form=[Windows.Forms.Form]::new();$form.Text='完整操作审计'
+    $form.Size=[Drawing.Size]::new(900,550);$form.StartPosition='CenterParent'
+    $tabs=[Windows.Forms.TabControl]::new();$tabs.Dock='Fill'
+    $paths=@([pscustomobject]@{Name='普通进程（当前用户本地记录）';Path=$script:MiActions.AuditPath},
+        [pscustomobject]@{Name='管理员执行器（受保护审计）';Path=(Get-MiSecurityPaths).Audit})
+    foreach ($entry in $paths) {
+        $page=[Windows.Forms.TabPage]::new();$page.Text=$entry.Name
+        $box=[Windows.Forms.TextBox]::new();$box.Multiline=$true;$box.ReadOnly=$true
+        $box.ScrollBars='Both';$box.WordWrap=$false;$box.Dock='Fill';$box.MaxLength=[int]::MaxValue
+        $box.Font=[Drawing.Font]::new('Consolas',[single]9)
+        try {
+            if ([IO.File]::Exists($entry.Path)) { $box.Text=[IO.File]::ReadAllText($entry.Path,[Text.Encoding]::UTF8) }
+            else { $box.Text='暂无记录。'+[Environment]::NewLine+$entry.Path }
+        } catch { $box.Text='读取日志失败：'+$_.Exception.Message+[Environment]::NewLine+$entry.Path }
+        $page.Controls.Add($box);$tabs.TabPages.Add($page)
+    }
+    $form.Controls.Add($tabs)
+    try { [void]$form.ShowDialog($script:Form) } finally { $form.Dispose() }
 }
 
 $btnRestart.Add_Click({
@@ -709,6 +767,7 @@ try {
             try { [void]$script:WorkerPs.BeginStop($null,$null) } catch {}
         }
     }
+    Close-MiProcessJob
     Stop-MiActionObservation
     Close-MiPrivilegeBridge
     Close-MiServiceBridge

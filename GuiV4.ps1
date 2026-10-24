@@ -13,6 +13,25 @@ function Get-MiV4Risk {
     }
     return '待核验（不可自动操作）'
 }
+function Get-MiVersionPresentation {
+    param([string]$Root=$PSScriptRoot)
+    # VERSION 只作为显示来源，不替代管理员执行器的版本白名单、ACL 或哈希校验。
+    # 缺失或损坏时明确中止初始化，不能回退到旧的硬编码版本冒充当前版本。
+    $versionPath=Join-Path $Root 'VERSION'
+    try { $version=[IO.File]::ReadAllText($versionPath,[Text.Encoding]::UTF8).Trim() }
+    catch { throw ('无法读取 VERSION，不能确认应用版本：'+$_.Exception.Message) }
+    $parsed=$null
+    if ($version.Length -gt 24 -or $version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or
+        -not [version]::TryParse($version,[ref]$parsed)) { throw 'VERSION 格式无效；需要 major.minor.patch。' }
+    return [pscustomobject]@{
+        Version=$version
+        WindowTitle=('MemoryInspector v{0} · 安全进程管理' -f $version)
+        TrayText=('MemoryInspector v{0} · 受控操作' -f $version)
+        ServiceNote=('M7：受保护服务管理 · 需先安装当前版本 {0}，并经管理员逐项批准。' -f $version)
+        PrivilegeNote=('M7：使用 Installer.ps1 安装当前版本 {0}。受保护服务操作须 UAC + 管理员再次确认。' -f $version)
+    }
+}
+
 function Protect-MiV4Csv {
     param($Value)
     if ($null -eq $Value) { return '' }
@@ -119,6 +138,7 @@ function Add-MiV4ProcessHistory {
     param($Snapshot)
     if ($null -eq $Snapshot -or $null -eq $Snapshot.Processes -or $Snapshot.Processes.Status -eq 'Failed') { return }
     $time=([datetime]$Snapshot.CaptureEndUtc).ToUniversalTime()
+    if ($Snapshot.TimeDiscontinuity) { $script:ProcessTrend.Clear() }
     $cutoff=$time.AddMinutes(-30)
     foreach ($p in @($Snapshot.Processes.Items | Where-Object { $null -ne $_.PrivateBytes } |
         Sort-Object -Property PrivateBytes -Descending | Select-Object -First 60)) {
@@ -307,10 +327,10 @@ function Request-MiV4ServiceAction {
         } else {
             $script:ServiceNote.Text=('UAC 已启动：'+$label+' '+$service.Name+'；请在提升权限的窗口中再次输入确认。')
         }
-        Set-MiStatus $script:ServiceNote.Text
+        Set-MiOperationStatus $status $script:ServiceNote.Text
     } catch {
         $script:ServiceNote.Text='服务操作未启动：'+$_.Exception.Message
-        Set-MiStatus $script:ServiceNote.Text $true
+        Set-MiOperationStatus 'Rejected' $script:ServiceNote.Text $true
     }
     Update-MiV4ServiceButtons
 }
@@ -450,7 +470,7 @@ function Initialize-MiV4Gui {
     $Root.RowStyles.Clear();$Root.RowCount=3
     [void]$Root.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]53)))
     [void]$Root.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Percent',[single]100)))
-    [void]$Root.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]31)))
+    [void]$Root.RowStyles.Add(([System.Windows.Forms.RowStyle]::new('Absolute',[single]82)))
     $script:Tabs=New-Object System.Windows.Forms.TabControl
     $script:Tabs.Dock='Fill'
     $script:Tabs.Font=[Drawing.Font]::new('Microsoft YaHei UI',[single]10)
@@ -462,6 +482,26 @@ function Initialize-MiV4Gui {
     $Root.Controls.Add($script:Tabs,0,1)
     $Root.Controls.Add($StatusBar,0,2)
     $Root.ResumeLayout()
+
+    # 监控和操作反馈分别占固定行；长结果保留文本，完整审计始终可通过按钮访问。
+    $StatusBar.SuspendLayout()
+    $StatusBar.Controls.Clear()
+    $statusLayout=[Windows.Forms.TableLayoutPanel]::new()
+    $statusLayout.Dock='Fill';$statusLayout.RowCount=2;$statusLayout.ColumnCount=2
+    [void]$statusLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute',[single]27))
+    [void]$statusLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent',[single]100))
+    [void]$statusLayout.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new('Percent',[single]100))
+    [void]$statusLayout.ColumnStyles.Add([Windows.Forms.ColumnStyle]::new('Absolute',[single]126))
+    $statusLayout.Controls.Add($script:StatusLabel,0,0);$statusLayout.SetColumnSpan($script:StatusLabel,2)
+    $script:OperationLabel=New-MiLabel '操作结果：暂无操作。' 9
+    $script:OperationLabel.Dock='Fill';$script:OperationLabel.TextAlign='MiddleLeft'
+    $script:OperationLabel.AutoEllipsis=$true;$script:OperationLabel.AccessibleName='最近操作结果'
+    $statusLayout.Controls.Add($script:OperationLabel,0,1)
+    $auditButton=New-MiButton '完整操作审计' 120;$auditButton.Dock='Fill'
+    $auditButton.Add_Click({Show-MiActionLog})
+    $statusLayout.Controls.Add($auditButton,1,1)
+    $StatusBar.Controls.Add($statusLayout);$StatusBar.ResumeLayout()
+
 
     $procPage=$script:Tabs.TabPages[0]
     $procLayout=New-Object System.Windows.Forms.TableLayoutPanel
@@ -517,18 +557,22 @@ function Initialize-MiV4Gui {
     $script:ProcessChart.Series['RAM'].Name='RAM'
     $split.Controls.Add($script:ProcessChart,0,2)
     $actionPanel=New-Object System.Windows.Forms.TableLayoutPanel
-    $actionPanel.Dock='Fill';$actionPanel.RowCount=2;$actionPanel.ColumnCount=2
+    $actionPanel.Dock='Fill';$actionPanel.RowCount=3;$actionPanel.ColumnCount=2
     [void]$actionPanel.ColumnStyles.Add(([Windows.Forms.ColumnStyle]::new('Percent',[single]50)))
     [void]$actionPanel.ColumnStyles.Add(([Windows.Forms.ColumnStyle]::new('Percent',[single]50)))
+    [void]$actionPanel.RowStyles.Add(([Windows.Forms.RowStyle]::new('Absolute',[single]24)))
     [void]$actionPanel.RowStyles.Add(([Windows.Forms.RowStyle]::new('Percent',[single]48)))
     [void]$actionPanel.RowStyles.Add(([Windows.Forms.RowStyle]::new('Percent',[single]52)))
+    $script:ProcessCheckLabel=New-MiLabel '等待目标身份预检查。' 8
+    $script:ProcessCheckLabel.Dock='Fill';$script:ProcessCheckLabel.AutoEllipsis=$true
+    $actionPanel.Controls.Add($script:ProcessCheckLabel,0,0);$actionPanel.SetColumnSpan($script:ProcessCheckLabel,2)
     $script:MiDangerCheck=[Windows.Forms.CheckBox]::new()
     $script:MiDangerCheck.Text='危险模式（仅对核验后的普通 GUI 应用）';$script:MiDangerCheck.Dock='Fill'
     $script:MiDangerCheck.Checked=$false;$script:MiDangerCheck.Font=$script:Font
-    $actionPanel.Controls.Add($script:MiDangerCheck,0,0);$actionPanel.SetColumnSpan($script:MiDangerCheck,2)
+    $actionPanel.Controls.Add($script:MiDangerCheck,0,1);$actionPanel.SetColumnSpan($script:MiDangerCheck,2)
     $script:MiGracefulButton=New-MiButton '正常关闭' 115;$script:MiGracefulButton.Dock='Fill';$script:MiGracefulButton.Enabled=$false
     $script:MiForceButton=New-MiButton '强制结束' 115;$script:MiForceButton.Dock='Fill';$script:MiForceButton.Enabled=$false
-    $actionPanel.Controls.Add($script:MiGracefulButton,0,1);$actionPanel.Controls.Add($script:MiForceButton,1,1)
+    $actionPanel.Controls.Add($script:MiGracefulButton,0,2);$actionPanel.Controls.Add($script:MiForceButton,1,2)
     $split.Controls.Add($actionPanel,0,1)
     $script:MiDangerCheck.Add_CheckedChanged({Update-MiActionButtons})
     $script:MiGracefulButton.Add_Click({Request-MiGuiProcessAction -Mode Graceful})
@@ -552,7 +596,7 @@ function Initialize-MiV4Gui {
     $serviceHeader=New-Object System.Windows.Forms.Panel
     $serviceHeader.Dock='Top';$serviceHeader.Height=68
     $servicePage.Controls.Add($serviceHeader)
-    $script:ServiceNote=New-MiLabel 'M7：受保护服务管理 · 需先安装 0.0.7，并经管理员逐项批准。' 9
+    $script:ServiceNote=New-MiLabel $script:VersionInfo.ServiceNote 9
     $script:ServiceNote.Dock='Bottom';$script:ServiceNote.Height=26
     $serviceHeader.Controls.Add($script:ServiceNote)
     $script:ServiceSearch=New-Object System.Windows.Forms.TextBox
@@ -632,7 +676,7 @@ function Initialize-MiV4Gui {
     $script:TraySetting.Text='点击 X 时最小化到系统托盘；使用托盘菜单“完全退出”结束程序。'
     $script:TraySetting.Checked=$script:CloseToTray
     $script:TraySetting.Size=[Drawing.Size]::new(650,43);$settingsPanel.Controls.Add($script:TraySetting)
-    $script:MiPrivilegeNote=New-MiLabel 'M7：使用 Installer.ps1 安装 0.0.7。受保护服务操作须 UAC + 管理员再次确认。' 9
+    $script:MiPrivilegeNote=New-MiLabel $script:VersionInfo.PrivilegeNote 9
     $script:MiPrivilegeNote.Size=[Drawing.Size]::new(750,45)
     $settingsPanel.Controls.Add($script:MiPrivilegeNote)
     $verifyButton=New-MiButton '验证管理员执行器（UAC）' 260
@@ -667,7 +711,7 @@ function Initialize-MiV4Gui {
     $exitItem=$script:TrayMenu.Items.Add('完全退出')
     $script:TrayIcon=New-Object System.Windows.Forms.NotifyIcon
     $script:TrayIcon.Icon=[Drawing.SystemIcons]::Information
-    $script:TrayIcon.Text='MemoryInspector v0.0.7 · 受控操作'
+    $script:TrayIcon.Text=$script:VersionInfo.TrayText
     $script:TrayIcon.ContextMenuStrip=$script:TrayMenu
     $script:TrayIcon.Visible=$true
     $showItem.Add_Click({$script:Form.Show();$script:Form.WindowState='Normal';$script:Form.Activate()})

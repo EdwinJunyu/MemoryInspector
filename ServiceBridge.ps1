@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <# M7 GUI service bridge: only whitelisted operation names, explicit UAC, no SCM commands here. #>
 $script:MiServiceRequest=$null
 function Get-MiServiceApprovalMap {
@@ -25,7 +25,7 @@ function Start-MiServiceRequest {
     if (-not (Test-MiPrivilegedOperation -Operation $Operation -RequestId $id -ServiceName $ServiceName)) {
         throw 'Unsupported operation or service name.'
     }
-    if (-not (Test-MiPrivilegeBridgeInstalled)) { throw 'Run the protected 0.0.7 installation first.' }
+    if (-not (Test-MiPrivilegeBridgeInstalled)) { throw 'Run Installer.ps1 for the current release from VERSION first.' }
     $paths=Get-MiSecurityPaths
     $exe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not [IO.File]::Exists($exe)) { throw 'Windows PowerShell 5.1 missing.' }

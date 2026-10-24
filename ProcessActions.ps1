@@ -5,6 +5,8 @@ Never touches Windows services or admin elevation. All exit requests are manual.
 A writable per-user action log is an operational record, NOT tamper-proof security audit.
 #>
 $script:MiActions = $null
+$script:MiProcessJob = $null
+$script:MiProcessCheck = $null
 function Initialize-MiActions {
     $folder = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MemoryInspector'
     $script:MiActions = [pscustomobject]@{
@@ -85,6 +87,7 @@ function Write-MiProcessAudit {
 }
 function Assert-MiProcessTarget {
     param($Item,$Snapshot)
+    $checkStarted=[Diagnostics.Stopwatch]::StartNew()
     $reason = Test-MiActionSnapshot -Item $Item -Snapshot $Snapshot
     if ($reason -ne 'Pass') { throw ('目标检查失败：'+$reason) }
     if (Test-MiElevated) { throw '当前 GUI 以管理员权限运行，禁止在本阶段执行进程操作。' }
@@ -102,7 +105,7 @@ function Assert-MiProcessTarget {
         if ([int]$proc.SessionId -ne $script:MiActions.CurrentSession -or
             [long]$proc.MainWindowHandle.ToInt64() -eq 0) { throw '必须是当前会话具有可用主窗口的普通应用。' }
 
-        $cim = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = {0}' -f $Item.PID) -ErrorAction Stop
+        $cim = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = {0}' -f $Item.PID) -OperationTimeoutSec 5 -ErrorAction Stop
         if ($null -eq $cim -or $null -eq $cim.CreationDate -or
             [string]::IsNullOrWhiteSpace([string]$cim.ExecutablePath)) { throw 'CIM 身份信息缺失。' }
         $cimTime = ([datetime]$cim.CreationDate).ToUniversalTime().Ticks
@@ -111,11 +114,18 @@ function Assert-MiProcessTarget {
             -not [string]::Equals([string]$cim.ExecutablePath,$path,[StringComparison]::OrdinalIgnoreCase)) {
             throw 'CIM 身份、会话或可执行路径不一致。'
         }
-        $owner = Invoke-CimMethod -InputObject $cim -MethodName GetOwnerSid -ErrorAction Stop
+        $owner = Invoke-CimMethod -InputObject $cim -MethodName GetOwnerSid -OperationTimeoutSec 5 -ErrorAction Stop
         if ($null -eq $owner -or [int]$owner.ReturnValue -ne 0 -or
             [string]$owner.Sid -cne $script:MiActions.CurrentSid) { throw '无法确认进程属于当前用户。' }
-        $services = @(Get-CimInstance -ClassName Win32_Service -Filter ('ProcessId = {0}' -f $Item.PID) -ErrorAction Stop)
+        $services = @(Get-CimInstance -ClassName Win32_Service -Filter ('ProcessId = {0}' -f $Item.PID) -OperationTimeoutSec 5 -ErrorAction Stop)
         if ($services.Count -gt 0) { throw '该 PID 承载 Windows 服务，禁止进程级关闭和 Kill。' }
+        # 慢查询完成后再次核验原 Process 对象；超出总预算或实例改变均拒绝发送。
+        $proc.Refresh()
+        if ($checkStarted.Elapsed.TotalSeconds -gt 15 -or $proc.HasExited -or
+            $proc.ProcessName -cne $Item.Name -or
+            [long]$proc.StartTime.ToUniversalTime().Ticks -ne [long]$Item.StartUtcTicks) {
+            throw '身份检查超时或目标进程实例已改变。'
+        }
         return $proc
     } catch {
         $proc.Dispose()
@@ -336,4 +346,89 @@ function Stop-MiActionObservation {
     })
     Close-MiProcessTargetLock -Operation $p -Status 'UnknownOutcome'
     $script:MiActions.Pending=$null
+}
+
+
+function Get-MiProcessCheckKey {
+    param($Item)
+    if ($null -eq $Item) { return '' }
+    return ('{0}:{1}:{2}' -f $Item.PID,$Item.StartUtcTicks,$Item.Name)
+}
+function Start-MiProcessJob {
+    param([ValidateSet('Check','Execute')][string]$Kind,$Item,$Snapshot,
+        [ValidateSet('Graceful','Force')][string]$Mode='Graceful',[bool]$DangerEnabled=$false,
+        [string]$ModulePath=(Join-Path $PSScriptRoot 'ProcessActions.ps1'))
+    if ($null -ne $script:MiProcessJob) { throw '已有进程验证或执行任务，拒绝重复请求。' }
+    $ps=$null
+    try {
+        # 独立状态副本：后台不修改 GUI 正在观察的 Pending，也不访问控件。
+        $state=[pscustomobject]@{
+            AuditPath=$script:MiActions.AuditPath;CanAudit=$script:MiActions.CanAudit
+            CurrentSid=$script:MiActions.CurrentSid;CurrentSession=$script:MiActions.CurrentSession
+            Busy=$false;Pending=$null
+        }
+        $target=$Item.PSObject.Copy()
+        $ps=[Management.Automation.PowerShell]::Create()
+        [void]$ps.AddScript(@'
+param($ModulePath,$State,$Kind,$Item,$Snapshot,$Mode,$DangerEnabled)
+$ErrorActionPreference='Stop'
+. $ModulePath
+$script:MiActions=$State
+if ($Kind -eq 'Check') {
+    $proc=$null
+    try {
+        $proc=Assert-MiProcessTarget -Item $Item -Snapshot $Snapshot
+        [pscustomobject]@{State='Verified';CanAudit=$State.CanAudit}
+    } finally { if ($null -ne $proc) { $proc.Dispose() } }
+} else {
+    $result=Invoke-MiProcessAction -Mode $Mode -Item $Item -Snapshot $Snapshot -DangerEnabled $DangerEnabled
+    [pscustomobject]@{State=$result.Outcome;Result=$result;CanAudit=$State.CanAudit}
+}
+'@).AddArgument($ModulePath).AddArgument($state).AddArgument($Kind).AddArgument($target).
+            AddArgument($Snapshot).AddArgument($Mode).AddArgument($DangerEnabled)
+        $handle=$ps.BeginInvoke()
+        $script:MiProcessJob=[pscustomobject]@{
+            Kind=$Kind;Key=(Get-MiProcessCheckKey $target);Item=$target
+            PowerShell=$ps;Handle=$handle;Clock=[Diagnostics.Stopwatch]::StartNew();TimeoutReported=$false
+        }
+    } catch { if ($null -ne $ps) { $ps.Dispose() };throw }
+}
+function Poll-MiProcessJob {
+    param([double]$TimeoutSeconds=20)
+    $job=$script:MiProcessJob
+    if ($null -eq $job) { return $null }
+    if (-not $job.Handle.IsCompleted) {
+        if (-not $job.TimeoutReported -and $job.Clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
+            $job.TimeoutReported=$true
+            # 只异步取消预验证。正式执行结果未知时保留任务和互斥，不盲目停止后重发。
+            if ($job.Kind -eq 'Check') { [void]$job.PowerShell.BeginStop($null,$null) }
+            return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State='TimedOut';Error='身份查询超时，未允许新的操作。';Result=$null}
+        }
+        return $null
+    }
+    try {
+        $data=@($job.PowerShell.EndInvoke($job.Handle))
+        if ($job.PowerShell.HadErrors -or $data.Count -ne 1) { throw ('后台身份验证或执行失败：'+($job.PowerShell.Streams.Error|Out-String)) }
+        $payload=$data[0]
+        if (-not $payload.CanAudit) { $script:MiActions.CanAudit=$false }
+        if ($job.Kind -eq 'Execute' -and $null -ne $payload.Result -and $payload.Result.Outcome -eq 'Requested') {
+            # 交接文件锁及观察对象，原跨进程锁在整个交接期间保持。
+            $script:MiActions.Pending=$payload.Result
+        }
+        $state=[string]$payload.State
+        if ($job.TimeoutReported) { $state=if ($job.Kind -eq 'Check') {'TimedOut'} else {'UnknownOutcome'} }
+        return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State=$state;Error=$payload.Result.Error;Result=$payload.Result}
+    } catch {
+        return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State='Rejected';Error=$_.Exception.Message;Result=$null}
+    } finally {
+        $job.PowerShell.Dispose();$job.Clock.Stop();$script:MiProcessJob=$null
+    }
+}
+function Close-MiProcessJob {
+    if ($null -eq $script:MiProcessJob) { return }
+    if ($script:MiProcessJob.Handle.IsCompleted) { [void](Poll-MiProcessJob);return }
+    if ($script:MiProcessJob.Kind -eq 'Check') {
+        try { [void]$script:MiProcessJob.PowerShell.BeginStop($null,$null) } catch {}
+    }
+    # 未确认执行的 Dispatching/Requested 仍受 P1 目标锁状态保护，退出不会允许重试。
 }

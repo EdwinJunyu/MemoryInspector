@@ -418,6 +418,7 @@ function Save-MiSnapshot {
         $stamp=$t.ToString('o');$day=$t.ToString('yyyy-MM-dd')
         $sys=[ordered]@{
             SchemaVersion=1;RecordType='SystemSnapshot';Sequence=$Snapshot.Sequence;IntervalSeconds=$Snapshot.IntervalSeconds
+            ContinuityId=$Snapshot.ContinuityId;TimeDiscontinuity=$Snapshot.TimeDiscontinuity;MonotonicSeconds=$Snapshot.MonotonicSeconds
             CaptureEndUtc=$stamp;Status=$Snapshot.Status;DurationMs=$Snapshot.DurationMs
             SystemStatus=$Snapshot.System.Status;Error=$Snapshot.System.Error
             TotalPhysicalBytes=$Snapshot.System.TotalPhysicalBytes
@@ -447,6 +448,7 @@ function Save-MiSnapshot {
         }
         $proc=[ordered]@{
             SchemaVersion=1;RecordType='ProcessSnapshot';Sequence=$Snapshot.Sequence;IntervalSeconds=$Snapshot.IntervalSeconds
+            ContinuityId=$Snapshot.ContinuityId;TimeDiscontinuity=$Snapshot.TimeDiscontinuity;MonotonicSeconds=$Snapshot.MonotonicSeconds
             CaptureEndUtc=$stamp;ProcessStatus=$Snapshot.Processes.Status
             Total=$Snapshot.Processes.Total;Incomplete=$Snapshot.Processes.Incomplete
             Error=$Snapshot.Processes.Error;Full=$full;Items=@($rows.ToArray())
