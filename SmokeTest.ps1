@@ -71,3 +71,36 @@ Write-Host 'PASS: snapshot schema and available collection sources.' -Foreground
     if ((Get-MiSystemSnapshot).Status -ne 'Failed') { throw 'Empty CIM records were accepted.' }
 }
 Write-Host 'PASS: P2-01 null/invalid/overflow/zero counters, partial sources, fallback and CIM failures.' -ForegroundColor Green
+
+# 本轮性能修复仍读取真实 Windows 创建时间，不能靠缓存身份或把失败改成零提速。
+$self=Get-Process -Id $PID
+try {
+    $expectedTicks=$self.StartTime.ToUniversalTime().Ticks
+    if ((Get-MiProcessStartUtcTicks -ProcessId $PID) -ne $expectedTicks -or
+        (Get-MiProcessStartUtcTicks -ProcessId $PID) -ne $expectedTicks) {throw 'Limited-query creation time differs from the actual process identity.'}
+    foreach($invalidPid in @(0,-1,2147483647)) {
+        if ($null -ne (Get-MiProcessStartUtcTicks -ProcessId $invalidPid)) {throw 'Unavailable creation time became a valid identity.'}
+    }
+    $self.Refresh();$handlesBefore=$self.HandleCount
+    for($i=0;$i -lt 200;$i++) {[void](Get-MiProcessStartUtcTicks -ProcessId $PID)}
+    $self.Refresh()
+    if ($self.HandleCount -gt $handlesBefore+8) {throw 'Creation-time sampling leaked process handles.'}
+} finally {$self.Dispose()}
+& {
+    $script:KnownCreationTicks=$expectedTicks
+    function Get-MiProcessStartUtcTicks {param($ProcessId) return $script:KnownCreationTicks}
+    function Get-Process {
+        param($ErrorAction)
+        $p=[pscustomobject]@{Id=42;ProcessName='collector-fixture';PrivateMemorySize64=8MB;WorkingSet64=4MB}
+        $p|Add-Member ScriptProperty StartTime {throw 'Slow legacy StartTime getter must not be called.'}
+        $p|Add-Member ScriptMethod Dispose {}
+        return $p
+    }
+    $known=Get-MiProcessSnapshot
+    if ($known.Status -ne 'Success' -or $known.Items[0].StartUtcTicks -ne $expectedTicks) {throw 'Fresh collector identity was lost.'}
+    $script:KnownCreationTicks=$null
+    $unknown=Get-MiProcessSnapshot
+    if ($unknown.Status -ne 'Partial' -or $unknown.Incomplete -ne 1 -or $null -ne $unknown.Items[0].StartUtcTicks -or
+        $unknown.Items[0].PrivateBytes -ne 8MB) {throw 'Unavailable identity was fabricated or valid independent memory was lost.'}
+}
+Write-Host 'PASS: fresh limited-query creation times, failure/null identity, handle release and no legacy getter.' -ForegroundColor Green

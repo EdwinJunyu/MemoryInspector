@@ -28,6 +28,33 @@ function New-Fixture {
         }
     }
 }
+# 证据点的整数精度不能因节省内存而退化为 double；窗口淘汰不能截断30分钟。
+$packed=New-MiAnalyzer -BootId 'memory-fixture' -Root '' -IntervalSeconds 5
+$packedUtc=[datetime]::SpecifyKind([datetime]'2026-10-24T10:00:00',[DateTimeKind]::Utc)
+$exactBytes=[long]9007199254740993
+for($packedIndex=0;$packedIndex -le 360;$packedIndex++) {
+    Add-MiTrackSample -Analyzer $packed -Snapshot (New-Fixture -Utc $packedUtc.AddSeconds(5*$packedIndex) -PrivateBytes $exactBytes)
+}
+$packedList=$packed.Tracks['memory-fixture:321:987654321'].Samples
+Assert-Mi ($packedList.Count -eq 361 -and $packedList[0].Bytes -eq $exactBytes -and
+    ($packedList[360].Utc-$packedList[0].Utc).TotalSeconds -eq 1800) 'compact evidence lost exact bytes or full window'
+Add-MiTrackSample -Analyzer $packed -Snapshot (New-Fixture -Utc $packedUtc.AddHours(2) -PrivateBytes $exactBytes)
+Assert-Mi ($packedList.Count -eq 1 -and $packedList[0].Bytes -eq $exactBytes) 'compact evidence retained expired samples'
+# 独立的存活对象预算：100实例各361点必须全部保留，不能靠缩短窗口通过。
+# GC 仅在测试测量前后使用，不在生产循环内强迫回收或修剪工作集。
+$budgetAnalyzer=New-MiAnalyzer -BootId 'budget' -Root '' -IntervalSeconds 5
+$budgetRows=@(for($budgetPid=1;$budgetPid -le 100;$budgetPid++){
+    [pscustomobject]@{PID=$budgetPid;StartUtcTicks=[long]$budgetPid;Name='budget';PrivateBytes=1GB}
+})
+$budgetBefore=[GC]::GetTotalMemory($true)
+for($budgetStep=0;$budgetStep -le 360;$budgetStep++) {
+    Add-MiTrackSample -Analyzer $budgetAnalyzer -Snapshot ([pscustomobject]@{CaptureEndUtc=$packedUtc.AddSeconds($budgetStep*5);Processes=[pscustomobject]@{Status='Success';Items=$budgetRows}})
+}
+$budgetAfter=[GC]::GetTotalMemory($true)
+Assert-Mi (($budgetAfter-$budgetBefore) -lt 16MB) '100 complete instance windows exceeded 16 MiB retained-managed budget'
+Assert-Mi ($budgetAnalyzer.Tracks.Count -eq 100 -and @($budgetAnalyzer.Tracks.Values|Where-Object {$_.Samples.Count -ne 361}).Count -eq 0) 'memory optimization dropped evidence to meet budget'
+$budgetAnalyzer=$null
+
 function New-Trend {
     param([scriptblock]$Calculate,[int]$ProcessId=321,[long]$StartTicks=987654321L,[int]$Step=1,
         [int]$IntervalSeconds=10)
@@ -89,7 +116,11 @@ try {
 
     $jitter=New-Trend -IntervalSeconds 5 -Calculate {param($i) (400MB+[long]($i*5MB))}
     $jitterSamples=$jitter.Analyzer.Tracks['TestBoot:321:987654321'].Samples
-    for ($i=0;$i -lt $jitterSamples.Count;$i++) { $jitterSamples[$i].Utc=$jitterSamples[$i].Utc.AddMilliseconds(($i%2)*200) }
+    # 值类型点以完整点写回列表，仍给每隔一个真实证据点注入原有200ms抖动。
+    for ($i=0;$i -lt $jitterSamples.Count;$i++) {
+        $point=$jitterSamples[$i]
+        $jitterSamples[$i]=[MemoryInspector.AnalysisPoint]::new($point.Utc.AddMilliseconds(($i%2)*200),$point.Bytes)
+    }
     $jitterReport=Get-MiProcessAnomaly -Analyzer $jitter.Analyzer -Process $jitter.Last.Processes.Items[0] -NowUtc $jitter.End
     Assert-Mi ($jitterReport.AnomalyState -eq 'SuspectedSustainedGrowth' -and $jitterReport.CoverageRatio -eq 1) 'Small completion-time jitter lost valid cadence slots.'
     $slowJitter=New-MiAnalyzer -BootId TestBoot -Root '' -IntervalSeconds 60
@@ -215,6 +246,40 @@ try {
     Assert-Mi ($readCount -eq 5) 'Recent saved samples not restored.'
     Assert-Mi ($restored.Tracks.Count -eq 1) 'Prior-boot records contaminated restored tracks.'
     Assert-Mi ($restored.Tracks['TestBoot:321:987654321'].Samples.Count -eq 5) 'Restore lost valid process samples.'
+    $plainRecords=@(Get-MiRecentProcessRecords -Root $root -NowUtc $now -IntervalSeconds 10)
+    $compactRecords=@(Get-MiRecentProcessRecords -Root $root -NowUtc $now -IntervalSeconds 10 -Compact)
+    Assert-Mi ($plainRecords.Count -eq $compactRecords.Count) 'compact restore lost records'
+    for($recordIndex=0;$recordIndex -lt $plainRecords.Count;$recordIndex++) {
+        $plainRecord=$plainRecords[$recordIndex];$compactRecord=$compactRecords[$recordIndex]
+        Assert-Mi ($plainRecord.CaptureEndUtc -eq $compactRecord.CaptureEndUtc -and $plainRecord.RecordType -eq $compactRecord.RecordType -and
+            $plainRecord.ProcessStatus -eq $compactRecord.ProcessStatus -and $plainRecord.IntervalSeconds -eq $compactRecord.IntervalSeconds -and
+            $plainRecord.MonotonicSeconds -eq $compactRecord.MonotonicSeconds -and $plainRecord.ContinuityId -eq $compactRecord.ContinuityId) 'compact restore changed ordering/continuity metadata'
+    }
+    $compactProbe=ConvertTo-MiCompactAnalysisRecord ([pscustomobject]@{SchemaVersion=1;RecordType='ProcessSnapshot';CaptureEndUtc=$now.ToString('o');IntervalSeconds=5;MonotonicSeconds=12.5;ContinuityId='exact';ProcessStatus='Partial';Items=@(
+        [pscustomobject]@{PID=1;Name='exact';StartUtcTicks=[long]9007199254740993;PrivateBytes=[long]9007199254740993;ProcessInstanceId='boot:1:9007199254740993'},
+        [pscustomobject]@{PID=2;Name='unknown';StartUtcTicks=$null;PrivateBytes=1GB},
+        [pscustomobject]@{PID=3;Name='negative';StartUtcTicks=3;PrivateBytes=-1},
+        [pscustomobject]@{PID=4;Name='missing';StartUtcTicks=4;PrivateBytes=$null}
+    )})
+    Assert-Mi ($compactProbe.Items.Count -eq 3 -and $compactProbe.Items[0].PrivateBytes -eq [long]9007199254740993 -and
+        $compactProbe.Items[0].StartUtcTicks -eq [long]9007199254740993 -and $compactProbe.Items[0].ProcessInstanceId -ceq 'boot:1:9007199254740993' -and
+        $compactProbe.Items[1].PrivateBytes -eq -1 -and $null -eq $compactProbe.Items[2].PrivateBytes -and
+        $compactProbe.MonotonicSeconds -eq 12.5 -and $compactProbe.ContinuityId -ceq 'exact') 'compact saved rows fabricated identities, rounded Int64 or lost metadata'
+    # null/负数行本身不贡献证据，但A→B→A连续段断点不能被紧凑读取器吞掉。
+    $counterIndex=0
+    foreach($badCounter in @($null,-1)) {
+        $counterRoot=Join-Path $root ('counter-continuity-'+$counterIndex++)
+        $counterDir=Join-Path $counterRoot 'process';[void][IO.Directory]::CreateDirectory($counterDir)
+        $counterLines=@(for($j=0;$j -lt 3;$j++){
+            [pscustomobject]@{SchemaVersion=1;RecordType='ProcessSnapshot';CaptureEndUtc=$now.AddMinutes(-10+$j*5).ToString('o');IntervalSeconds=5
+                MonotonicSeconds=(100+$j*100);ContinuityId=$(if($j -eq 1){'B'}else{'A'});ProcessStatus='Partial'
+                Items=@([pscustomobject]@{PID=321;Name='fixture';StartUtcTicks=987654321L;PrivateBytes=$(if($j -eq 1){$badCounter}else{400MB});ProcessInstanceId='TestBoot:321:987654321'})}|ConvertTo-Json -Depth 5 -Compress
+        })
+        [IO.File]::WriteAllLines((Join-Path $counterDir ('process-'+$now.ToString('yyyy-MM-dd')+'.jsonl')),$counterLines,[Text.UTF8Encoding]::new($false))
+        $counterAnalyzer=New-MiAnalyzer -BootId TestBoot -Root $counterRoot -IntervalSeconds 5
+        [void](Restore-MiAnalyzer $counterAnalyzer $now)
+        Assert-Mi ($counterAnalyzer.Tracks['TestBoot:321:987654321'].Samples.Count -eq 1) 'compact restore spliced evidence across a null/invalid-counter continuity barrier'
+    }
     $unknownBoot=New-MiAnalyzer -BootId BootUnavailable -Root $root
     Assert-Mi (-not $unknownBoot.CanRestore) 'Unknown boot id must disable cross-run restore.'
 

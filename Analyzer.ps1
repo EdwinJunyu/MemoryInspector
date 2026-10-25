@@ -35,10 +35,32 @@ function Get-MiAnalysisParameters {
     }
 }
 
+function Initialize-MiAnalysisStorage {
+    if ($null -ne ('MemoryInspector.AnalysisPoint' -as [type])) { return }
+    # 每个实例保留完整30分钟证据；紧凑值类型只消除 PSObject 开销，不降采样、不改归槽规则。
+    Add-Type -TypeDefinition @'
+using System;
+namespace MemoryInspector {
+    public struct AnalysisPoint {
+        public readonly DateTime Utc;
+        public readonly long Bytes;
+        public AnalysisPoint(DateTime utc, long bytes) { Utc=utc; Bytes=bytes; }
+    }
+    public struct SavedAnalysisProcess {
+        public int PID;
+        public string Name;
+        public long StartUtcTicks;
+        public string ProcessInstanceId;
+        public long? PrivateBytes;
+    }
+}
+'@ -ErrorAction Stop
+}
 function New-MiAnalyzer {
     param([string]$BootId,[string]$Root,[int]$WindowMinutes=30,
         [ValidateRange(5,60)][int]$IntervalSeconds=5)
     if ($WindowMinutes -ne 30) { throw 'Milestone 3 uses a fixed 30-minute diagnostic window.' }
+    Initialize-MiAnalysisStorage
     $usableBoot = -not [string]::IsNullOrWhiteSpace($BootId) -and $BootId -ne 'BootUnavailable'
     return [pscustomobject]@{
         BootId = $(if ($usableBoot) { $BootId } else { 'Session-'+[guid]::NewGuid().ToString('N') })
@@ -120,12 +142,12 @@ function Add-MiTrackSample {
                 Name = [string]$p.Name
                 PID = [int]$p.PID
                 StartUtcTicks = [long]$p.StartUtcTicks
-                Samples = (New-Object 'System.Collections.Generic.List[object]')
+                Samples = (New-Object 'System.Collections.Generic.List[MemoryInspector.AnalysisPoint]')
             }
         }
         $list = $Analyzer.Tracks[$key].Samples
         if ($list.Count -gt 0 -and $utc -le $list[$list.Count-1].Utc) { continue }
-        $list.Add([pscustomobject]@{Utc=$utc;Bytes=$bytes})
+        $list.Add([MemoryInspector.AnalysisPoint]::new($utc,$bytes))
         Limit-MiAnalysisHistory -Analyzer $Analyzer -Samples $list -NowUtc $utc
     }
     # A process can exit, but stale traces must not accumulate indefinitely.
@@ -140,19 +162,39 @@ function Add-MiTrackSample {
     }
 }
 
+function ConvertTo-MiCompactAnalysisRecord {
+    param($Record)
+    # 仅用于内部恢复；缺失身份不能成为证据。有效身份的null/负计数器仍须保留，
+    # 让原恢复逻辑观察其连续段断点，再由Add-MiTrackSample拒绝无效数值，不能省掉断点。
+    $rows=New-Object 'System.Collections.Generic.List[MemoryInspector.SavedAnalysisProcess]'
+    foreach($p in @($Record.Items)) {
+        if ($null -eq $p -or $null -eq $p.PID -or $null -eq $p.StartUtcTicks -or
+            [long]$p.StartUtcTicks -le 0 -or [string]::IsNullOrWhiteSpace([string]$p.Name)) {continue}
+        $row=[MemoryInspector.SavedAnalysisProcess]::new()
+        $row.PID=[int]$p.PID;$row.Name=[string]$p.Name;$row.StartUtcTicks=[long]$p.StartUtcTicks
+        $row.ProcessInstanceId=[string]$p.ProcessInstanceId;$row.PrivateBytes=$p.PrivateBytes
+        $rows.Add($row)
+    }
+    return [pscustomobject]@{SchemaVersion=$Record.SchemaVersion;RecordType=$Record.RecordType
+        CaptureEndUtc=$Record.CaptureEndUtc;IntervalSeconds=$Record.IntervalSeconds
+        ProcessStatus=$Record.ProcessStatus;MonotonicSeconds=$Record.MonotonicSeconds
+        ContinuityId=$Record.ContinuityId;Items=$rows.ToArray()}
+}
 function Get-MiRecentProcessRecords {
-    param([string]$Root,[datetime]$NowUtc,[ValidateRange(5,60)][int]$IntervalSeconds=5)
+    param([string]$Root,[datetime]$NowUtc,[ValidateRange(5,60)][int]$IntervalSeconds=5,[switch]$Compact)
     if ([string]::IsNullOrWhiteSpace($Root)) { return @() }
     # 旧 schema=1 没有周期字段，恢复读取量按所有受支持周期中最密的 5 秒计算。
     $tailCapacity=(Get-MiAnalysisParameters -IntervalSeconds 5).HistoryCapacity
     $records = New-Object 'System.Collections.Generic.List[object]'
+    $projection=$null
+    if($Compact){Initialize-MiAnalysisStorage;$projection={param($r) ConvertTo-MiCompactAnalysisRecord $r}}
     foreach ($day in @($NowUtc.Date.AddDays(-1),$NowUtc.Date)) {
         $date = $day.ToString('yyyy-MM-dd')
         $filename = 'process-'+$date+'.jsonl'
         $raw = Join-Path (Join-Path $Root 'process') $filename
         $recent = @()
         if ([IO.File]::Exists($raw)) {
-            $recent = @(Read-MiJsonTail -Path $raw -Count $tailCapacity)
+            $recent = @(Read-MiJsonTail -Path $raw -Count $tailCapacity -Projection $projection)
         } else {
             # M2 may compress yesterday's JSONL after midnight.
             $archive = Join-Path (Join-Path $Root 'archives') ('raw-'+$date+'.zip')
@@ -175,7 +217,9 @@ function Get-MiRecentProcessRecords {
                             foreach ($line in $tail) {
                                 try {
                                     $obj = ConvertFrom-Json -InputObject $line -ErrorAction Stop
-                                    if ([int]$obj.SchemaVersion -eq 1) { $recent += $obj }
+                                    if ([int]$obj.SchemaVersion -eq 1) {
+                                        if($Compact){$recent += ConvertTo-MiCompactAnalysisRecord $obj}else{$recent += $obj}
+                                    }
                                 } catch {}
                             }
                         } finally { $reader.Dispose() }
@@ -201,7 +245,7 @@ function Restore-MiAnalyzer {
     if (-not $Analyzer.CanRestore -or [string]::IsNullOrWhiteSpace($Analyzer.Root)) { return 0 }
     $count = 0
     $previousUtc=[datetime]::MinValue;$previousContinuity=$null;$previousMonotonic=$null
-    $recent=@(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc -IntervalSeconds $Analyzer.IntervalSeconds)
+    $recent=@(Get-MiRecentProcessRecords -Root $Analyzer.Root -NowUtc $NowUtc -IntervalSeconds $Analyzer.IntervalSeconds -Compact)
     # UTC 跨日回拨会把新行写入前一天的文件；同一启动内的单调时间恢复真实采样顺序。
     # 旧记录没有此可选字段，仍保持原追加顺序，不猜测单调时间。
     $ordered=New-Object 'System.Collections.Generic.List[object]'

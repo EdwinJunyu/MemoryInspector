@@ -10,6 +10,14 @@ $s=$null
 try {
     $s=New-MiPersistence -Root $root
     Assert-Mi $s.Healthy ('Persistence init failed: '+$s.Warning)
+    # 默认尾部接口保留完整JSON；内部投影逐行执行，坏行/未知schema仍不得成为有效记录。
+    $projectionPath=Join-Path $root 'tail-projection.jsonl'
+    [IO.File]::WriteAllLines($projectionPath,@('{"SchemaVersion":1,"Value":9007199254740993,"Extra":"preserve"}','{"SchemaVersion":99,"Value":2}','{"SchemaVersion":1,'),[Text.UTF8Encoding]::new($false))
+    $plainTail=@(Read-MiJsonTail -Path $projectionPath -Count 10)
+    $projectedTail=@(Read-MiJsonTail -Path $projectionPath -Count 10 -Projection {param($r) [pscustomobject]@{SchemaVersion=$r.SchemaVersion;Value=$r.Value}})
+    Assert-Mi ($plainTail.Count -eq 1 -and $plainTail[0].Extra -eq 'preserve' -and
+        $projectedTail.Count -eq 1 -and [long]$projectedTail[0].Value -eq [long]9007199254740993 -and
+        $null -eq $projectedTail[0].Extra) 'Tail projection changed default API, exact Int64 or corrupt/schema rejection.'
     $t=[datetime]::UtcNow
     # Use timestamps in two distinct five-minute buckets.
     $bucketStart=[datetime]::new($t.Year,$t.Month,$t.Day,$t.Hour,([int][math]::Floor($t.Minute/5)*5),0,[DateTimeKind]::Utc)

@@ -76,7 +76,8 @@ function Test-MiAclRestricted {
     } catch { return $false }
 }
 function Assert-MiTrustedInstallation {
-    param([string[]]$AllowedVersions=@('0.0.8'))
+    # 当前执行器只接受本发行版；旧版本仅由安装器显式指定，用于验证升级来源。
+    param([string[]]$AllowedVersions=@('0.0.9'))
     $paths=Get-MiSecurityPaths
     foreach ($folder in @($paths.Install,$paths.Data,$paths.Replay,(Split-Path -Parent $paths.Audit),$paths.Results,$paths.PolicyFolder)) {
         if (-not (Test-Path -LiteralPath $folder -PathType Container) -or
@@ -95,7 +96,7 @@ function Assert-MiTrustedInstallation {
     $manifest=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($paths.Manifest,[Text.Encoding]::UTF8)) -ErrorAction Stop
     if ($manifest.SchemaVersion -ne 1 -or $AllowedVersions -cnotcontains [string]$manifest.Version -or
         $null -eq $manifest.Files -or @($manifest.Files).Count -lt 8) { throw 'Invalid installation manifest/version.' }
-    if ($manifest.Version -cin @('0.0.7','0.0.8')) {
+    if ($manifest.Version -cin @('0.0.7','0.0.8','0.0.9')) {
         $names=@($manifest.Files | ForEach-Object { [string]$_.Name })
         foreach ($essential in @('ElevatedExecutor.ps1','PrivilegeSecurity.ps1','ServiceManagement.ps1','ServiceBridge.ps1','VERSION')) {
             if ($names -cnotcontains $essential) { throw ('Missing M7 component: '+$essential) }

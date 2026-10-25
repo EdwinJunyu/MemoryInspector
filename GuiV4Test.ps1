@@ -69,6 +69,33 @@ for ($i=0;$i -le 360;$i++) { Add-MiHistory ([pscustomobject]@{CaptureEndUtc=$bas
 if ($script:History.Count -ne 361) { throw 'Overview chart truncated 5-second history.' }
 Add-MiHistory ([pscustomobject]@{CaptureEndUtc=$base.AddHours(2)})
 if ($script:History.Count -ne 1) { throw 'Overview chart kept expired data.' }
+# 大对象图不能因系统曲线缓存而存活；拷贝后原计数器变化也不能篡改已保存的图点。
+$full=[pscustomobject]@{Sequence=99;CaptureEndUtc=$base.AddHours(3)
+    System=[pscustomobject]@{Status='Partial';CommittedBytes=$null;UsedPhysicalBytes=4GB}
+    Processes=[pscustomobject]@{Items=@([pscustomobject]@{PID=42;PrivateBytes=1GB})}
+    Diagnosis=[pscustomobject]@{Reports=@('large-object-graph')}}
+Add-MiHistory $full
+$full.System.UsedPhysicalBytes=8GB
+$retained=$script:History[0]
+if ($null -ne $retained.Processes -or $null -ne $retained.Diagnosis -or
+    $retained.System.UsedPhysicalBytes -ne 4GB -or $null -ne $retained.System.CommittedBytes -or
+    $retained.Sequence -ne 99 -or $retained.System.Status -ne 'Partial') {throw 'Overview retained the snapshot graph, aliased counters or fabricated missing values.'}
+
+# 紧凑存储必须保持精确字节数、未知RAM、实例隔离与完整窗口，而非以少存样本换内存。
+$script:ProcessTrend=@{}
+$largeBytes=[long]9007199254740993
+$trendItem=[pscustomobject]@{PID=7;StartUtcTicks=123;PrivateBytes=$largeBytes;WorkingBytes=$null}
+for($i=0;$i -le 360;$i++) {
+    Add-MiV4ProcessHistory ([pscustomobject]@{CaptureEndUtc=$base.AddSeconds(5*$i);Processes=[pscustomobject]@{Status='Success';Items=@($trendItem)}})
+}
+$points=$script:ProcessTrend['7:123']
+if ($points.Count -ne 361 -or $points[0].PrivateBytes -ne $largeBytes -or $null -ne $points[0].WorkingBytes -or
+    ($points[360].Utc-$points[0].Utc).TotalSeconds -ne 1800) {throw 'Compact process history lost exact counters, null RAM or full-window samples.'}
+$trendItem.StartUtcTicks=124
+Add-MiV4ProcessHistory ([pscustomobject]@{CaptureEndUtc=$base.AddSeconds(1805);Processes=[pscustomobject]@{Status='Success';Items=@($trendItem)}})
+if ($script:ProcessTrend['7:123'].Count -ne 361 -or $script:ProcessTrend['7:124'].Count -ne 1) {throw 'Compact display cache spliced reused PID identities.'}
+Add-MiV4ProcessHistory ([pscustomobject]@{CaptureEndUtc=$base.AddHours(2);Processes=[pscustomobject]@{Status='Success';Items=@($trendItem)}})
+if ($script:ProcessTrend.ContainsKey('7:123') -or $script:ProcessTrend['7:124'].Count -ne 1) {throw 'Compact display cache kept expired instances.'}
 if ($main -notmatch '\$script:PeriodMs = 5000' -or $gui -notmatch '默认 5 秒') {
     throw 'Default sampling period is inconsistent between controller and settings.'
 }
@@ -288,7 +315,7 @@ $guiAst=[Management.Automation.Language.Parser]::ParseInput($gui,[ref]$guiTokens
 function New-MiLabel { param([string]$Text,[int]$Size) return [pscustomobject]@{Text=$Text} }
 $script:Form=[pscustomobject]@{Text=''}
 $script:TrayIcon=[pscustomobject]@{Text=''}
-foreach ($expected in @('0.0.8','1.2.3')) {
+foreach ($expected in @('0.0.8','0.0.9','1.2.3')) {
     [IO.File]::WriteAllText($versionFile,(' '+$expected+[Environment]::NewLine),[Text.UTF8Encoding]::new($true))
     $script:VersionInfo=Get-MiVersionPresentation -Root $versionRoot
     foreach ($binding in @(
@@ -337,8 +364,81 @@ $manifestAssignment=$installerAst.Find({param($n)
 $sourceVersion=$actual.Version
 $entries=New-Object 'System.Collections.Generic.List[object]'
 . ([scriptblock]::Create($manifestAssignment.Extent.Text))
-if ($manifest.Version -cne $actual.Version -or $installerCode -notmatch '\$sourceVersion -cne ''0\.0\.8''' -or
+if ($manifest.Version -cne $actual.Version -or $installerCode -notmatch '\$sourceVersion -cne ''0\.0\.9''' -or
     $installerCode -notmatch '''Installed MemoryInspector ''\+\$sourceVersion') {
     throw 'Installation metadata/display differs from validated VERSION or release pin was weakened.'
 }
 Write-Host 'PASS: P3 VERSION-driven window/tray/service/install text, future-version fixture, invalid/missing/unreadable VERSION rejection and installer version pin.' -ForegroundColor Green
+
+# 从真实主控制器创建完整控件，再喂入第一条邮箱；不手动预置趋势缓存或替换真实 Grid 刷新。
+# 只禁用实际动作、辅助后台查询和模态主循环，防止原来的分函数夹具掩盖冷启动缺陷。
+$runtimeRepo=$root
+$prefix=$main.Substring(0,$main.IndexOf('$script:UiTimer ='))
+$prefix=$prefix.Replace('$script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path','$script:Root = $runtimeRepo')
+$prefix=[regex]::Replace($prefix,'(?m)^Initialize-MiActions\r?$', '$script:MiActions=[pscustomobject]@{AuditPath="";CanAudit=$false;Busy=$false;Pending=$null}')
+$prefix=$prefix.Replace('Initialize-MiV4Gui -Root $root',"function Start-MiV4ServicesLoad {}`r`nfunction Start-MiV4HistoryLoad {}`r`nInitialize-MiV4Gui -Root `$root")
+$script:ProcessTrend=$null
+try {
+    . ([scriptblock]::Create($prefix))
+    if ($null -eq $script:ProcessTrend -or $script:ProcessTrend.Count -ne 0) {throw 'Fresh GUI did not initialize its empty process trend cache.'}
+    $script:Mailbox=[Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $now=[datetime]::UtcNow
+    $item=[pscustomobject]@{PID=9001;Name='gui-cold-start-fixture';StartUtcTicks=100;PrivateBytes=128MB;WorkingBytes=64MB;Status='Success'}
+    $snapshot=[pscustomobject]@{Sequence=1;CaptureEndUtc=$now;DurationMs=1;Status='Success';TimeDiscontinuity=$false
+        System=[pscustomobject]@{Status='Success';CommittedBytes=4GB;CommitLimitBytes=16GB;UsedPhysicalBytes=5GB;TotalPhysicalBytes=8GB;AvailablePhysicalBytes=3GB;NonpagedPoolBytes=32MB;PagedPoolBytes=64MB;Error=$null}
+        Processes=[pscustomobject]@{Status='Success';Items=@($item);Total=1;Error=$null}
+        Diagnosis=[pscustomobject]@{Status='Success';Reports=@();Pressure=[pscustomobject]@{State='Normal'}}
+        PersistenceStatus='Saved';PersistenceError=$null}
+    $script:Mailbox.Enqueue($snapshot)
+    Process-MiMailbox
+    if ($script:Grid.Rows.Count -ne 1 -or $script:Grid.Columns.Count -ne 9 -or
+        $script:KpiValues[0].Text -notmatch '4.00 / 16.00' -or
+        $script:LineChart.Series['Committed'].Points.Count -ne 1 -or $script:BarChart.Series[0].Points.Count -ne 1 -or
+        $script:ProcessTrend.Count -ne 1 -or $script:StatusLabel.Text -notmatch '第 1 次采样' -or
+        $script:MiGracefulButton.Enabled -or $script:MiForceButton.Enabled) {throw 'Fresh full GUI failed to render its first snapshot or enabled actions.'}
+    # 复用行控件不能复用旧快照/旧身份。排序移动后跟随实例，PID复用和筛空后取消选择。
+    $firstRow=$script:Grid.Rows[0];$firstRow.Selected=$true
+    $fresh=[pscustomobject]@{PID=9001;Name='gui-cold-start-fixture';StartUtcTicks=100;PrivateBytes=256MB;WorkingBytes=$null;Status='Success'}
+    Update-MiGrid ([pscustomobject]@{Status='Success';Items=@($fresh);Total=1})
+    if(-not [object]::ReferenceEquals($firstRow,$script:Grid.Rows[0]) -or
+        -not [object]::ReferenceEquals($script:Grid.Rows[0].Tag,$fresh) -or
+        $script:Grid.Rows[0].Cells['Private'].Value -ne (Format-MiGiB 256MB) -or
+        $script:Grid.Rows[0].Cells['Working'].Value -ne '不可用'){throw 'Reused row kept stale identity/counters or recreated the row.'}
+    $larger=[pscustomobject]@{PID=9002;Name='larger';StartUtcTicks=200;PrivateBytes=512MB;WorkingBytes=128MB;Status='Success'}
+    Update-MiGrid ([pscustomobject]@{Status='Success';Items=@($fresh,$larger);Total=2})
+    if($script:Grid.Rows[0].Tag.PID -ne 9002 -or (Get-MiSelectedProcess).PID -ne 9001){throw 'Sorting reused rows lost exact-instance selection.'}
+    $replacement=[pscustomobject]@{PID=9001;Name='replacement';StartUtcTicks=101;PrivateBytes=256MB;WorkingBytes=64MB;Status='Success'}
+    Update-MiGrid ([pscustomobject]@{Status='Success';Items=@($replacement);Total=1})
+    if($null -ne (Get-MiSelectedProcess) -or $script:MiGracefulButton.Enabled -or $script:MiForceButton.Enabled){throw 'Row reuse transferred selection/permission to a reused PID.'}
+    $script:SearchInput.Text='no-matching-fixture'
+    if($script:Grid.Rows.Count -ne 0 -or $null -ne (Get-MiSelectedProcess)){throw 'Filtering did not remove stale reused rows.'}
+    $script:SearchInput.Text=''
+    if($script:Grid.Rows.Count -ne 1 -or $script:Grid.Rows[0].Tag.Name -ne 'replacement'){throw 'Clearing filter failed to rebuild current rows.'}
+    # 此窗口属于测试自身；创建真实布局句柄，透明且不占任务栏，不触碰用户的运行窗口。
+    $script:Form.ShowInTaskbar=$false;$script:Form.Opacity=0;$script:Form.Show()
+    # 主机字体缩放会放大 MinimumSize；本夹具固定物理像素，确保真的覆盖1020窄窗。
+    $script:Form.AutoScaleMode='None';$script:Form.MinimumSize=[Drawing.Size]::new(1020,690)
+    # 对真实父子控件做布局，检查标题与内容的矩形不重叠，而不是只断言 Dock 属性。
+    foreach($size in @([Drawing.Size]::new(1300,850),[Drawing.Size]::new(1020,690))) {
+        $script:Form.Size=$size
+        if($script:Form.Width -ne $size.Width -or $script:Form.Height -ne $size.Height){throw 'Layout fixture did not reach its requested physical size.'}
+        [void]$script:Form.Handle
+        foreach($tabIndex in @(0,1,2,3,4)) {
+            $script:Tabs.SelectedIndex=$tabIndex
+            $script:Form.PerformLayout();$script:Tabs.TabPages[$tabIndex].PerformLayout()
+            [Windows.Forms.Application]::DoEvents()
+            foreach($content in @($script:Grid,$script:LineChart,$script:BarChart,$script:Details.Parent)) {
+                $parent=$content.Parent
+                foreach($header in @($parent.Controls|Where-Object {$_ -is [Windows.Forms.Label] -and $_.Dock -eq 'Top'})) {
+                    if ($content.Bounds.IntersectsWith($header.Bounds)) {throw ('Header overlaps content at '+$size+' / '+$header.Text)}
+                }
+            }
+            if ($tabIndex -eq 0 -and ($script:Grid.ColumnHeadersHeight -lt $script:Grid.Font.Height+6 -or
+                $script:Grid.GetCellDisplayRectangle(0,-1,$false).Height -le 0)) {throw 'Visible process column headers are clipped or missing.'}
+        }
+    }
+} finally {
+    Close-MiV4Gui
+    if ($script:Form) {$script:Form.Dispose()}
+}
+Write-Host 'PASS: full fresh GUI initialization, first real mailbox/grid/KPI/chart refresh and safe disabled actions.' -ForegroundColor Green

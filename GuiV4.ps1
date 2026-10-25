@@ -102,21 +102,37 @@ function Render-MiV4Grid {
     $script:UiUpdating=$true
     $script:Grid.SuspendLayout()
     try {
-        $script:Grid.Rows.Clear()
+        # 保留仍需要的60行控件，只更新变化的单元格；Clear/Add会对可见表格逐行触发布局和绘制。
+        # Tag每轮都替换为最新快照，选择仍按PID+创建时间恢复，不能复用旧身份或预检查权限。
+        while($script:Grid.Rows.Count -gt $rows.Count){
+            $last=$script:Grid.Rows[$script:Grid.Rows.Count-1]
+            $script:Grid.Rows.RemoveAt($script:Grid.Rows.Count-1)
+            $last.Dispose()
+        }
+        $idx=0
         foreach ($p in $rows) {
             $delta='—'
             if ($null -ne $p.DeltaBytes) { $delta=('{0:+0.0;-0.0;0.0}' -f ([double]$p.DeltaBytes/1MB)) }
             $report=Get-MiDiagnosisReport -Item $p
             $serviceFlag='—'
             if ($null -ne $script:ServicePids -and $script:ServicePids.ContainsKey([int]$p.PID)) { $serviceFlag='服务' }
-            $idx=$script:Grid.Rows.Add([object[]]@(
+            $values=[object[]]@(
                 $p.PID,$p.Name,(Format-MiGiB $p.PrivateBytes),(Format-MiGiB $p.WorkingBytes),
                 $delta,(Format-MiDiagnosisState -Report $report),(Get-MiV4Risk -Item $p),$serviceFlag,$p.Status
-            ))
+            )
+            if($idx -ge $script:Grid.Rows.Count){[void]$script:Grid.Rows.Add($values)}
+            else {
+                for($column=0;$column -lt $values.Count;$column++){
+                    if(-not [object]::Equals($script:Grid.Rows[$idx].Cells[$column].Value,$values[$column])){
+                        $script:Grid.Rows[$idx].Cells[$column].Value=$values[$column]
+                    }
+                }
+            }
             $script:Grid.Rows[$idx].Tag=$p
             if ($p.PID -eq $oldPid -and $null -ne $oldTicks -and $p.StartUtcTicks -eq $oldTicks) {
                 $script:Grid.Rows[$idx].Selected=$true
             }
+            $idx++
         }
         $script:Grid.ClearSelection()
         foreach ($row in $script:Grid.Rows) {
@@ -134,9 +150,27 @@ function Render-MiV4Grid {
     Update-MiSelectedProcess
 }
 
+function Initialize-MiV4TrendStorage {
+    if ($null -ne ('MemoryInspector.GuiTrendPoint' -as [type])) { return }
+    # 只保存三项标量的值类型，避免每个点的 PSObject/属性字典开销；null RAM 仍然是未知。
+    Add-Type -TypeDefinition @'
+using System;
+namespace MemoryInspector {
+    public struct GuiTrendPoint {
+        public readonly DateTime Utc;
+        public readonly long PrivateBytes;
+        public readonly long? WorkingBytes;
+        public GuiTrendPoint(DateTime utc, long privateBytes, long? workingBytes) {
+            Utc=utc; PrivateBytes=privateBytes; WorkingBytes=workingBytes;
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
 function Add-MiV4ProcessHistory {
     param($Snapshot)
     if ($null -eq $Snapshot -or $null -eq $Snapshot.Processes -or $Snapshot.Processes.Status -eq 'Failed') { return }
+    Initialize-MiV4TrendStorage
     $time=([datetime]$Snapshot.CaptureEndUtc).ToUniversalTime()
     if ($Snapshot.TimeDiscontinuity) { $script:ProcessTrend.Clear() }
     $cutoff=$time.AddMinutes(-30)
@@ -145,11 +179,11 @@ function Add-MiV4ProcessHistory {
         if ($null -eq $p.StartUtcTicks -or [long]$p.StartUtcTicks -le 0) { continue }
         $key='{0}:{1}' -f $p.PID,$p.StartUtcTicks
         if (-not $script:ProcessTrend.ContainsKey($key)) {
-            $script:ProcessTrend[$key]=New-Object 'System.Collections.Generic.List[object]'
+            $script:ProcessTrend[$key]=New-Object 'System.Collections.Generic.List[MemoryInspector.GuiTrendPoint]'
         }
         $list=$script:ProcessTrend[$key]
         if ($list.Count -eq 0 -or $time -gt $list[$list.Count-1].Utc) {
-            $list.Add([pscustomobject]@{Utc=$time;PrivateBytes=$p.PrivateBytes;WorkingBytes=$p.WorkingBytes})
+            $list.Add([MemoryInspector.GuiTrendPoint]::new($time,[long]$p.PrivateBytes,$p.WorkingBytes))
         }
         while ($list.Count -gt 0 -and $list[0].Utc -lt $cutoff) { $list.RemoveAt(0) }
         # 显示缓存按支持的最密周期保留全窗口；诊断仍由后台分析器独立审核证据。
@@ -431,6 +465,7 @@ function New-MiV4DataGrid {
     $grid.Dock='Fill';$grid.ReadOnly=$true;$grid.AllowUserToAddRows=$false;$grid.AllowUserToDeleteRows=$false
     $grid.SelectionMode='FullRowSelect';$grid.RowHeadersVisible=$false;$grid.MultiSelect=$false
     $grid.AutoGenerateColumns=$false;$grid.AutoSizeColumnsMode='Fill';$grid.BackgroundColor=[Drawing.Color]::White
+    $grid.ColumnHeadersHeightSizeMode='AutoSize';$grid.ColumnHeadersDefaultCellStyle.WrapMode='True'
     foreach ($d in $Defs) {
         $c=New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $c.Name=[string]$d[0];$c.HeaderText=[string]$d[1];$c.FillWeight=[single]$d[2]
@@ -442,6 +477,9 @@ function New-MiV4DataGrid {
 function Initialize-MiV4Gui {
     param($Root,$Cards,$Charts,$Bottom,$StatusBar)
     $script:AllProcesses=@()
+    # 首次完整 GUI 初始化也要建立趋势缓存，不能依赖“重启采样器”或测试先创建它。
+    # 邮箱先更新进程趋势再刷新 KPI；缺少此缓存会使所有实时页面在首样本持续失败。
+    $script:ProcessTrend=@{}
     $script:ServicePids=@{}
     $script:ServiceRows=@()
     $script:ServiceApprovals=@{}
@@ -530,6 +568,8 @@ function Initialize-MiV4Gui {
     $filters.Controls.Add($script:ListSummary)
     $procLayout.Controls.Add($Bottom,0,1)
     $script:Grid.Columns.Clear()
+    # 窄窗口使用表格自身的水平滚动，不能将列压到标题和数值不可读；长标题自动换行。
+    $script:Grid.ColumnHeadersHeightSizeMode='AutoSize';$script:Grid.ColumnHeadersDefaultCellStyle.WrapMode='True'
     foreach ($d in @(
         @('PID','PID',10),@('Name','进程',22),@('Private','Private GiB',14),
         @('Working','RAM GiB',13),@('Delta','增量 MiB',12),
@@ -538,6 +578,7 @@ function Initialize-MiV4Gui {
     )) {
         $c=New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $c.Name=[string]$d[0];$c.HeaderText=[string]$d[1];$c.FillWeight=[single]$d[2]
+        $c.MinimumWidth=$(switch([string]$d[0]) {'Name'{110};'Risk'{130};'Anomaly'{110};'PID'{55};'Service'{50};default{70}})
         $c.SortMode='NotSortable'
         [void]$script:Grid.Columns.Add($c)
     }
@@ -578,9 +619,6 @@ function Initialize-MiV4Gui {
     $script:MiGracefulButton.Add_Click({Request-MiGuiProcessAction -Mode Graceful})
     $script:MiForceButton.Add_Click({Request-MiGuiProcessAction -Mode Force})
     $split.BringToFront()
-    foreach ($control in @($hostPanel.Controls)) {
-        if ($control -is [System.Windows.Forms.Label]) { $control.BringToFront() }
-    }
     $script:SearchInput.Add_TextChanged({ Render-MiV4Grid; Update-MiCharts })
     $script:OrderInput.Add_SelectedIndexChanged({ Render-MiV4Grid; Update-MiCharts })
     $export.Add_Click({ Export-MiV4Processes })

@@ -262,14 +262,17 @@ function Add-MiJsonl {
     if ($PassThru) { return $true }
 }
 function Read-MiJsonTail {
-    param([string]$Path,[int]$Count=240)
+    param([string]$Path,[int]$Count=240,[scriptblock]$Projection)
     if (-not [IO.File]::Exists($Path)) { return @() }
     $items=New-Object 'System.Collections.Generic.List[object]'
     foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8 -Tail $Count -ErrorAction Stop)) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         try {
             $o=ConvertFrom-Json -InputObject $line -ErrorAction Stop
-            if ($null -ne $o -and [int]$o.SchemaVersion -eq 1) { $items.Add($o) }
+            if ($null -ne $o -and [int]$o.SchemaVersion -eq 1) {
+                # 默认调用保持完整记录；内部逐行投影避免恢复期间同时保留所有JSON属性字典。
+                if($null -ne $Projection){$items.Add((& $Projection $o))}else{$items.Add($o)}
+            }
         } catch { } # Corrupt lines are never interpreted as successful samples.
     }
     return $items.ToArray()

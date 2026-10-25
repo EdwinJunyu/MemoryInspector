@@ -75,8 +75,8 @@ if ($code -notmatch 'Assert-MiServiceDependentsStopped' -or
     $code -notmatch 'Write-MiPrivilegedAudit') {
     throw 'Missing safety guards or audit/recovery controls.'
 }
-if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.8') {
-    throw 'Expected version 0.0.8.'
+if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.9') {
+    throw 'Expected version 0.0.9.'
 }
 Write-Host 'PASS: M7 syntax, allowlist contracts, protected service guard, fingerprints and recovery guards.' -ForegroundColor Green
 

@@ -23,12 +23,12 @@ foreach ($name in $names) {
 }
 $sourceVersion=([IO.File]::ReadAllText((Join-Path $source 'VERSION'),[Text.Encoding]::UTF8)).Trim()
 # 明确受支持的发行版是安全约束，不能因显示版本动态化而自动信任任意版本。
-if ($sourceVersion -cne '0.0.8') {
-    throw 'Expected VERSION 0.0.8; installation canceled.'
+if ($sourceVersion -cne '0.0.9') {
+    throw 'Expected VERSION 0.0.9; installation canceled.'
 }
 # Never replace an untrusted directory: refuse to overwrite arbitrary existing files.
 if ([IO.Directory]::Exists($paths.Install)) {
-    [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8'))
+    [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8','0.0.9'))
 }
 $parent=Split-Path -Parent $paths.Install
 if (-not [IO.Directory]::Exists($parent)) { throw 'Program Files parent folder missing.' }
@@ -115,7 +115,7 @@ try {
     }
     if ($null -ne $oldManifest -and [IO.File]::Exists($oldManifest)) { [IO.File]::Delete($oldManifest) }
     Write-Host ('Installed MemoryInspector '+$sourceVersion+' in '+$paths.Install) -ForegroundColor Green
-    Write-Host 'M8 release-candidate: run complete acceptance before stable release.'
+    Write-Host 'Legacy snapshot: acceptance incomplete; this version is not declared stable.'
     Write-Host ('Launch the protected GUI using: '+(Join-Path $paths.Install 'Run_MemoryInspector.cmd'))
 } catch {
     $err=$_.Exception.Message

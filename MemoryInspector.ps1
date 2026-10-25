@@ -223,7 +223,13 @@ function Restore-MiGuiHistory {
 function Add-MiHistory {
     param($Snapshot)
     if ($Snapshot.TimeDiscontinuity) { $script:History.Clear() }
-    $script:History.Add($Snapshot)
+    # 总览只消费这几个标量。保留整个 Snapshot 会把每轮数百个进程和诊断对象留住30分钟。
+    # 最新快照仍供身份检查/操作使用；这里复制数值，不共享可变 System 对象或削减证据窗口。
+    $script:History.Add([pscustomobject]@{
+        Sequence=$Snapshot.Sequence;CaptureEndUtc=$Snapshot.CaptureEndUtc
+        System=[pscustomobject]@{Status=$Snapshot.System.Status
+            CommittedBytes=$Snapshot.System.CommittedBytes;UsedPhysicalBytes=$Snapshot.System.UsedPhysicalBytes}
+    })
     $cutoff = ([datetime]$Snapshot.CaptureEndUtc).AddMinutes(-30)
     while ($script:History.Count -gt 0 -and
         ([datetime]$script:History[0].CaptureEndUtc -lt $cutoff -or $script:History.Count -gt $script:HistoryLimit)) {
@@ -493,7 +499,8 @@ foreach($def in @(@('Committed',$script:Blue),@('RAM',$script:Teal))) {
     [void]$script:LineChart.Series.Add($s)
 }
 $linePanel.Controls.Add($script:LineChart)
-$script:LineChart.BringToFront();$lineHeader.BringToFront()
+# WinForms 从后向前计算 Dock；Top 必须先占位，再由 Fill 使用剩余区域，不能把标题叠在图上。
+$script:LineChart.BringToFront()
 
 $barPanel=New-MiPanel;$barPanel.Dock='Fill';$chartLayout.Controls.Add($barPanel,1,0)
 $barHeader=New-MiLabel '进程 Top 8 · Private Bytes（GiB）' 10 $true
@@ -510,7 +517,7 @@ $barSeries.ChartType='Bar';$barSeries.Color=$script:Blue;$barSeries.ChartArea='T
 $barSeries.IsValueShownAsLabel=$true;$barSeries.LabelFormat='0.00'
 [void]$script:BarChart.Series.Add($barSeries)
 $barPanel.Controls.Add($script:BarChart)
-$script:BarChart.BringToFront();$barHeader.BringToFront()
+$script:BarChart.BringToFront()
 
 $bottom=New-Object System.Windows.Forms.TableLayoutPanel
 $bottom.Dock='Fill';$bottom.RowCount=1;$bottom.ColumnCount=2
@@ -539,7 +546,7 @@ foreach($def in @(
     $column.FillWeight=[single]$def[2];$column.SortMode='NotSortable'
     [void]$script:Grid.Columns.Add($column)
 }
-$tablePanel.Controls.Add($script:Grid);$script:Grid.BringToFront();$tableHeader.BringToFront()
+$tablePanel.Controls.Add($script:Grid);$script:Grid.BringToFront()
 $detailPanel=New-MiPanel;$detailPanel.Dock='Fill';$bottom.Controls.Add($detailPanel,1,0)
 $detailHeader=New-MiLabel '进程详情 · 趋势诊断（只读）' 10 $true
 $detailHeader.Dock='Top';$detailHeader.Height=33;$detailHeader.Padding=[System.Windows.Forms.Padding]::new(10,7,0,0)
@@ -549,7 +556,7 @@ $script:Details.Dock='Fill';$script:Details.ReadOnly=$true
 $script:Details.BorderStyle='None';$script:Details.BackColor=[System.Drawing.Color]::White
 $script:Details.Font=$script:Font;$script:Details.ForeColor=$script:Ink
 $script:Details.Text='等待读取进程信息…'
-$detailPanel.Controls.Add($script:Details);$script:Details.BringToFront();$detailHeader.BringToFront()
+$detailPanel.Controls.Add($script:Details);$script:Details.BringToFront()
 
 $statusBar=New-Object System.Windows.Forms.Panel
 $statusBar.Dock='Fill';$root.Controls.Add($statusBar,0,4)

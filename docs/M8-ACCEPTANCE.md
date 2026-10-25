@@ -1,6 +1,23 @@
-﻿# MemoryInspector 0.0.8 — Milestone 8 acceptance checklist
+﻿# MemoryInspector 0.0.9 — Milestone 8 acceptance checklist
 
-**Status: release candidate.** Automated CI cannot substitute for Windows 10 and 11 desktop validation or a 24-hour GUI run.
+**Status: 旧版本 / legacy snapshot; acceptance incomplete.** Automated CI cannot substitute for Windows 10 and 11 desktop validation or a 24-hour GUI run.
+
+## 0.0.9 旧版本备注与后续待办（2026-10-24）
+
+按用户要求，将至今的修复保存为 0.0.9 旧版本快照并提交到远程 main；这不是稳定版或 P1–P3 全部验收通过的声明。下方旧章节保留各轮当时的版本、结果和提交状态，属于历史记录。原始机器进程列表、截图、日志、测试夹具和源码备份仅保留本地，不随源码发布；本节给出公开结果摘要和未完成范围。
+
+| 状态 / 优先级 | 项目与备注 | 后续工作 |
+|---|---|---|
+| 已测试未通过 / P1-01 | 最终 30 分钟窗口原始 360 点归入 343/361 槽（95%）；六段 50/60、52/60、60/60、60/60、60/60、61/61，首段低于原 85%。存在 17 次归槽碰撞，累计完成相位漂移约 2.558 秒。修改前后分析器的 24967 点哈希及完整报告相同。 | 修复调度/抖动归槽问题，增加回归并重新完成实机窗口；不降低阈值、不填补缺样。 |
+| 已测试未通过 / P2 | GUI 35 分钟平均 CPU 0.0914%，Working Set 均值 194.42 MiB、采样峰值 210.08 MiB；观察后读取的 OS 存活期峰值 234.94 MiB。未重现此前数百 MiB 增长，但严格 200 MiB 峰值目标仍未达到。 | 继续优化瞬时分配/恢复峰值，验证长期资源；不能宣称无泄漏。 |
+| 未完成 / P2–P3，按实际影响分级 | 真实系统 DPI 切换、多屏、端到端输入延迟、最终版五页人工确认和完整托盘/快捷键/滚动组合。普通两尺寸表头和图例已通过控件回归及此前用户截图；125%/150% 模拟图有整页超界，不能记为真实 DPI 通过。 | 在真实显示设置下验收；纯显示问题通常 P3，操作不可用为 P2，安全提示/目标受影响需重新评估。 |
+| 未测试 / 通常 P2，严重后果另评 | Windows 10；Windows 10/11 各自 24 小时 GUI/托盘长稳。当前本机实测仅为 Windows 11 的有限时长。 | 完成对应系统和 24 小时矩阵；未测系统不宣称已验证兼容。 |
+| 未测试 / P1–P2，按后果分级 | 真实磁盘满、存储失败/恢复、时钟回拨/校时、休眠/唤醒、真实 PID 复用。合成/文件级回归不等于实机通过。 | 在隔离 Windows 环境注入故障，检查历史、身份连续性和默认拒绝。 |
+| 未测试 / 安全路径 P1 | 受保护安装/升级/卸载及跨路径 ACL/清单、真实 UAC 取消、管理员执行器并发和部署后的重放/篡改；普通测试 GUI 的关闭/强制结束；专用允许名单服务的停止/恢复/依赖/自恢复/超时。 | 仅使用一次性 Windows VM 和专用测试目标。此前临时目录管理员 ACL 和普通用户写入拒绝已验证，但不能代替完整部署。未验收前不宣称危险操作可用于生产。 |
+
+以上未通过/未测试项目由本版本明确留待后续处理，既有安全检查继续保留。0.0.9 只精确更新本发行版安装/执行版本门控；升级来源仅显式允许已知 0.0.7/0.0.8/0.0.9，当前执行器默认只信任 0.0.9，M7 必需组件、Recovery Ledger、ACL、哈希、UAC、重放和审计要求不减。常规回归覆盖不冒充真实管理员部署。
+
+本节实机指标来自版本递增前的 0.0.8 修复版。0.0.9 版本对齐后，以 Windows PowerShell 5.1 / RemoteSigned 重新执行 SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test，8 个常规脚本均退出码 0。新增信任回归执行真实验证函数，覆盖 0.0.9 默认接受、旧版默认拒绝但显式升级允许、未知版本拒绝、M7 必需组件及账本缺失拒绝；ACL 仅在独立测试目录中模拟，普通权限的真实管理员 ACL 分支仍 SKIP。独立代码审阅未发现新引入的提交阻塞项。版本递增本身没有重跑新的 35 分钟或 24 小时验收。
 
 ## Automated acceptance (safe)
 
@@ -28,7 +45,7 @@ Record commit SHA, OS build, PowerShell version, start/end times, result, and sa
 - [ ] Only an approved, disposable test service can be stopped and manually restarted.
 - [ ] Running dependent service, auto-restart and timeout do not cause cascade, retries, host kill or startup type edits.
 - [ ] Release report distinguishes target process bytes from system net Commit changes.
-- [ ] Upgrade from protected 0.0.7 to 0.0.8 preserves allowlist/audit and enforces manifest.
+- [ ] Upgrade from protected 0.0.7/0.0.8 to 0.0.9 preserves allowlist/audit and enforces manifest.
 - [ ] Uninstaller removes only controlled files and retains user data and privileged audit by default.
 - [ ] Inject storage errors, truncated JSONL, access-denied CIM, disk full, sleep/resume on isolated test host.
 - [ ] Measure idle GUI CPU target <1%, working set target <200 MiB, normal UI response target <1 second.
@@ -195,3 +212,35 @@ Windows PowerShell Desktop 5.1 下运行 SmokeTest.ps1、AnalyzerTest.ps1、Proc
 证据保留于 .p3-validation：regression-core.json、regression-safety.json、各测试 .log、version-render.json、gui-tab-0.png / gui-tab-2.png / gui-tab-4.png，以及渲染测试夹具。既有 .p2-validation 和故障测试资料均保留。
 
 安全与兼容性：未改动管理员执行器、权限分离、ACL / 哈希 / 版本信任白名单、跨进程锁或确认机制。代码中的明确安全版本列表和历史升级文档继续保留旧版本号，它们不是当前 GUI 显示来源。VERSION 读取只提供显示信息，不提供操作权限。未安装或更新系统中的受保护副本；若需要实际部署，应在隔离验收通过后使用 Installer.ps1 更新。
+
+## 2026-10-24 正式启动、采样和资源观察修复
+
+本轮继续保持原有模块、Windows PowerShell 5.1、普通 GUI / 保护执行器分离、85% 覆盖率和默认拒绝检查。没有新增生产模块，没有提交或推送。
+
+- 正式入口仍为 RemoteSigned。已将启动失败说明和验证下载来源的步骤写入原启动器及 README；启动器不会改策略或自动解除标记。本机 PrivilegeSecurity.ps1 / PrivilegeBridge.ps1 与当前提交及 GitHub 上游 blob 一致，保存来源流证据并经用户明确批准后，仅解除这两个文件的 ZoneId=3 标记。它们的源码字节未变。这是一次性本机信任处理，不是自动信任后续下载。
+- 实测约 470 个进程的枚举约 46 ms、内存字段约 3 ms，旧 Process.StartTime 路径约 3.54 秒。在原 Collector.ps1 内改用 Windows GetProcessTimes + PROCESS_QUERY_LIMITED_INFORMATION（0x1000）的只读句柄，仍每轮读取真实创建时间，不缓存 PID 身份、不申请终止/写内存/调试权限；SafeProcessHandle 每次释放。失败保留 null / Partial，进程动作原有身份、所有者、会话、服务宿主及执行前检查不变。参考 [GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)。
+- 首次完整 GUI 初始化遗漏 ProcessTrend，导致首条邮箱样本在 KPI / 表格刷新前抛出 null 异常；原 GuiV4.ps1 初始化中补齐空缓存。新回归创建完整真实控件再执行首条邮箱，而非由测试预先填好缓存或替换 Grid 刷新。
+- 上轮失败的多 Worker 观察器属于临时夹具，原始失败证据继续保留。本轮统一使用已有 AcceptanceGuiMonitor.ps1；新增 -JobsPath 支持多目标，并修复 PS5.1 JSON 数组嵌套、校验精确 PID/创建时间、CPU 差分、首样本 CPU 未知、区域格式 CSV 及零观测失败摘要。GUI 与 BackendJobs 的 SourceKind 和各目标结果分开保存。运行中的 CSV 用 FileShare.ReadWrite 读取，不能仅根据目录枚举暂时报出的 0 字节判定没有观测数据。
+- SmokeTest 新增真实创建时间一致性、无效 PID、句柄释放和慢旧 getter 未调用回归；Milestone8Test 新增 RemoteSigned 的真实下载标记拒绝/显式信任夹具，以及观察器的多目标、损坏/重复身份、PID 复用、CPU、区域格式和空结果回归。管理员 ACL 夹具改为保留在项目 test-artifacts，不删除资料。
+
+8 个常规回归在 RemoteSigned 下全部通过；另已通过用户确认的 UAC 执行原 PrivilegeSecurityTest 的真实管理员 ACL 分支，独立夹具被设置为 SYSTEM / Administrators 可写、Users 只读。普通用户取得测试文件写句柄被 UnauthorizedAccessException 拒绝，文件哈希未变。该临时目录测试不代替 Program Files / ProgramData 的完整保护安装和跨路径信任验收。用户本轮选择先完成本机 GUI 与临时目录 ACL；PrivilegeInstallTest、安装/卸载和真实服务操作继续留待隔离 Windows 环境。
+
+最终长时数据、实际资源、已完成及未完成清单以项目 `.repair-acceptance-20261024-185941/REPORT.md` 为准。原 `.live-acceptance-20261024-175103` 失败证据保留，不改写为通过。
+
+本轮最终结果：正式普通权限 GUI 的 395 对真实落盘记录首尾跨度 1972.622 秒；5 秒最终窗口 358/361 个有效槽（99.2%），六段均满足原 85% 要求。Collector 平均 1271.60 ms、P95 1636 ms、最大 3208 ms。受控增长与稳定进程各自然运行 32 分钟；原分析器的真实数据回放与用户实时 GUI 截图分别显示疑似持续增长、暂无明显增长。资源观察器完整运行 1920 秒、192 条，GUI 平均归一化 CPU 0.1503%、峰值 1.55%，Working Set 峰值 895.74 MiB，**内存未通过 <200 MiB 目标**；截图中的表头/图例裁切和完整 DPI/交互仍未通过。受保护安装、真实服务/进程动作、真实故障/回拨/休眠、Windows 10 与 Win10/11 各 24 小时验收继续未测，不能声明 P1–P3 全部通过。
+
+## 2026-10-24 GUI 内存、表头和图例修复
+
+总览缓存原先保留每轮完整进程快照，现只复制系统图表需要的标量；当前完整快照继续用于界面和身份核验。原 GuiV4 / Analyzer 模块内改用紧凑值类型保留全部 30 分钟样本，历史恢复按行投影释放 JSON 属性图，raw/ZIP 与原 schema=1 兼容。有效身份的 null/负计数器仍保留连续段断点，之后由原规则拒绝其数值，不能拼接断点两侧的证据。5 秒周期、85% 总体及分段覆盖要求、Int64/null 语义和所有危险操作检查未放宽。
+
+修正现有 Top/Fill 控件 Dock 顺序，标题不再覆盖表头、图例、顶端刻度或详情首行。表头自动换行/增高，窄表格保留最小列宽并使用内部水平滚动。表格改为复用行、仅更新变化单元格，Tag 每轮替换为最新对象；选择和操作门控仍按精确 PID/创建时间核验，PID 复用或过滤不能继承旧目标。
+
+同输入的独立缓存实验（361 轮×500 进程）：总览保留托管内存增量 291.354→1.799 MiB，进程图表 21.362→2.584 MiB，分析器 69.286→3.931 MiB。真实历史恢复的 326 条记录/365 实例/22257 点逐点 SHA-256 相同，独立恢复峰值 320.86→221.82 MiB；恢复约 30 秒，不能称为快速启动通过。可见表格控件刷新均值约 749.74→119.63 ms，此为刷新计时，不是端到端输入延迟。
+
+8 个常规 PS5.1 回归在 RemoteSigned 下全部通过，保留原安全测试，并新增缓存隔离、完整窗口、精确计数、null 连续段屏障、复用行身份/选择/过滤、真实完整控件首条刷新及 UTF-8 BOM 检查。布局夹具生成 30 张图；100% 的实际 1300×850 / 1020×690 五页检查中表头、图例及顶端刻度可见。125%/150% 自有控件缩放的 20 张图虽无标题/内容重叠，但人工复核发现整页右侧超界，保留为待复核模拟实验，不能记为布局或 DPI 全部通过。自有控件 Form.Scale 不代替真实系统 DPI 切换和多屏实测。
+
+当前任务完整证据及最终实机结论见 `.gui-memory-layout-20261024-200746/REPORT.md`。初轮不足时长、资源超标、编码错误的夹具及弃用性能实验均保留，不能改记为通过。最终正式 GUI 观察独立记录于 `verified-gui-observer`，不得用合成缓存或隐藏控件结果替代。继续保持 CPU <1%、Working Set <200 MiB 和正常响应 <1 秒目标；未完成 Windows 10、真实 DPI/故障/服务/受保护部署及 Win10/11 各 24 小时验收，不能宣称 P1–P3 全部通过。未提交或推送。
+
+最终正式观察为 35 分钟/210 条：平均归一化 CPU 0.0914%，Working Set 均值 194.42 MiB、采样峰值 210.08 MiB，之后读取的 OS 存活期峰值 234.94 MiB。第 5–10 与 30–35 分钟均值分别为 194.103 和 195.025 MiB，没有重现原先数百 MiB 增长，但严格内存峰值目标仍未通过。
+
+真实落盘 412 对、跨度 2057.558 秒，0 解析/重复/配对/序号/时钟异常；Collector 均值 1474.13 ms、P95 1830 ms。最终回放 343/361 槽（95%），六段 50/60、52/60、60/60、60/60、60/60、61/61，首段低于原 85%，所以诊断仍为证据不足，不能算采样充分性通过。修改前后分析器在同一窗口的 24967 个点哈希和完整报告相同，排除本轮存储优化造成该差异；360 个原始点有 17 次归槽碰撞，累计完成相位漂移约 2.558 秒，仍需后续修复/实测，不能放宽检查。

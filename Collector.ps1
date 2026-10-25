@@ -5,6 +5,47 @@ All outputs are scalar snapshots. Never return live System.Diagnostics.Process o
 No mutating operations, no process termination, no privilege elevation.
 #>
 
+function Initialize-MiCollectorProcessTimes {
+    # .NET Framework 的 Process.StartTime 在部分受限进程上有昂贵的失败路径。
+    # 只申请 QUERY_LIMITED_INFORMATION，每轮重新读同一 Windows 创建时间；不缓存 PID 身份。
+    # 这里没有终止、写内存或调试权限，失败仍返回 null，动作模块继续独立完整复核身份。
+    if ($null -ne ('MemoryInspector.CollectorProcessTimes' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace MemoryInspector {
+    public static class CollectorProcessTimes {
+        private const uint QueryLimitedInformation = 0x1000;
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetProcessTimes(SafeProcessHandle process,
+            out long creation, out long exit, out long kernel, out long user);
+        public static long? ReadStartUtcTicks(int processId) {
+            if (processId <= 0) return null;
+            try {
+                // 每次调用都释放句柄，不保留跨采样状态或任何操作能力。
+                using (SafeProcessHandle handle = OpenProcess(QueryLimitedInformation, false, processId)) {
+                    if (handle == null || handle.IsInvalid) return null;
+                    long creation, exit, kernel, user;
+                    if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user) || creation <= 0)
+                        return null;
+                    return DateTime.FromFileTimeUtc(creation).Ticks;
+                }
+            } catch { return null; }
+        }
+    }
+}
+'@ -ErrorAction Stop
+}
+
+function Get-MiProcessStartUtcTicks {
+    param([int]$ProcessId)
+    return [MemoryInspector.CollectorProcessTimes]::ReadStartUtcTicks($ProcessId)
+}
+
 function Get-MiMemoryCounter {
     param($Source,[string]$Property,[long]$Scale=1,[long]$Minimum=0)
     # 先检查空值和整数格式再转换，避免 PowerShell 将 $null、空串或无效计数器变成合法的 0。
@@ -60,6 +101,7 @@ function Get-MiProcessSnapshot {
     $incomplete = 0
     $errorText = $null
     try {
+        Initialize-MiCollectorProcessTimes
         $processes = @(Get-Process -ErrorAction Stop)
     } catch {
         return [pscustomobject]@{
@@ -81,8 +123,8 @@ function Get-MiProcessSnapshot {
             $row.PID = [int]$proc.Id
             $row.Name = [string]$proc.ProcessName
             try {
-                $start = $proc.StartTime
-                if ($null -ne $start) { $row.StartUtcTicks = [long]$start.ToUniversalTime().Ticks }
+                $row.StartUtcTicks = Get-MiProcessStartUtcTicks -ProcessId $row.PID
+                if ($null -eq $row.StartUtcTicks) { $row.Status = 'Partial' }
             } catch { $row.Status = 'Partial' }
             try { $row.PrivateBytes = [long]$proc.PrivateMemorySize64 }
             catch { $row.Status = 'Partial' }
