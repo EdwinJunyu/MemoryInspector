@@ -311,3 +311,48 @@ PrivilegeInstallTest 已扩展真实 SYSTEM 握手、任务禁用时拒绝、非
 **仍未验证：**真实 Program Files/ProgramData 安装、任务注册/DACL、SYSTEM 执行与开机触发、调度延迟、真实断电/进程崩溃/磁盘满、Windows 10/11 分别部署验收。第一次从旧版迁移前需关闭旧 GUI 和旧提权执行器，旧版不认识 M2 部署租约。任务注册后失败、实际状态未知或坏日志保持阻断，管理员需保留证据并修复可信状态，不能删除日志解锁。高级 WPR/Heap/ETL 功能保持禁用，不能宣布 Preview B 或 Stable v3。此前 <200 MiB 峰值与长时采样覆盖问题仍开放，本轮未重新验证或调整门槛。
 
 Task Scheduler API 依据：[重复触发](https://learn.microsoft.com/en-us/windows/win32/taskschd/repeating-a-task)、[任务安全上下文](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)、[任务安全描述符](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-setsecuritydescriptor)。这些 API 文档不替代本项目的实机部署验收。
+
+## 2026-10-25 V3-M3：WPR Core
+
+冻结依据：规格第 5、6、8、11–14 节及 V3-M3；基线 `1955cb4`（M2）。修改原 PrivilegeSecurity、ElevatedExecutor、PrivilegeSecurityTest、PrivilegeInstallTest 及现有备注，没有新增代码模块。VERSION 保持 0.0.9；安装清单继续验证修改后的组件哈希。本地提交，不推送远程。
+
+### M2 安全前置条件
+
+本轮实际检查：PowerShell Desktop 5.1.22621.6133，Windows 11 build 22631；当前非管理员，受保护安装、Trace Journal、Watchdog 策略均不存在。先运行 M2 安全回归通过，但管理员 ACL 分支为 SKIP；既有 M2 记录同样没有真实 SYSTEM/开机/任务 DACL/Win10、11 验收。故 M3 总发布门、M2Accepted、MemoryAccepted、FileAccepted 全部固定关闭，任何实际 Start/Stop 在副作用前拒绝，没有用户设置、JSON 或专家模式绕过。普通监控和只读归因保持原行为。
+
+### 实现范围
+
+- 固定审核源码内 Profile：VirtualAlloc / Pool × Memory / File，1 MiB × 128 系统缓冲，绑定 XML SHA256。仅使用 System32 的已验证 Microsoft 签名 WPR，记录版本/摘要/签名身份，不接受用户可执行路径、Profile 或输出目录。启动后建立实际公共 ETW collector 身份；名称之外绑定 GUID、session handle、logger thread ID/创建时间、模式、临时路径、启动会话和启动意图。启动前后发现外部公共会话身份变化，保留 UnknownOutcome；不停止外部会话。
+- 控制器确认后重新核验 M2 健康和资源；持共享部署租约与全局状态锁，写意图后一次派发。固定 `TraceStart/TraceStop/TraceArtifacts` 命令及对应参数分开验证。没有自由命令、全局 cancel/force、服务操作或进程 Kill。TraceStop 的手动请求须属于实际授权账户；没有把 GUI 用户 SID 从任意参数传入高权限路径。GUI 发起者安全绑定与界面整合尚属 M7，当前控制台确认者就是所有者。
+- CreateProcessW 使用完整 ApplicationName、最小离线环境、受保护工作目录、隐藏窗口及 CREATE_BREAKAWAY_FROM_JOB；不支持脱离 Job 时拒绝，不回退到可能随 Watchdog 结束的子进程。高权限 CodeDom 编译临时文件位于受保护 workspace。ETW 查询要求管理员完整公共会话可见性；普通令牌查询得到空列表不被当作没有外部追踪。
+- 独立 Watchdog 调用 M3 监督路径：归属核验后优先处理截止，资源不可读则保守请求一次受控停止。运行空间/可用 RAM 过低亦进入同一路径。Stop 意图、进程身份、停止观测时间和保存结果分开记录；停止/合并不阻塞 GUI，超过 180 秒的观察期限标记未知并保留恢复义务，不自动重试或 Kill。机器不可用时不承诺准时停止，健康环境截止后两分钟目标尚未实测。
+- 三层容量独立计算：默认成品/相关诊断数据 8 GiB、工作空间 4 GiB、磁盘预留 2 GiB；启动 RAM 余量 1 GiB，监督时 Memory 工作量 ≥4 GiB、File 工作量 ≥2 GiB（余下一半留给合并）、磁盘剩余小于 2 GiB + max(1 GiB, 当前工作量)、或 RAM <512 MiB 请求受控停止；周期采样可能超出软预算，不能保证磁盘硬配额。阈值为工程初值，尚未冻结性能/容量验收。File Mode 用固定受保护临时目录，拒绝重解析点、不可读卷或不可信 ACL；继承自受保护父目录的 WPR 数据允许可信继承，不把它误判为可写控制文件。
+- ETL 使用原生 OpenTrace/ProcessTrace 读取全部事件（消费时间上限 10 秒），再有界哈希（10 秒）；超时/损坏保持不可信并保留数据。事件/缓冲丢失降低 MeasurementQuality。实际有效 ETL 与大文件耗时未实测，这两个上限仍需兼容性校准，不能声称覆盖所有追踪文件。
+- 保存前记录已校验字节数/哈希，移动后再提交 Ready。源/目标仅一个存在且身份吻合时可恢复；两处同时存在、缺失、哈希变化均保持阻断。停止确认后、首个 Artifact 意图前重启，也可在写者退出后重新核验已知输出完成保存。Saved 后失败保留 SaveState=Saved，不回退为未保存。M3 无 Heap 配置事务及分析器，CleanupState=NotRequired，AnalysisState=Unavailable。
+- 受保护 ETL 仅对应所有者可读。默认 7 天到期后，在无引用和无冲突读句柄时归档到 `retained`，并处理移动后日志中断；遵守用户“不实际删除”要求，保留的字节仍计入预算。无自动上传/符号联网。人工导出只通过用户主动复制其可读文件，不为高权限执行器增加用户指定输出目录。普通历史配额不变。
+
+### Review：Standards
+
+基线固定为 `1955cb4`，审阅未提交差异。首轮发现资源读取失败造成监督中断，以及保存后失败使用陈旧 Session 导致非法状态回退；修复后增加期限与资源故障、Artifact Ready/Session Cleaning/Analyzing/Completed 日志边界测试。复核另发现 PowerShell 动态作用域验证变量未初始化、WPR 缺失时测试误报四次真实解析；均修复并测试。最终 Standards 复核无剩余阻断项。
+
+### Review：Spec
+
+独立首轮发现资源查询故障丢失截止处理，以及 ETL 移动后崩溃的保存事务无法恢复；随后发现首个 Artifact 意图前重启缺少恢复入口。现通过受保护保存意图、最新状态及真实文件核验恢复，未确认停止或写者仍存活时拒绝，不重派发 WPR。新增无 Artifact 的换启动会话恢复夹具。最终 Spec 复核无剩余阻断项。两轴结论均是代码审阅，不是实机发布验收。
+
+### 验证与保留证据
+
+Windows PowerShell Desktop 5.1 / STA / RemoteSigned：SmokeTest、AnalyzerTest、GuiV4Test、PersistenceTest、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test **八套全部退出 0**。新增测试运行真实 Journal、跨进程文件锁代码、文件移动/哈希、读句柄与原生无效 ETL 拒绝；WPR 启停、ACL、健康响应及有效 ETL 消费边界在夹具中模拟，不会录制本机。
+
+新增覆盖：实际关闭的 Start/Stop/Recovery 门控、三层预算、固定模式/实例参数、Heap 拒绝、健康失败/取消、单活跃会话、身份替换/路径不可信/Profile 改写、未知 Start/Stop 不重试、期限优先于资源错误、资源不可读/超预算停止、停止与保存独立、四处保存日志故障、首次保存意图前重启、归档活跃引用/真实读句柄及移动后中断、保留字节仍计入预算。原 M2 锁/CAS/日志损坏、部署回滚及真实内存 COM 定义测试继续通过。
+
+只读实机检查：WPR 文件版本 10.0.22621.5624，Microsoft 签名 Valid；四种固定 Profile 均由实际 `wpr -profiles <file>` 解析成功。原生 C# 适配器在 PS5.1 编译成功，损坏 ETL 由实际 OpenTrace 拒绝。**没有执行 WPR start/stop、SYSTEM 任务注册、安装/卸载或修改 Heap 配置。** PrivilegeInstallTest 增加真实安装后的 TraceStart 禁用验证，仅供 disposable runner；本轮未执行。
+
+证据位于本地忽略目录 `test-artifacts/v3-m3/`：`prerequisite-status.json`、`m2-prerequisite.log`、`security-first.log`、`security-m3-first.log`、`security-recovery.log`、`security-final.log` 及八套同名日志。首次 CodeDom 缺少 System.dll 引用的编译失败已修复；没有降低测试标准。测试自有的 WprProfiles/WprCore 文件夹保留在 test-artifacts，不纳入源码提交。
+
+### 仍关闭的发布关卡
+
+待验证：真实受保护部署与 SYSTEM/计划任务健康、Windows 10/11 各版本 WPR Profile 支持、实际 collector 身份与外部追踪共存、Job breakaway、有效 ETL/事件丢失、Memory/File 实录/保存/合并、磁盘/内存压力、截止/崩溃/断电/休眠、调度延迟及性能开销。QueryAllTraces 仅返回调用者可访问的公共会话，不能作为所有私有 ETW 会话的完整盘点；不据此宣称无冲突。未知归属、无法确认停止或保存输入不完整时仍需管理员保留证据并独立修复，不能删除日志解锁。
+
+所有上述验收通过前不修改源码内 release gate，不宣布 Preview B 或 Stable v3。此前 GUI 内存峰值和长时采样覆盖问题仍开放，M3 未修改相应阈值。Heap/M4、WPAExporter/M5、ActionGrant/M6 和 GUI/M7 不在本次范围。
+
+API 依据：[WPR 命令与模式](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/wpr-command-line-options)、[命名实例](https://devblogs.microsoft.com/performance-diagnostics/controlling-the-event-session-name-with-the-instance-name/)、[QueryAllTraces 可见性](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-queryalltracesw)、[ETW 会话属性](https://learn.microsoft.com/en-us/windows/desktop/ETW/event-trace-properties)、[OpenTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracew)、[CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)、[Job breakaway / 隐藏进程标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)。文档只证明 API 契约，不替代上述实机验收。

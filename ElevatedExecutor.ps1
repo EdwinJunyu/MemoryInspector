@@ -1,13 +1,17 @@
 ﻿#requires -Version 5.1
 <#
-M7 protected, short-lived executor. Probe plus explicitly approved Windows service
-operations only. Unknown identity, invalid ACL, changed binary, missing audit or
+M7 / V3-M3 protected, short-lived executor. Fixed service and trace operations only.
+Unaccepted WPR features remain disabled by the code-level release policy. Unknown identity, invalid ACL, changed binary, missing audit or
 running dependents always fails closed. Never kills a service host process.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$Operation,
     [Parameter(Mandatory=$true)][string]$RequestId,
-    [string]$ServiceName=''
+    [string]$ServiceName='',
+    [ValidateSet('VirtualAlloc','Pool')][string]$TraceType='VirtualAlloc',
+    [ValidateSet('Memory','File')][string]$RecordingMode='Memory',
+    [ValidateRange(300,1800)][int]$DurationSeconds=300,
+    [string]$TraceSessionId=''
 )
 $ErrorActionPreference='Stop'
 $exitCode=2
@@ -24,6 +28,13 @@ try {
     if (-not (Test-MiPrivilegedOperation -Operation $Operation -RequestId $RequestId -ServiceName $ServiceName)) {
         throw 'Unsupported operation, invalid request ID, or invalid service name.'
     }
+    # 每种命令只接受其自身的固定参数，不静默忽略跨操作参数。
+    foreach ($parameter in @('TraceType','RecordingMode','DurationSeconds')) {
+        if ($PSBoundParameters.ContainsKey($parameter) -and $Operation -cne 'TraceStart') {throw 'Unexpected trace start parameter.'}
+    }
+    if (($PSBoundParameters.ContainsKey('TraceSessionId') -and $Operation -cne 'TraceStop') -or
+        ($Operation -ceq 'TraceStop' -and -not (Test-MiGuidN $TraceSessionId))) {throw 'Unexpected or invalid trace session parameter.'}
+    if ($Operation -cin @('TraceStart','TraceStop')) {Assert-MiWprReleaseAccepted}
     $paths=Assert-MiTrustedInstallation
     if (-not [string]::Equals(
         [IO.Path]::GetFullPath($root).TrimEnd('\'),
@@ -60,12 +71,29 @@ try {
     } elseif ($Operation -ceq 'TracePreflight') {
         Invoke-MiTracePreflight $RequestId | Format-List
         $exitCode=2 # M2 不开放实际 WPR，拒绝不能伪装成成功启动。
+    } elseif ($Operation -ceq 'TraceStart') {
+        $trace=Invoke-MiWprStart $RequestId $TraceType $RecordingMode $DurationSeconds
+        $trace|Format-List
+        $exitCode=if ($trace.State -ceq 'Recording') {0} else {2}
+        Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -State $trace.State -Reason 'Fixed profile trace request'
+    } elseif ($Operation -ceq 'TraceStop') {
+        Invoke-MiWprStop $TraceSessionId
+        Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -State 'DISPATCHED' -Reason ('Asynchronous stop for '+$TraceSessionId)
+        $exitCode=0
+    } elseif ($Operation -ceq 'TraceArtifacts') {
+        $lock=Enter-MiTraceLock
+        try {@((Read-MiTraceJournal $lock).Artifacts.Values)|ConvertTo-Json -Depth 12|Write-Output} finally {$lock.Dispose()}
+        $exitCode=0
     } elseif ($Operation -ceq 'TraceRecovery') {
         Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
-        $answer=Read-Host 'Type VERIFY DEPLOYMENT to revalidate an intact deployment; Enter only keeps the report'
+        $answer=Read-Host 'Type VERIFY DEPLOYMENT or RECOVER SAVED ARTIFACTS; Enter only keeps the report'
         if ($answer -ceq 'VERIFY DEPLOYMENT') {
             Invoke-MiTraceDeploymentRecovery
             Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
+        }
+        if ($answer -ceq 'RECOVER SAVED ARTIFACTS') {
+            Repair-MiWprSavedArtifacts
+            Get-MiTraceRecoveryReport|ConvertTo-Json -Depth 12|Write-Output
         }
         $exitCode=0 # 仅表示生成报告；报告明确独立列出恢复阻断。
     } else {

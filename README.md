@@ -43,6 +43,20 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 本轮只执行普通权限回归、真实文件故障夹具及内存 COM 定义检查，**未在本机安装 SYSTEM 任务**。真实安装/健康响应/禁用任务拒绝/卸载重装已加入原 PrivilegeInstallTest，仍需隔离环境执行；Windows 10/11 启动、调度延迟和权限实测未完成，因此不能据此开放高级追踪或宣布 Preview B / Stable v3。
 
+## V3-M3 — WPR Core（代码完成，录制发布门关闭）
+
+按冻结规格在原 PrivilegeSecurity / ElevatedExecutor 内接入固定 VirtualAlloc、Pool Profile、默认 Memory / 可选 File Mode、独立停止/保存、受保护 ETL 目录与恢复事务。**本机 M2 前置条件未通过：没有受保护安装、Journal 或 Watchdog 策略，当前令牌不是管理员。** M2 的真实 SYSTEM、任务 DACL、启动触发与 Windows 10/11 验收也未完成。因此 `Get-MiWprReleaseStatus` 的 M2/Memory/File 验收标志及总开关固定为 false，不提供配置绕过；实际追踪尚不能使用，不能发布 Preview B。
+
+- `TraceStart` 只接受 VirtualAlloc/Pool、Memory/File、300–1800 秒；默认 300 秒，独立显示并确认本次请求。只有发布门、完整安装、实际 SYSTEM 健康响应、公共 ETW 状态、路径与三层预算全部通过才有启动资格。GUI 高级追踪接入留待 M7。
+- 归属绑定启动会话、授权、固定 Profile/程序身份、启动意图和 ETW GUID/handle/logger thread 创建时间等证据。停止只能作用于已绑定实例；不存在全局 cancel、force、任意路径/命令或进程 Kill。仅名称匹配、结果未知、线程/程序身份变化均不派发停止。QueryAllTraces 不声称能枚举所有私有会话，实际共存能力须实机验收。
+- WPR 隐藏子进程使用固定完整路径和最小环境，独立于 GUI。停止/合并异步进行，Watchdog 观察精确子进程身份；通过 Job breakaway 避免被任务运行时限一起结束，不支持脱离时拒绝。停止确认、ETL 校验与保存、清理和分析各自记录，不把派发成功当作保存完成。
+- 当前工程预算：128 MiB Profile 缓冲、4 GiB 工作预算、2 GiB 磁盘预留、8 GiB ETL/诊断存储预算；这些工作阈值需在目标设备校准，不是文件系统硬上限。File 录制占用达到工作预算一半即请求停止，为合并保留空间。资源读取失败先重新核验归属再请求一次停止，期限判断优先。File Mode 的实际临时路径、ACL/重解析点及磁盘卷必须可信。
+- ETL 在产品 ProgramData 的固定 `diagnostics/<OwnerSid>/<ArtifactId>.etl` 保存，仅授予对应授权用户只读访问；不联网、不自动上传、不生成联网符号。`TraceArtifacts` 是受保护目录的只读清单入口。M3 无自动分析器，完成后的 AnalysisState 为 Unavailable；有效 ETL 的完整消费校验和事件丢失信息独立于 WPAExporter。
+- 默认 7 天到期；遵守本项目“不实际删除”要求，自动清理将已核验、无活跃引用/读句柄的 ETL 移入同一受保护所有者目录下的 `retained`，仍计入 8 GiB 预算，不报告释放空间。普通监控历史不受此配额影响。用户可明确使用普通文件操作导出自己可读的副本，该副本不受本工具保留策略管理。
+- 固定 `TraceRecovery` 报告新增门控和 Artifact 状态；`RECOVER SAVED ARTIFACTS` 仅在发布验收通过后恢复已经确认停止、写者退出的已知保存事务。记录前后崩溃均重新核验实际文件，绝不补发未知 Start/Stop。未完成会话、保存/归档事务和引用继续阻断安装/卸载。
+
+本轮四种 Profile 已通过本机 WPR 的只读语法解析，八个 PS5.1 回归与 Review 双轴复核通过。实际录制/停止、有效 ETL、SYSTEM 子进程 Job breakaway、资源压力、外部追踪共存和 Windows 10/11 验收均未完成，**不把模拟测试等同于发布验收**。详细记录见 [M3 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m3wpr-core)。VERSION 仍为 0.0.9，仅本地提交，不推送。
+
 ### 归因页界面约定
 
 本次为现有 Windows 桌面界面的局部扩展，复用 `New-MiV4DataGrid`、`New-MiLabel` 和主窗口的配色/中文字体，不创建新的 UI 模块或改变已有操作页。Microsoft YaHei UI、浅色背景 `#F3F6FB`、正文 `#17283E`、分隔线 `#DDE5EE` 仍由 MemoryInspector.ps1 统一拥有。原生 TabControl/ComboBox/DataGridView 负责键盘、焦点和内部滚动；归因页的多选是只读诊断特例。未知值显示“不可用”，失效结果清空，选择仅跟随精确实例；后台采集与趋势分析在 Worker 中执行，界面只排版结果。设置、历史、服务及危险确认流程沿用原行为。

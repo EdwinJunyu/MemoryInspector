@@ -347,3 +347,229 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     if (-not $rejected) {throw 'Unbounded watchdog accepted.'}
     Write-Host 'PASS: real COM task definition (not registered), exact action/principal/bounded runtime rejection.'
 }
+
+
+# V3-M3：真实 Journal/文件移动，WPR/ACL/健康边界在夹具中模拟；绝不录制本机。
+& {
+    function Assert-M3Rejected {param([scriptblock]$Action,[string]$Label)
+        $rejected=$false;try {& $Action|Out-Null} catch {$rejected=$true}
+        if (-not $rejected) {throw ('M3 unexpectedly accepted: '+$Label)}
+    }
+    if ((Get-MiWprReleaseStatus).Enabled -or (Get-MiWprReleaseStatus).M2Accepted -or (Get-MiWprReleaseStatus).FileAccepted) {throw 'Unaccepted M2/M3 released.'}
+    Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))} 'actual release gate'
+    Assert-M3Rejected {Invoke-MiWprStop ([guid]::NewGuid().ToString('N'))} 'actual stop release gate'
+    Assert-M3Rejected {Repair-MiWprSavedArtifacts} 'actual recovery release gate'
+    foreach ($operation in @('TraceStart','TraceStop','TraceArtifacts')) {
+        if (-not (Test-MiPrivilegedOperation $operation $id)) {throw 'Fixed M3 protocol rejected.'}
+        if (Test-MiPrivilegedOperation $operation $id 'RpcSs') {throw 'M3 protocol accepted service payload.'}
+    }
+    if (-not (Test-MiWprResources 0 0 6442450944 1073741824)) {throw 'Valid independent budgets rejected.'}
+    foreach ($values in @(@(-1,0,6442450944,1073741824),@(8589934592,0,6442450944,1073741824),
+        @(0,4294967297,6442450944,1073741824),@(0,0,6442450943,1073741824),@(0,0,6442450944,1073741823))) {
+        if (Test-MiWprResources $values[0] $values[1] $values[2] $values[3]) {throw 'Invalid resource budget accepted.'}
+    }
+    $profileFixture=Join-Path (Join-Path $root 'test-artifacts') ('WprProfiles-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($profileFixture)
+    $parsedProfiles=0
+    foreach ($type in @('VirtualAlloc','Pool')) {foreach ($mode in @('Memory','File')) {
+        $profile=Get-MiWprProfile $type $mode
+        if ((Get-MiTraceHash $profile.Xml) -cne $profile.Fingerprint -or $profile.BufferBytes -ne 134217728) {throw 'Profile fingerprint/buffer budget mismatch.'}
+        $path=Join-Path $profileFixture ($type+'-'+$mode+'.wprp');[IO.File]::WriteAllText($path,$profile.Xml)
+        if ([IO.File]::Exists((Join-Path $env:WINDIR 'System32\wpr.exe'))) {
+            & (Join-Path $env:WINDIR 'System32\wpr.exe') -profiles $path | Out-Null
+            if ($LASTEXITCODE -ne 0) {throw 'Real read-only WPR profile parser rejected fixed profile.'}
+            $parsedProfiles++
+        }
+    }}
+    Assert-M3Rejected {Get-MiWprProfile 'Heap' 'Memory'} 'M4 not enabled'
+    Initialize-MiTraceNative
+    $badEtl=Join-Path $profileFixture 'invalid.etl';[IO.File]::WriteAllText($badEtl,'not an ETL')
+    Assert-M3Rejected {Test-MiEtlArtifact $badEtl} 'real native ETL parser'
+    if (-not (Test-MiAdminToken)) {Assert-M3Rejected {Get-MiEtwSessions} 'permission filtered ETW query'}
+    Write-Host ('PASS: actual disabled release gates, independent budgets and native invalid ETL rejection; real WPR profile parses='+$parsedProfiles)
+    if ($parsedProfiles -eq 0) {Write-Host 'SKIP: WPR missing; profile syntax not verified by actual WPR.'}
+
+    $realAppend=${function:Add-MiTraceJournalRecord}
+    $realTransport=${function:Start-MiWprProcess}
+    $test=@{}
+    function Get-MiSecurityPaths {return $test.Paths}
+    function Test-MiAdminToken {return $true}
+    function Test-MiAclRestricted {param($Path,$Protected) if ($test.PathFault) {return $false};return [IO.Path]::GetFullPath($Path).StartsWith($test.Paths.Data+'\',[StringComparison]::OrdinalIgnoreCase) -or $Path -eq $test.Paths.Data}
+    function Set-MiProtectedFileAcl {param($Path,$AllowUsersRead)}
+    function Set-MiAdminDirectoryAcl {param($Path,$AllowUsersRead)}
+    function Set-MiDiagnosticAccess {param($Path,$OwnerSid,[switch]$Directory)}
+    function Get-MiWprReleaseStatus {return [pscustomobject]@{Enabled=$true;M2Accepted=$true;MemoryAccepted=$true;FileAccepted=$true}}
+    function Get-MiBootSessionId {return '100'}
+    function Assert-MiWatchdog {}
+    function Invoke-MiTraceHealthCheck {if ($test.HealthFault) {throw 'Fixture health failure'}}
+    function Read-Host {param($Prompt) if ($test.Cancel) {return ''};if ($Prompt -match 'Type START ([a-f0-9]{32}) ') {return 'START '+$matches[1]};throw 'Unexpected prompt'}
+    function Get-MiWprIdentity {return [pscustomobject]@{SchemaVersion=1;Path='C:\Windows\System32\wpr.exe';Sha256=('A'*64);Version='Fixture';Signer='Fixture'}}
+    function Get-MiEtwSessions {return $test.Observed}
+    function Get-MiWprResources {
+        if ($test.ResourceFault) {throw 'Fixture disk query failed'}
+        return [pscustomobject]@{ArtifactBytes=0;WorkingBytes=$test.WorkingBytes;FreeBytes=10737418240;AvailableMemoryBytes=4294967296}
+    }
+    function Start-MiWprProcess {param($Verb,$Session)
+        if ($Verb -ceq 'Start') {
+            $test.Starts++
+            if ($test.StartFault) {throw 'Fixture start result unknown'}
+            $profile=Get-MiWprProfile $Session.RequestedTraceType $Session.RecordingMode
+            $temporary=(Get-MiWprSessionPaths $Session).Temporary
+            $test.Observed=@($test.Observed)+[pscustomobject]@{Name=('WPR_initiated_'+$Session.WprInstanceName+'_'+$profile.CollectorSuffix);
+                Guid=[guid]::NewGuid().ToString();Handle='0000000000000123';ThreadId=123;ThreadCreated=[datetime]::UtcNow.ToFileTimeUtc();
+                Mode=0x02000000;FileName=(Join-Path $temporary 'fixture.etl');BufferKB=1024;MaximumBuffers=128}
+        } else {$test.Stops++;if ($test.StopFault) {throw 'Fixture stop dispatch outcome unknown'}}
+        $time=if ($test.Expired) {[datetime]::UtcNow.AddMinutes(-10)} else {[datetime]::UtcNow}
+        return [pscustomobject]@{SchemaVersion=1;Pid=123;StartUtcTicks=123456;DispatchedUtc=$time.ToString('o');Operation=$Verb}
+    }
+    function Test-MiWprProcessRunning {param($Identity) return $test.WriterLive}
+    function Test-MiEtlArtifact {param($Path)
+        $file=Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.Length -eq 0) {throw 'Empty fixture ETL'}
+        return [pscustomobject]@{SizeBytes=$file.Length;Sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash;EventCount=3;EventsLost=1;BuffersLost=0}
+    }
+    function Add-MiTraceJournalRecord {param($Lock,$ExpectedRevision,$Kind,$Payload)
+        if ($Kind -ceq 'Artifact' -and $Payload.State -ceq 'Saving' -and $test.AgeArtifact) {
+            $Payload.CreatedUtc=[datetime]::UtcNow.AddDays(-8).ToString('o');$Payload.RetainUntilUtc=(ConvertTo-MiTraceUtc $Payload.CreatedUtc).AddDays(7).ToString('o')
+        }
+        if ($test.Fault -ceq ($Kind+':'+$Payload.State)) {$test.Fault='';throw 'Injected append boundary failure'}
+        return & $realAppend $Lock $ExpectedRevision $Kind $Payload
+    }
+    function New-M3Fixture {
+        $test.Clear();$test.Starts=0;$test.Stops=0;$test.WorkingBytes=0;$test.Observed=@();$test.WriterLive=$true
+        $directory=Join-Path (Join-Path $root 'test-artifacts') ('WprCore-'+[guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($directory)
+        $test.Paths=[pscustomobject]@{Data=$directory;TraceRoot=(Join-Path $directory 'trace');TraceJournal=(Join-Path $directory 'trace\journal.jsonl');
+            TraceLock=(Join-Path $directory 'trace.lock');TraceWorkspace=(Join-Path $directory 'trace\workspace');DeploymentLease=(Join-Path $directory 'deployment.lock');TraceArtifacts=(Join-Path $directory 'diagnostics')}
+        $lock=Enter-MiTraceLock
+        try {
+            $j=Initialize-MiTraceJournal $lock
+            $challenge=[ordered]@{SchemaVersion=1;Nonce=[guid]::NewGuid().ToString('N');BootSessionId='100';InstallationId=$j.InstallationId;
+                DefinitionHash=('A'*64);RequestedUtc=[datetime]::UtcNow.ToString('o');ExpiresUtc=[datetime]::UtcNow.AddSeconds(40).ToString('o')}
+            $j=Add-MiTraceJournalRecord $lock $j.Revision 'HealthChallenge' $challenge
+            $response=[ordered]@{SchemaVersion=1;Nonce=$challenge.Nonce;BootSessionId='100';InstallationId=$j.InstallationId;
+                DefinitionHash=('A'*64);Utc=[datetime]::UtcNow.ToString('o');ExecutorSid='S-1-5-18';ScannedHash=$j.Hash}
+            $j=Add-MiTraceJournalRecord $lock $j.Revision 'HealthResponse' $response
+            [void](Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='Ready'}))
+        } finally {$lock.Dispose()}
+    }
+    New-M3Fixture;$test.Cancel=$true
+    if ((Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))).State -cne 'AuthorizationDenied' -or $test.Starts -ne 0) {throw 'Cancelled start dispatched.'}
+    New-M3Fixture;$test.HealthFault=$true
+    Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))} 'missing watchdog response'
+    if ($test.Starts -ne 0) {throw 'Unhealthy watchdog dispatched.'}
+    New-M3Fixture;$test.StartFault=$true;$request=[guid]::NewGuid().ToString('N')
+    Assert-M3Rejected {Invoke-MiWprStart $request} 'unknown start'
+    $lock=Enter-MiTraceLock
+    try {
+        $j=Update-MiTraceSupervision $lock '100';$j=Update-MiTraceSupervision $lock '100'
+        if ($test.Starts -ne 1 -or $test.Stops -ne 0 -or $j.Sessions[$request].State -cne 'RecoveryRequired') {throw 'Unknown start automatically retried or stopped.'}
+    } finally {$lock.Dispose()}
+    foreach ($mode in @('Memory','File')) {
+        New-M3Fixture;$session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N')) 'Pool' $mode 300
+        $arguments=Get-MiWprArguments Start $session
+        if (-not $arguments.EndsWith('-instancename '+$session.WprInstanceName) -or ($mode -ceq 'File' -and $arguments -notmatch '-filemode') -or
+            ($mode -ceq 'Memory' -and $arguments -match '-filemode')) {throw 'Wrong mode or instance command binding.'}
+        Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))} 'single active trace'
+        Assert-MiWprOwnership $session $test.Observed
+        $test.PathFault=$true
+        Assert-M3Rejected {& $realTransport 'Start' $session} 'untrusted actual transport workspace'
+        $test.PathFault=$false
+        $paths=Get-MiWprSessionPaths $session;$profileText=[IO.File]::ReadAllText($paths.Profile)
+        [IO.File]::WriteAllText($paths.Profile,'changed profile')
+        Assert-M3Rejected {& $realTransport 'Start' $session} 'changed actual transport profile'
+        [IO.File]::WriteAllText($paths.Profile,$profileText)
+        $original=$test.Observed[0]|ConvertTo-Json -Depth 10|ConvertFrom-Json
+        foreach ($field in @('Guid','Handle','ThreadId','ThreadCreated','Mode','FileName')) {
+            $bad=$original|ConvertTo-Json -Depth 10|ConvertFrom-Json
+            if ($field -cin @('ThreadId','ThreadCreated','Mode')) {$bad.$field=1} else {$bad.$field='replaced'}
+            Assert-M3Rejected {Assert-MiWprOwnership $session @($bad)} ('ownership '+$field)
+        }
+        if ($test.Stops -ne 0) {throw 'Ownership rejection dispatched stop.'}
+    }
+    foreach ($reason in @('Deadline','ResourceFailure','Budget','FileMergeReserve','UnknownStop')) {
+        New-M3Fixture;$test.Expired=$reason -ceq 'Deadline'
+        $mode=if ($reason -ceq 'FileMergeReserve') {'File'} else {'Memory'}
+        $session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N')) 'VirtualAlloc' $mode
+        $test.ResourceFault=$reason -cin @('Deadline','ResourceFailure');$test.StopFault=$reason -ceq 'UnknownStop'
+        if ($reason -ceq 'Budget') {$test.WorkingBytes=4294967297}
+        if ($reason -ceq 'FileMergeReserve') {$test.WorkingBytes=2147483648}
+        $lock=Enter-MiTraceLock
+        try {
+            if ($reason -ceq 'UnknownStop') {Assert-M3Rejected {Request-MiWprStop $lock $session} 'unknown stop'}
+            else {$j=Update-MiTraceSupervision $lock '100'}
+            $j=Read-MiTraceJournal $lock
+            if ($test.Stops -ne 1) {throw ('Missing single stop: '+$reason)}
+            if ($reason -ceq 'Deadline' -and $j.Sessions[$session.TraceSessionId].StopReason -cne 'DeadlineExceeded') {throw 'Resource error masked deadline.'}
+            Assert-M3Rejected {Request-MiWprStop $lock $session} 'stale or replayed stop'
+            $j=Update-MiTraceSupervision $lock '100'
+            if ($test.Stops -ne 1) {throw 'Stop automatically repeated.'}
+        } finally {$lock.Dispose()}
+    }
+    foreach ($fault in @('','Artifact:Ready','Session:Cleaning','Session:Analyzing','Session:Completed','MissingOutput')) {
+        New-M3Fixture;$session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))
+        $lock=Enter-MiTraceLock
+        try {
+            $j=Request-MiWprStop $lock $session;$test.Observed=@()
+            $j=Update-MiTraceSupervision $lock '100';$current=$j.Sessions[$session.TraceSessionId]
+            if ($current.State -cne 'Saving' -or $current.StopState -cne 'Confirmed' -or $current.SaveState -ceq 'Saved') {throw 'Stop/save outcomes conflated.'}
+            $paths=Get-MiWprSessionPaths $session
+            if ($fault -cne 'MissingOutput') {[IO.File]::WriteAllText($paths.Output,'fixture ETL bytes')}
+            $test.WriterLive=$false;$test.Fault=$fault
+            $j=Update-MiTraceSupervision $lock '100';$current=$j.Sessions[$session.TraceSessionId]
+            if ($fault -ceq 'MissingOutput') {
+                if ($current.State -cne 'TraceNotSaved' -or $current.StopState -cne 'Confirmed') {throw 'Missing ETL erased confirmed stop.'}
+                continue
+            }
+            if ($fault -ne '') {
+                if ($current.State -cne 'RecoveryRequired') {throw ('Fault not retained: '+$fault)}
+                if ($fault.StartsWith('Session:') -and $current.SaveState -cne 'Saved') {throw 'Saved result lost on later failure.'}
+                $j=Complete-MiWprArtifact $lock $current
+            }
+            $current=$j.Sessions[$session.TraceSessionId];$artifact=$j.Artifacts[$current.OutputArtifactId]
+            if ($current.State -cne 'Completed' -or $artifact.State -cne 'Ready' -or $artifact.MeasurementQuality -cne 'Partial' -or
+                -not [IO.File]::Exists((Get-MiTraceArtifactPath $artifact)) -or [IO.File]::Exists($paths.Output)) {throw 'Save/recovery did not preserve verified artifact.'}
+            Assert-MiTraceQuiescent $j
+            $artifact.ActiveReferences=1;$j=Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $artifact
+            Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'active analysis deployment'
+            $artifact.ActiveReferences=0;$j=Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $artifact
+            if ($test.Stops -ne 1) {throw 'Save recovery repeated WPR stop.'}
+        } finally {$lock.Dispose()}
+    }
+    # 停止确认后、首次 Artifact 意图前重启：只恢复已知文件，不补发 WPR。
+    New-M3Fixture;$session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))
+    $lock=Enter-MiTraceLock
+    try {
+        $j=Request-MiWprStop $lock $session;$test.Observed=@();$j=Update-MiTraceSupervision $lock '100'
+        [IO.File]::WriteAllText((Get-MiWprSessionPaths $session).Output,'ETL written before reboot')
+        $test.WriterLive=$false;$j=Update-MiTraceSupervision $lock '200'
+        if ($j.Sessions[$session.TraceSessionId].State -cne 'RecoveryRequired' -or $j.Artifacts.Count -ne 0) {throw 'Reboot fixture failed.'}
+    } finally {$lock.Dispose()}
+    Repair-MiWprSavedArtifacts
+    $lock=Enter-MiTraceLock
+    try {
+        $j=Read-MiTraceJournal $lock;Assert-MiTraceQuiescent $j
+        if ($j.Sessions[$session.TraceSessionId].State -cne 'Completed' -or $test.Stops -ne 1) {throw 'Pre-intent reboot recovery failed.'}
+    } finally {$lock.Dispose()}
+    # 7 天归档：先验证活跃读句柄与引用保护，再模拟移动成功/记账失败后的重入。
+    New-M3Fixture;$test.AgeArtifact=$true;$session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))
+    $lock=Enter-MiTraceLock
+    try {
+        $j=Request-MiWprStop $lock $session;$test.Observed=@();$j=Update-MiTraceSupervision $lock '100'
+        [IO.File]::WriteAllText((Get-MiWprSessionPaths $session).Output,'retained ETL')
+        $test.WriterLive=$false;$j=Update-MiWprSession $lock $j.Sessions[$session.TraceSessionId]
+        $artifact=@($j.Artifacts.Values)[0];$source=Get-MiTraceArtifactPath $artifact
+        $artifact.ActiveReferences=1;$j=Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $artifact
+        $j=Invoke-MiTraceRetention $lock
+        if ($j.Artifacts[$artifact.ArtifactId].State -cne 'Ready') {throw 'Active reference archived.'}
+        $artifact.ActiveReferences=0;$j=Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $artifact
+        $reader=[IO.File]::Open($source,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try {$j=Invoke-MiTraceRetention $lock;if ($j.Artifacts[$artifact.ArtifactId].State -cne 'Ready') {throw 'Active reader archived.'}} finally {$reader.Dispose()}
+        $test.Fault='Artifact:Retained';Assert-M3Rejected {Invoke-MiTraceRetention $lock} 'retention append interruption'
+        $j=Read-MiTraceJournal $lock;Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'unfinished retention blocks deployment'
+        $j=Invoke-MiTraceRetention $lock
+        if ($j.Artifacts[$artifact.ArtifactId].State -cne 'Retained' -or -not [IO.File]::Exists((Get-MiTraceArtifactPath $artifact -Retained)) -or
+            (Measure-MiProtectedTree $test.Paths.TraceArtifacts) -ne $artifact.SizeBytes) {throw 'Retention lost bytes or misreported storage.'}
+    } finally {$lock.Dispose()}
+    Write-Host 'PASS: M3 start/cancel/health/gates, modes/ownership/replay, resource/deadline stops, independent outcomes and four save crash boundaries (WPR and ACL mocked).'
+}

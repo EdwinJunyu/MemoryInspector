@@ -27,6 +27,7 @@ function Invoke-MiTestExecutor {
 $watchdog=Assert-MiWatchdog
 [void](Invoke-MiTraceHealthCheck)
 if ((Invoke-MiTestExecutor 'TracePreflight' ([guid]::NewGuid().ToString('N'))) -eq 0) { throw 'M2 unexpectedly enabled WPR.' }
+if ((Invoke-MiTestExecutor 'TraceStart' ([guid]::NewGuid().ToString('N'))) -eq 0) {throw 'Unaccepted M3 launch escaped code-level gate.'}
 if ((Invoke-MiTestExecutor 'TraceWatchdog' 'Scheduled') -eq 0) { throw 'Administrator impersonated SYSTEM watchdog.' }
 $lock=Enter-MiTraceLock
 try {
