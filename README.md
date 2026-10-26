@@ -1,6 +1,6 @@
 # MemoryInspector
 
-**Version 0.0.9 — 旧版本（Legacy snapshot / acceptance incomplete）**
+**Version 0.0.9（Legacy snapshot / acceptance incomplete）**
 
 这是保留至今修复的旧版本快照，未完成全部实机验收，不标记为稳定版。已知未通过：5 秒采样最终窗口首段仅 50/60 个有效槽（低于原 85% 要求），GUI Working Set 采样峰值 210.08 MiB（目标 <200 MiB）。两项均保留检查，待后续修复。
 
