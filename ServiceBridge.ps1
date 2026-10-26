@@ -17,7 +17,7 @@ function Get-MiServiceApprovalMap {
 }
 function Start-MiServiceRequest {
     param([string]$Operation,[string]$ServiceName)
-    if ($null -ne $script:MiServiceRequest -or $null -ne $script:MiPrivilegeProbe) {
+    if ($null -ne $script:MiServiceRequest -or $null -ne $script:MiPrivilegeProbe -or $null -ne $script:MiTraceRequest) {
         throw 'Another administrator request is still in progress.'
     }
     if (Test-MiElevated) { throw 'GUI must remain unelevated.' }

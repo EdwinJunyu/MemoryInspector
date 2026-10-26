@@ -445,7 +445,7 @@ try {
         $script:Form.Size=$size
         if($script:Form.Width -ne $size.Width -or $script:Form.Height -ne $size.Height){throw 'Layout fixture did not reach its requested physical size.'}
         [void]$script:Form.Handle
-        foreach($tabIndex in @(0,1,2,3,4,5)) {
+        foreach($tabIndex in @(0,1,2,3,4,5,6)) {
             $script:Tabs.SelectedIndex=$tabIndex
             $script:Form.PerformLayout();$script:Tabs.TabPages[$tabIndex].PerformLayout()
             [Windows.Forms.Application]::DoEvents()
@@ -469,10 +469,98 @@ try {
                     $image.Save((Join-Path $renderRoot ('attribution-'+$size.Width+'.png')))
                 } finally {$image.Dispose()}
             }
+            if ($tabIndex -eq 6) {
+                Update-MiDiagnosticsView
+                foreach ($name in @('Start','Stop','Prepare','Analyze','Recovery')) {if ($script:DiagnosticButtons[$name].Enabled) {throw ('Unaccepted GUI operation enabled: '+$name)}}
+                if ($script:DiagnosticOnline.Enabled -or $script:DiagnosticDetails.Height -lt 60 -or $script:DiagnosticSessions.Height -lt 60) {throw 'Diagnostic gate/layout failed'}
+                $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+                $report=[pscustomobject]@{ResultTrust='ProtectedStatusOnlyNotActionAuthority';OwnerSid=$sid;Utc=[datetime]::UtcNow.ToString('o');
+                    Sessions=@([pscustomobject]@{TraceSessionId=('1'*32);RequestedTraceType='Heap';State='CleanupPending';StopState='Confirmed';SaveState='Saved';CleanupState='CleanupPending';AnalysisState='Unavailable'});
+                    Artifacts=@([pscustomobject]@{ArtifactId=('2'*32);State='Ready';SizeBytes=100;EventLossStatus='LossReported';RetainUntilUtc='2026-11-01T00:00:00Z'})}
+                Show-MiDiagnosticReport $report
+                if ($script:DiagnosticSessions.Rows[0].Cells['Save'].Value -cne 'Saved' -or $script:DiagnosticSessions.Rows[0].Cells['Cleanup'].Value -cne 'CleanupPending' -or $script:DiagnosticSessions.SelectedRows.Count -gt 0) {throw 'Diagnostic outcomes merged or stale selection retained'}
+                $image=[Drawing.Bitmap]::new($script:Form.Width,$script:Form.Height)
+                try {$script:Form.DrawToBitmap($image,[Drawing.Rectangle]::new(0,0,$image.Width,$image.Height));[void][IO.Directory]::CreateDirectory((Join-Path $runtimeRepo 'test-artifacts\v3-m67'));$image.Save((Join-Path $runtimeRepo ('test-artifacts\v3-m67\diagnostics-'+$size.Width+'.png')))} finally {$image.Dispose()}
+            }
         }
+    }
+    & {
+        function Get-MiDiagnosticUiCapabilities {return [pscustomobject]@{CanRead=$true;CanTrace=$true;CanRecovery=$true;CanHeap=$true;CanFile=$true;CanExport=$true;CanOnline=$true}}
+        function Show-MiActionTypedDialog {return $true}
+        function Start-MiTraceRequest {param($Operation,$TraceType,$RecordingMode,$DurationSeconds,$HeapImagePath)
+            $script:CapturedHeapPath=$HeapImagePath;return 'UacCancelled'
+        }
+        $script:DiagnosticImage.Text='C:\fixture.exe';$script:DiagnosticType.SelectedIndex=2
+        Request-MiGuiDiagnosticAction 'TraceStart'
+        if ($script:CapturedHeapPath -cne 'C:\fixture.exe') {throw 'Heap target path not bound to Heap request'}
+        $script:DiagnosticType.SelectedIndex=0;Request-MiGuiDiagnosticAction 'TraceStart'
+        if ($script:CapturedHeapPath) {throw 'Switching trace type leaked a stale Heap path'}
     }
 } finally {
     Close-MiV4Gui
     if ($script:Form) {$script:Form.Dispose()}
 }
 Write-Host 'PASS: full fresh GUI initialization, first real mailbox/grid/KPI/chart refresh and safe disabled actions.' -ForegroundColor Green
+
+# M7 固定桥：真实文件读写，UAC/ACL 是替身；取消、独立验收门和未知报告不得触发重试。
+& {
+    . (Join-Path $runtimeRepo 'PrivilegeSecurity.ps1');. (Join-Path $runtimeRepo 'PrivilegeBridge.ps1')
+    $context=@{Launches=0;Cancelled=$false;Alive=$false;GuiEnabled=$false;TraceAccepted=$false;ExportAccepted=$false;RecoveryAccepted=$false}
+    $folder=Join-Path $runtimeRepo ('test-artifacts\M7-Bridge-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($folder)
+    function Get-MiSecurityPaths {return [pscustomobject]@{Install=$folder;Executor=(Join-Path $folder 'ElevatedExecutor.ps1');TraceArtifacts=$folder}}
+    function Test-MiPrivilegeBridgeInstalled {return $true}
+    function Test-MiElevated {return $false}
+    function Assert-MiWprReleaseAccepted {}
+    function Assert-MiExportReleaseAccepted {}
+    function Get-MiGuiDiagnosticReleaseStatus {return [pscustomobject]@{Enabled=$context.GuiEnabled;TraceUiAccepted=$context.TraceAccepted;ExportUiAccepted=$context.ExportAccepted;RecoveryUiAccepted=$context.RecoveryAccepted;Reason='FixtureGate'}}
+    function Assert-MiTracePath {param($Path) if (-not [IO.File]::Exists($Path) -or -not $Path.StartsWith($folder,[StringComparison]::OrdinalIgnoreCase)) {throw 'Fixture trust refused'}}
+    function Start-Process {param($FilePath,$ArgumentList,$Verb,$WindowStyle,[switch]$PassThru,$ErrorAction)
+        $context.Launches++;$context.Arguments=$ArgumentList
+        if ($context.Cancelled) {throw [ComponentModel.Win32Exception]::new(1223)}
+        $process=[pscustomobject]@{HasExited=(-not $context.Alive);ExitCode=0}
+        $process|Add-Member ScriptMethod Refresh {};$process|Add-Member ScriptMethod Dispose {}
+        return $process
+    }
+    # 后台运行原桥读取函数，仅替换夹具 ACL；300 ms 慢磁盘读不得阻塞首次 GUI 轮询。
+    [IO.File]::WriteAllBytes((Join-Path $folder 'PrivilegeSecurity.ps1'),[IO.File]::ReadAllBytes((Join-Path $runtimeRepo 'PrivilegeSecurity.ps1')))
+    $bridgeFixture=[IO.File]::ReadAllText((Join-Path $runtimeRepo 'PrivilegeBridge.ps1'))
+    $bridgeFixture+=[Environment]::NewLine+'function Assert-MiTracePath {param($Path);Start-Sleep -Milliseconds 300;if (-not [IO.File]::Exists($Path)) {throw "Fixture report missing"}}'
+    $script:MiTraceReportModulePath=Join-Path $folder 'PrivilegeBridge.fixture.ps1'
+    [IO.File]::WriteAllText($script:MiTraceReportModulePath,$bridgeFixture,[Text.UTF8Encoding]::new($true))
+    foreach ($operation in @('TraceStart','TraceStop','TraceExportPrepare','TraceRecovery')) {
+        $denied=$false;try {Start-MiTraceRequest -Operation $operation -TraceSessionId ('1'*32) -ArtifactId ('2'*32)|Out-Null} catch {$denied=$true}
+        if (-not $denied -or $context.Launches -ne 0) {throw 'Disabled bridge launched UAC'}
+    }
+    $context.GuiEnabled=$true;$context.TraceAccepted=$true
+    foreach ($operation in @('TraceExportPrepare','TraceRecovery')) {
+        $denied=$false;try {Start-MiTraceRequest -Operation $operation -ArtifactId ('2'*32)|Out-Null} catch {$denied=$true}
+        if (-not $denied -or $context.Launches -ne 0) {throw 'Per-operation UI gate bypassed'}
+    }
+    foreach ($corrupt in @($false,$true)) {
+        [void](Start-MiTraceRequest 'TraceStatus');$request=$script:MiTraceRequest
+        if ($context.Arguments -notmatch '-RequesterSid S-1-5-21-' -or $context.Arguments -notmatch '-RequesterSession \d+') {throw 'Requester identity missing'}
+        $directory=Join-Path (Join-Path $folder $request.OwnerSid) 'requests';[void][IO.Directory]::CreateDirectory($directory)
+        [pscustomobject]@{SchemaVersion=1;RequestId=if ($corrupt) {('0'*32)} else {$request.Id};OwnerSid=$request.OwnerSid;Operation='TraceStatus';ResultTrust='ProtectedStatusOnlyNotActionAuthority'}|ConvertTo-Json -Compress|Set-Content -LiteralPath (Join-Path $directory ($request.Id+'.json')) -Encoding UTF8
+        $pollClock=[Diagnostics.Stopwatch]::StartNew();$reply=Poll-MiTraceRequest
+        if ($null -ne $reply -or $pollClock.Elapsed.TotalMilliseconds -gt 200) {throw 'Report I/O blocked the GUI poll'}
+        $pollClock.Restart()
+        while ($null -eq $reply -and $pollClock.Elapsed.TotalSeconds -lt 10) {Start-Sleep -Milliseconds 20;$reply=Poll-MiTraceRequest}
+        if ($reply.State -cne $(if ($corrupt) {'UnknownOutcome'} else {'Reported'}) -or $null -ne $script:MiTraceRequest) {throw 'Report/request binding or completed handle release failed'}
+    }
+    # 确定性制造“检查未完成后马上完成”的窗口；完成不等于本次 Poll 已交付结果。
+    [void](Start-MiTraceRequest 'TraceStatus');$context.ReadChecks=0;$context.EndInvokes=0
+    $handle=[pscustomobject]@{};$handle|Add-Member ScriptProperty IsCompleted {$context.ReadChecks++;return $context.ReadChecks -gt 1}
+    $reader=[pscustomobject]@{HadErrors=$false}
+    $reader|Add-Member ScriptMethod EndInvoke {param($Handle);$context.EndInvokes++;return [pscustomobject]@{ResultTrust='ProtectedStatusOnlyNotActionAuthority'}}
+    $reader|Add-Member ScriptMethod Dispose {}
+    $script:MiTraceRequest|Add-Member NoteProperty Reader ([pscustomobject]@{PowerShell=$reader;Handle=$handle})
+    if ($null -ne (Poll-MiTraceRequest) -or $null -eq $script:MiTraceRequest -or $context.EndInvokes -ne 0) {throw 'Fast reader completion lost the undelivered report'}
+    $reply=Poll-MiTraceRequest
+    if ($reply.State -cne 'Reported' -or $context.EndInvokes -ne 1 -or $null -ne $script:MiTraceRequest) {throw 'Fast reader terminal result not delivered once'}
+    $context.Cancelled=$true
+    if ((Start-MiTraceRequest 'TraceStatus') -cne 'UacCancelled' -or $null -ne $script:MiTraceRequest) {throw 'UAC cancellation reused pending request'}
+    $context.Cancelled=$false;$context.Alive=$true;[void](Start-MiTraceRequest 'TraceStatus')
+    if ($null -ne (Poll-MiTraceRequest) -or $null -eq $script:MiTraceRequest) {throw 'Active unknown child released/retried'}
+    Close-MiPrivilegeBridge
+    Write-Host 'PASS: V3-M7 fixed UAC bridge, independent UI gates, SID/session/report binding, slow/fast-completion report delivery, cancellation and active unknown request retention (UAC/ACL mocked).'
+}

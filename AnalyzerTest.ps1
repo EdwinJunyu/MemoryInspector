@@ -624,5 +624,21 @@ Write-Host 'PASS: V3-M1 contracts, Commit/RAM separation, pool trends, cadence/g
         if ($case -ceq 'SymbolFailure') {Assert-Mi ($test.Calls.Count -eq 2 -and $test.Calls[0].Online -and -not $test.Calls[1].Online) 'known symbol failure fallback'}
         else {Assert-Mi ($test.Calls.Count -eq 1 -and $test.Calls[0].Online -eq ($case -ceq 'Online')) 'network consent reused/ignored'}
     }
-    Write-Host 'PASS: M5 strict CSV/precision/quality, fixed version refusal, ordinary-worker gates, consent/fallback, unknown outcome, and real deployment/ETL read leases (exporter mocked).'
+    foreach ($case in @('GuiOnline','GuiCancelled','GuiClosed')) {
+        foreach ($flag in @('Admin','ToolMissing','ToolUnsupported','CorruptEtl','BudgetFault','ResultBudgetFault','SymbolFailure','MissingTable','ThrowProcess')) {$test[$flag]=$false}
+        $test.Calls=@();$channel=[hashtable]::Synchronized(@{Question=$null;Answer=$null;Cancelled=($case -ceq 'GuiClosed')})
+        if ($case -ceq 'GuiClosed') {
+            Assert-M5Rejected {Invoke-MiAttributionExport $metadata.ArtifactId -OnlineSymbols -ConsentChannel $channel} 'GUI closed consent'
+            Assert-Mi ($test.Calls.Count -eq 0) 'closed GUI dispatched analysis';continue
+        }
+        $responder=[Management.Automation.PowerShell]::Create()
+        try {
+            [void]$responder.AddScript('param($Channel,$Online) while ($null -eq $Channel.Question) {[Threading.Thread]::Sleep(10)}; $Channel.Answer=if ($Online) {"SYMBOLS "+$Channel.Question.AnalysisId} else {""}').AddArgument($channel).AddArgument($case -ceq 'GuiOnline')
+            $response=$responder.BeginInvoke()
+            $result=Invoke-MiAttributionExport $metadata.ArtifactId -OnlineSymbols -ConsentChannel $channel
+            [void]$responder.EndInvoke($response)
+            Assert-Mi ($test.Calls.Count -eq 1 -and $test.Calls[0].Online -eq ($case -ceq 'GuiOnline') -and $channel.Question.Prompt -match 'https://msdl.microsoft.com/download/symbols' -and $channel.Question.Prompt -match 'Cache:') 'GUI single analysis consent/fallback broken'
+        } finally {$responder.Dispose()}
+    }
+    Write-Host 'PASS: M5 strict CSV/precision/quality, fixed version refusal, ordinary-worker gates, consent/fallback, unknown outcome, and real deployment/ETL read leases (exporter mocked); M7 GUI consent channel/cancel/close.'
 }

@@ -267,6 +267,7 @@ if (Test-Path -LiteralPath $folder -PathType Container) {
     Start-MiV4Job -Kind 'History' -Code $code
 }
 function Poll-MiV4Jobs {
+    if ($script:DiagnosticButtons) {Poll-MiGuiDiagnostics}
     foreach ($kind in @($script:AuxJobs.Keys)) {
         $job=$script:AuxJobs[$kind]
         if (-not $job.Handle.IsCompleted) { continue }
@@ -593,6 +594,155 @@ function Update-MiAttributionView {
     Show-MiAttributionDetails
 }
 
+function Get-MiDiagnosticUiCapabilities {
+    $gate=Get-MiGuiDiagnosticReleaseStatus;$wpr=Get-MiWprReleaseStatus;$heap=Get-MiHeapReleaseStatus;$export=Get-MiExportReleaseStatus
+    $installed=Test-MiPrivilegeBridgeInstalled
+    $ready=$installed -and $gate.Enabled -and $gate.TraceUiAccepted -and $wpr.Enabled -and $wpr.M2Accepted -and $wpr.MemoryAccepted
+    return [pscustomobject]@{CanRead=$installed;CanRecovery=($installed -and $gate.Enabled -and $gate.RecoveryUiAccepted);CanTrace=$ready;CanFile=($ready -and $wpr.FileAccepted);
+        CanHeap=($ready -and $heap.Enabled -and $heap.ConfigurationAccepted -and $heap.RecoveryAccepted);
+        CanExport=($ready -and $gate.ExportUiAccepted -and $export.Enabled -and $export.OfflineAccepted -and $export.NormalizationAccepted);
+        CanOnline=($ready -and $gate.ExportUiAccepted -and $export.Enabled -and $export.OnlineAccepted);
+        Reason=if (-not $installed) {'需要受保护安装；普通监控仍可使用。'} else {$gate.Reason}}
+}
+function Initialize-MiDiagnosticsView {
+    param($Page)
+    $script:DiagnosticReport=$null;$script:DiagnosticExportJob=$null
+    $layout=[Windows.Forms.TableLayoutPanel]::new();$layout.Dock='Fill';$layout.ColumnCount=1;$layout.RowCount=5
+    foreach ($height in @(104,46)) {[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute',[single]$height))}
+    foreach ($height in @(30,25,45)) {[void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent',[single]$height))}
+    $Page.Controls.Add($layout)
+    $bar=[Windows.Forms.FlowLayoutPanel]::new();$bar.Dock='Fill';$bar.AutoScroll=$true;$bar.WrapContents=$true;$layout.Controls.Add($bar,0,0)
+    $script:DiagnosticType=[Windows.Forms.ComboBox]::new();$script:DiagnosticType.DropDownStyle='DropDownList';$script:DiagnosticType.Width=110
+    [void]$script:DiagnosticType.Items.AddRange([object[]]@('VirtualAlloc','Pool','Heap'));$script:DiagnosticType.SelectedIndex=0;$script:DiagnosticType.AccessibleName='追踪类型'
+    $script:DiagnosticMode=[Windows.Forms.ComboBox]::new();$script:DiagnosticMode.DropDownStyle='DropDownList';$script:DiagnosticMode.Width=85
+    [void]$script:DiagnosticMode.Items.AddRange([object[]]@('Memory','File'));$script:DiagnosticMode.SelectedIndex=0;$script:DiagnosticMode.AccessibleName='追踪存储模式'
+    $script:DiagnosticDuration=[Windows.Forms.NumericUpDown]::new();$script:DiagnosticDuration.Minimum=300;$script:DiagnosticDuration.Maximum=1800;$script:DiagnosticDuration.Value=300;$script:DiagnosticDuration.Increment=60;$script:DiagnosticDuration.Width=70;$script:DiagnosticDuration.AccessibleName='追踪秒数，300至1800'
+    $script:DiagnosticImage=[Windows.Forms.TextBox]::new();$script:DiagnosticImage.Width=210;$script:DiagnosticImage.AccessibleName='Heap目标可执行文件绝对路径'
+    $script:DiagnosticOnline=[Windows.Forms.CheckBox]::new();$script:DiagnosticOnline.Text='本次请求联网符号';$script:DiagnosticOnline.AutoSize=$true
+    foreach ($control in @($script:DiagnosticType,$script:DiagnosticMode,$script:DiagnosticDuration,(New-MiLabel '秒' 9),(New-MiLabel 'Heap 路径' 9),$script:DiagnosticImage,$script:DiagnosticOnline)) {$bar.Controls.Add($control)}
+    $script:DiagnosticButtons=@{}
+    foreach ($pair in @(@('Status','刷新状态 (UAC)'),@('Start','开始追踪'),@('Stop','停止所选追踪'),@('Prepare','准备所选 ETL'),@('Analyze','分析所选 ETL'),@('Recovery','恢复向导 (UAC)'))) {
+        $button=New-MiButton $pair[1] 132;$button.AccessibleName=$pair[1];$bar.Controls.Add($button);$script:DiagnosticButtons[$pair[0]]=$button
+    }
+    $script:DiagnosticNote=New-MiLabel '高级功能尚未验收；普通监控与只读归因可继续。' 9;$script:DiagnosticNote.Dock='Fill';$layout.Controls.Add($script:DiagnosticNote,0,1)
+    $script:DiagnosticSessions=New-MiV4DataGrid -Defs @(@('Id','TraceSessionId',25),@('Type','类型',10),@('State','追踪状态',15),@('Stop','停止',12),@('Save','ETL 保存',12),@('Cleanup','Heap 恢复',14),@('Analysis','历史分析',12))
+    $script:DiagnosticSessions.AccessibleName='受保护追踪状态快照';$layout.Controls.Add($script:DiagnosticSessions,0,2)
+    $script:DiagnosticArtifacts=New-MiV4DataGrid -Defs @(@('Id','ArtifactId',35),@('State','保存状态',15),@('Bytes','字节数',15),@('Loss','事件丢失',20),@('Retain','保留至 UTC',25))
+    $script:DiagnosticArtifacts.AccessibleName='当前账户诊断文件';$layout.Controls.Add($script:DiagnosticArtifacts,0,3)
+    $script:DiagnosticDetails=[Windows.Forms.TextBox]::new();$script:DiagnosticDetails.Multiline=$true;$script:DiagnosticDetails.ReadOnly=$true;$script:DiagnosticDetails.ScrollBars='Both';$script:DiagnosticDetails.Dock='Fill';$script:DiagnosticDetails.AccessibleName='恢复差异、归因结果与限制';$layout.Controls.Add($script:DiagnosticDetails,0,4)
+    $script:DiagnosticButtons.Status.Add_Click({Request-MiGuiDiagnosticAction 'TraceStatus'})
+    $script:DiagnosticButtons.Start.Add_Click({Request-MiGuiDiagnosticAction 'TraceStart'})
+    $script:DiagnosticButtons.Stop.Add_Click({Request-MiGuiDiagnosticAction 'TraceStop'})
+    $script:DiagnosticButtons.Prepare.Add_Click({Request-MiGuiDiagnosticAction 'TraceExportPrepare'})
+    $script:DiagnosticButtons.Recovery.Add_Click({Request-MiGuiDiagnosticAction 'TraceRecovery'})
+    $script:DiagnosticButtons.Analyze.Add_Click({Start-MiGuiAttributionExport})
+    foreach ($control in @($script:DiagnosticType,$script:DiagnosticMode)) {$control.Add_SelectedIndexChanged({Update-MiDiagnosticsView})}
+    foreach ($grid in @($script:DiagnosticSessions,$script:DiagnosticArtifacts)) {$grid.Add_SelectionChanged({Update-MiDiagnosticsView})}
+    Update-MiDiagnosticsView
+}
+function Update-MiDiagnosticsView {
+    if (-not $script:DiagnosticButtons) {return}
+    $cap=Get-MiDiagnosticUiCapabilities;$busy=$null -ne $script:MiTraceRequest -or $null -ne $script:DiagnosticExportJob
+    $session=if ($script:DiagnosticSessions.SelectedRows.Count -eq 1) {$script:DiagnosticSessions.SelectedRows[0].Tag} else {$null}
+    $artifact=if ($script:DiagnosticArtifacts.SelectedRows.Count -eq 1) {$script:DiagnosticArtifacts.SelectedRows[0].Tag} else {$null}
+    $script:DiagnosticButtons.Status.Enabled=$cap.CanRead -and -not $busy
+    $script:DiagnosticButtons.Recovery.Enabled=$cap.CanRecovery -and -not $busy
+    $script:DiagnosticButtons.Start.Enabled=$cap.CanTrace -and -not $busy -and ($script:DiagnosticType.Text -cne 'Heap' -or $cap.CanHeap) -and ($script:DiagnosticMode.Text -cne 'File' -or $cap.CanFile)
+    $script:DiagnosticButtons.Stop.Enabled=$cap.CanTrace -and -not $busy -and $null -ne $session -and $session.State -ceq 'Recording'
+    $script:DiagnosticButtons.Prepare.Enabled=$cap.CanExport -and -not $busy -and $null -ne $artifact -and $artifact.State -ceq 'Ready'
+    $script:DiagnosticButtons.Analyze.Enabled=$cap.CanExport -and -not $busy -and $null -ne $artifact -and $artifact.State -ceq 'Ready' -and $null -ne $artifact.ExportDescriptor
+    $script:DiagnosticOnline.Enabled=$cap.CanOnline -and -not $busy
+    if (-not $script:DiagnosticOnline.Enabled) {$script:DiagnosticOnline.Checked=$false}
+    $script:DiagnosticImage.Enabled=$script:DiagnosticType.Text -ceq 'Heap' -and -not $busy
+    $script:DiagnosticNote.Text=if ($busy) {'请求处理中；不自动重复。GUI 退出不会停止独立追踪。'} else {$cap.Reason+' 状态快照仅供显示；停止、保存、恢复和分析独立记录。'}
+}
+function Show-MiDiagnosticReport {
+    param($Report)
+    if ($Report.ResultTrust -cne 'ProtectedStatusOnlyNotActionAuthority') {throw 'Unknown diagnostic report trust.'}
+    $script:DiagnosticReport=$Report
+    # 刷新始终清除旧选择，防止旧的授权/ID 随行复用转给另一会话或文件。
+    $script:DiagnosticSessions.Rows.Clear();$script:DiagnosticArtifacts.Rows.Clear()
+    foreach ($session in @($Report.Sessions)) {
+        $index=$script:DiagnosticSessions.Rows.Add(@($session.TraceSessionId,$session.RequestedTraceType,$session.State,$session.StopState,$session.SaveState,$session.CleanupState,$session.AnalysisState))
+        $script:DiagnosticSessions.Rows[$index].Tag=$session
+    }
+    foreach ($artifact in @($Report.Artifacts)) {
+        $index=$script:DiagnosticArtifacts.Rows.Add(@($artifact.ArtifactId,$artifact.State,$artifact.SizeBytes,$artifact.EventLossStatus,$artifact.RetainUntilUtc))
+        $script:DiagnosticArtifacts.Rows[$index].Tag=$artifact
+    }
+    $script:DiagnosticSessions.ClearSelection();$script:DiagnosticArtifacts.ClearSelection()
+    $script:DiagnosticDetails.Text=if ($Report.PreviewText) {$Report.PreviewText} else {($Report|ConvertTo-Json -Depth 14)}
+    Update-MiDiagnosticsView
+}
+function Request-MiGuiDiagnosticAction {
+    param([string]$Operation)
+    Update-MiDiagnosticsView
+    $key=@{TraceStatus='Status';TraceStart='Start';TraceStop='Stop';TraceExportPrepare='Prepare';TraceRecovery='Recovery'}[$Operation]
+    if (-not $key -or -not $script:DiagnosticButtons[$key].Enabled) {return}
+    try {
+        $session=if ($script:DiagnosticSessions.SelectedRows.Count -eq 1) {$script:DiagnosticSessions.SelectedRows[0].Tag} else {$null}
+        $artifact=if ($script:DiagnosticArtifacts.SelectedRows.Count -eq 1) {$script:DiagnosticArtifacts.SelectedRows[0].Tag} else {$null}
+        if ($Operation -ceq 'TraceStart') {
+            $params=@{Operation=$Operation;TraceType=$script:DiagnosticType.Text;RecordingMode=$script:DiagnosticMode.Text;DurationSeconds=[int]$script:DiagnosticDuration.Value;
+                HeapImagePath=if ($script:DiagnosticType.Text -ceq 'Heap') {$script:DiagnosticImage.Text} else {''}}
+            # GUI 提示不代替 Controller 的 START/Heap 确认，更不能授予进程操作权限。
+            if (-not (Show-MiActionTypedDialog ('本次 '+$params.TraceType+'/'+$params.RecordingMode+'，'+$params.DurationSeconds+' 秒；受保护控制台会继续确认。') 'OPEN TRACE CONTROLLER')) {return}
+            $state=Start-MiTraceRequest @params
+        } elseif ($Operation -ceq 'TraceStop') {$state=Start-MiTraceRequest -Operation $Operation -TraceSessionId $session.TraceSessionId}
+        elseif ($Operation -ceq 'TraceExportPrepare') {$state=Start-MiTraceRequest -Operation $Operation -ArtifactId $artifact.ArtifactId}
+        else {$state=Start-MiTraceRequest -Operation $Operation}
+        $script:DiagnosticDetails.Text=$state+'：'+$Operation+'。恢复向导只处理本工具已证明归属的状态；未知归属保留报告和人工指引。'
+    } catch {$script:DiagnosticDetails.Text='请求被拒绝：'+$_.Exception.Message}
+    Update-MiDiagnosticsView
+}
+function Start-MiGuiAttributionExport {
+    Update-MiDiagnosticsView
+    if (-not $script:DiagnosticButtons.Analyze.Enabled) {return}
+    $artifact=$script:DiagnosticArtifacts.SelectedRows[0].Tag;$ps=$null
+    try {
+        $channel=[hashtable]::Synchronized(@{Question=$null;Answer=$null;Cancelled=$false})
+        $ps=[Management.Automation.PowerShell]::Create()
+        [void]$ps.AddScript(@'
+param($Root,$ArtifactId,$Online,$Channel)
+$ErrorActionPreference='Stop'
+. (Join-Path $Root 'PrivilegeSecurity.ps1')
+. (Join-Path $Root 'Analyzer.ps1')
+$result=Invoke-MiAttributionExport -ArtifactId $ArtifactId -OnlineSymbols:$Online -ConsentChannel $Channel
+$preview=$result|Select-Object * -ExcludeProperty Findings
+$preview|Add-Member NoteProperty FindingCount @($result.Findings).Count
+$preview|Add-Member NoteProperty Findings @($result.Findings|Select-Object -First 20)
+$text=$preview|ConvertTo-Json -Depth 12
+if ($text.Length -gt 32768) {$text=$text.Substring(0,32768)}
+[pscustomobject]@{PreviewText=$text+[Environment]::NewLine+'界面仅显示最多 20 条和 32768 字符；完整用户结果保存在本次 OutputDirectory。'}
+'@).AddArgument($script:Root).AddArgument($artifact.ArtifactId).AddArgument([bool]$script:DiagnosticOnline.Checked).AddArgument($channel)
+        $script:DiagnosticExportJob=[pscustomobject]@{PowerShell=$ps;Handle=$ps.BeginInvoke();Channel=$channel;QuestionShown=$false}
+    } catch {if ($ps) {$ps.Dispose()};$script:DiagnosticDetails.Text='分析未启动：'+$_.Exception.Message}
+    Update-MiDiagnosticsView
+}
+function Poll-MiGuiDiagnostics {
+    $reply=Poll-MiTraceRequest
+    if ($null -ne $reply) {
+        if ($reply.State -ceq 'Reported') {Show-MiDiagnosticReport $reply.Report}
+        else {$script:DiagnosticReport=$null;$script:DiagnosticSessions.Rows.Clear();$script:DiagnosticArtifacts.Rows.Clear();$script:DiagnosticDetails.Text=$reply.State+'：'+$reply.Error+'。结果未知时不自动重试。'}
+    }
+    $job=$script:DiagnosticExportJob
+    if ($null -ne $job) {
+        if ($null -ne $job.Channel.Question -and -not $job.QuestionShown) {
+            $job.QuestionShown=$true;$question=$job.Channel.Question
+            $accepted=Show-MiActionTypedDialog $question.Prompt ('SYMBOLS '+$question.AnalysisId)
+            $job.Channel.Answer=if ($accepted) {'SYMBOLS '+$question.AnalysisId} else {''}
+        }
+        if ($job.Handle.IsCompleted) {
+            try {
+                $result=@($job.PowerShell.EndInvoke($job.Handle))
+                if ($job.PowerShell.HadErrors -or $result.Count -ne 1) {throw ('分析被拒绝：'+($job.PowerShell.Streams.Error|Out-String))}
+                $script:DiagnosticDetails.Text=$result[0].PreviewText
+            } catch {$script:DiagnosticDetails.Text=$_.Exception.Message}
+            finally {$job.PowerShell.Dispose();$script:DiagnosticExportJob=$null}
+        }
+    }
+    Update-MiDiagnosticsView
+}
 function Initialize-MiV4Gui {
     param($Root,$Cards,$Charts,$Bottom,$StatusBar)
     $script:AllProcesses=@()
@@ -631,7 +781,7 @@ function Initialize-MiV4Gui {
     $script:Tabs=New-Object System.Windows.Forms.TabControl
     $script:Tabs.Dock='Fill'
     $script:Tabs.Font=[Drawing.Font]::new('Microsoft YaHei UI',[single]10)
-    foreach ($title in @('Processes · 进程','Overview · 总览','Services · 服务','History · 历史','Settings · 设置','Attribution · 归因')) {
+    foreach ($title in @('Processes · 进程','Overview · 总览','Services · 服务','History · 历史','Settings · 设置','Attribution · 归因','Diagnostics · 高级诊断')) {
         $page=New-Object System.Windows.Forms.TabPage
         $page.Text=$title;$page.BackColor=$script:Background
         [void]$script:Tabs.TabPages.Add($page)
@@ -640,6 +790,7 @@ function Initialize-MiV4Gui {
     $Root.Controls.Add($StatusBar,0,2)
     $Root.ResumeLayout()
     Initialize-MiAttributionView -Page $script:Tabs.TabPages[5]
+    Initialize-MiDiagnosticsView -Page $script:Tabs.TabPages[6]
 
     # 监控和操作反馈分别占固定行；长结果保留文本，完整审计始终可通过按钮访问。
     $StatusBar.SuspendLayout()
@@ -878,6 +1029,7 @@ function Initialize-MiV4Gui {
     $exitItem.Add_Click({$script:ExitRequested=$true;$script:Form.Close()})
 }
 function Close-MiV4Gui {
+    if ($null -ne $script:DiagnosticExportJob) {$script:DiagnosticExportJob.Channel.Cancelled=$true}
     foreach ($job in @($script:AuxJobs.Values)) {
         try { if (-not $job.Handle.IsCompleted) { [void]$job.PowerShell.BeginStop($null,$null) } }
         catch {}

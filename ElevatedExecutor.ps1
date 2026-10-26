@@ -13,7 +13,9 @@ param(
     [ValidateRange(300,1800)][int]$DurationSeconds=300,
     [string]$TraceSessionId='',
     [string]$HeapImagePath='',
-    [string]$ArtifactId=''
+    [string]$ArtifactId='',
+    [string]$RequesterSid='',
+    [int]$RequesterSession=0
 )
 $ErrorActionPreference='Stop'
 $exitCode=2
@@ -39,6 +41,10 @@ try {
     if ($PSBoundParameters.ContainsKey('HeapImagePath') -and ($Operation -cne 'TraceStart' -or $TraceType -cne 'Heap')) {throw 'Unexpected Heap image parameter.'}
     if (($PSBoundParameters.ContainsKey('ArtifactId') -and $Operation -cne 'TraceExportPrepare') -or
         ($Operation -ceq 'TraceExportPrepare' -and -not (Test-MiGuidN $ArtifactId))) {throw 'Unexpected or invalid export artifact parameter.'}
+    if ($PSBoundParameters.ContainsKey('RequesterSid') -or $PSBoundParameters.ContainsKey('RequesterSession')) {
+        # UAC 改用另一账户/会话时拒绝，不能把另一个管理员的追踪/文件转授给 GUI。
+        Assert-MiGuiRequesterContext $Operation $RequesterSid $RequesterSession
+    }
     if ($Operation -cin @('TraceStart','TraceStop')) {Assert-MiWprReleaseAccepted}
     if ($Operation -ceq 'TraceStart' -and $TraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
     if ($Operation -ceq 'TraceExportPrepare') {Assert-MiExportReleaseAccepted}
@@ -51,7 +57,7 @@ try {
     }
     $trusted=$true
     $installationManifest=[IO.File]::ReadAllText($paths.Manifest)|ConvertFrom-Json
-    if ($installationManifest.TraceArchitectureVersion -eq 1 -and $Operation -cne 'TraceRecovery') {
+    if ($installationManifest.TraceArchitectureVersion -eq 1 -and $Operation -cnotin @('TraceRecovery','TraceStatus')) {
         [void](Assert-MiWatchdog)
     }
     if ($Operation -ceq 'TraceWatchdog') {
@@ -90,6 +96,8 @@ try {
     } elseif ($Operation -ceq 'TraceExportPrepare') {
         Initialize-MiArtifactExport $ArtifactId|Format-List
         $exitCode=0
+    } elseif ($Operation -ceq 'TraceStatus') {
+        $exitCode=0 # 只生成受保护、对应请求者可读的状态快照；不解除任何恢复义务。
     } elseif ($Operation -ceq 'TraceArtifacts') {
         $lock=Enter-MiTraceLock
         try {@((Read-MiTraceJournal $lock).Artifacts.Values)|ConvertTo-Json -Depth 12|Write-Output} finally {$lock.Dispose()}
@@ -125,6 +133,7 @@ try {
         } finally { $lease.Dispose() }
         $exitCode=if ($outcome -eq 'Confirmed') {0} elseif ($outcome -eq 'TimedOut') {3} else {2}
     }
+    if ($exitCode -eq 0 -and $RequesterSid) {Write-MiTraceRequestReport $RequestId $Operation $RequesterSid}
 } catch {
     if ($trusted) {
         try {

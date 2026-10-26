@@ -259,3 +259,82 @@ try {
     if ($observed.State -ne 'Complete' -or $null -ne $script:MiActions.Pending) { throw 'Transferred observation did not finish and release lock.' }
 } finally { Close-MiProcessJob;Stop-MiActionObservation }
 Write-Host 'PASS: P2-03 slow CIM is asynchronous, bounded jobs/timeouts, identity revalidation, service rejection and lock handoff.' -ForegroundColor Green
+
+# V3-M6：原生只读核验本测试创建的有限寿命无窗口程序；派发替身绝不终止实际进程。
+& {
+    . (Join-Path $root 'ProcessActions.ps1')
+    function Assert-M6Denied {param([scriptblock]$Action,[string]$Label)
+        $denied=$false;try {& $Action|Out-Null} catch {$denied=$true};if (-not $denied) {throw ('M6 accepted '+$Label)}
+    }
+    Assert-M6Denied {New-MiActionGrant $null $null Force ([guid]::NewGuid().ToString('N')) $true} 'unaccepted release gate'
+    Initialize-MiActionGrantNative
+    $fixture=Join-Path $root ('test-artifacts\M6-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $exe=Join-Path $fixture 'MiActionGrantFixture.exe'
+    Add-Type -TypeDefinition 'public static class MiGrantFixture {public static void Main(){System.Threading.Thread.Sleep(90000);}}' -OutputAssembly $exe -OutputType WindowsApplication
+    $child=Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+    $native=$null
+    try {
+        $child.Refresh();$record=[pscustomobject]@{PID=$child.Id;Name=$child.ProcessName;StartUtcTicks=$child.StartTime.ToUniversalTime().Ticks;Status='Success';PrivateBytes=1MB}
+        $snapshot=[pscustomobject]@{CaptureEndUtc=[datetime]::UtcNow;Processes=[pscustomobject]@{Status='Success';Items=@($record)};System=[pscustomobject]@{Status='Success';CommittedBytes=4GB;AvailablePhysicalBytes=2GB}}
+        Initialize-MiActions;$script:MiActions.AuditPath=Join-Path $fixture 'audit.jsonl'
+        $native=New-MiNativeActionTarget $record $true;$native.Verify()
+        if ($native.OwnerSid -cne $script:MiActions.CurrentSid -or $native.Session -ne $script:MiActions.CurrentSession -or $native.Hash -cne (Get-FileHash $exe -Algorithm SHA256).Hash) {throw 'Native target binding/hash failed'}
+        Assert-M6Denied {[IO.File]::Open($exe,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None)} 'locked executable mutation'
+        Assert-M6Denied {[MemoryInspector.ActionTarget]::new($child.Id,$record.StartUtcTicks+1,$script:MiActions.CurrentSid,$script:MiActions.CurrentSession,$false)} 'reused PID start time'
+        Assert-M6Denied {[MemoryInspector.ActionTarget]::new($child.Id,$record.StartUtcTicks,'S-1-5-21-1-2-3-4',$script:MiActions.CurrentSession,$false)} 'different owner'
+        Assert-M6Denied {[MemoryInspector.ActionTarget]::new($child.Id,$record.StartUtcTicks,$script:MiActions.CurrentSid,$script:MiActions.CurrentSession+1,$false)} 'different session'
+        $native.Dispose();$native=$null
+        $context=@{Policy='V3-M6-1';Dispatches=0;ServiceFault=$false;SlowIntent=$false}
+        function Get-MiActionGrantReleaseStatus {return [pscustomobject]@{Enabled=$true;IdentityAccepted=$true;ReplayAccepted=$true;WindowsAccepted=$true;SafetyPolicyVersion=$context.Policy}}
+        # 真正的 CIM/所有者/服务检查必须允许合法无窗口目标；Graceful 不因此获得能力。
+        $verified=Assert-MiProcessTarget $record $snapshot -AllowBackground
+        try {if ($verified.MainWindowHandle.ToInt64() -ne 0) {throw 'Fixture unexpectedly has a window'}} finally {$verified.Dispose()}
+        Assert-M6Denied {New-MiActionGrant $record $snapshot Graceful ([guid]::NewGuid().ToString('N')) $false} 'cooperative capability absent'
+        Assert-M6Denied {New-MiActionGrant $record $snapshot Force ([guid]::NewGuid().ToString('N')) $false} 'force without danger confirmation'
+        $realAssert=${function:Assert-MiProcessTarget};$realWrite=${function:Write-MiProcessTargetState}
+        function Assert-MiProcessTarget {param($Item,$Snapshot,[switch]$AllowBackground)
+            if ($context.ServiceFault) {throw 'Service membership unavailable'}
+            return Get-Process -Id $Item.PID
+        }
+        function Write-MiProcessTargetState {param($Stream,$OperationId,$Mode,$Status)
+            & $realWrite $Stream $OperationId $Mode $Status
+            if ($context.SlowIntent -and $Status -ceq 'Dispatching') {Start-Sleep -Seconds 16}
+        }
+        function Invoke-MiGrantedNativeAction {param($Target,$Process,$Mode,$GrantId)
+            $Target.Verify();[MemoryInspector.ActionGrants]::CheckDispatch($GrantId,$context.Policy);$context.Dispatches++
+        }
+        $confirmation=[guid]::NewGuid().ToString('N');$grant=New-MiActionGrant $record $snapshot Force $confirmation $true
+        $result=Invoke-MiProcessAction Force $record $snapshot $true $grant.GrantId $confirmation
+        if ($result.Outcome -cne 'Requested' -or $context.Dispatches -ne 1) {throw 'Single grant dispatch failed'}
+        # 实际句柄、系统净变化、目标 Private Bytes 与退出状态分别报告；本测试未终止目标。
+        $snapshot.CaptureEndUtc=$result.StartedUtc.AddSeconds(61);$snapshot.System.CommittedBytes=3GB;$snapshot.System.AvailablePhysicalBytes=3GB
+        $observed=Update-MiActionObservation $snapshot $result.StartedUtc.AddSeconds(62)
+        if ($observed.ExitState -cne 'Running' -or $observed.NetCommitBytes -ne -1GB -or $observed.NetAvailableRamBytes -ne 1GB -or $observed.PrivateBytesNoLongerExists -eq $true) {throw 'Independent action outcome measurement failed'}
+        Assert-M6Denied {[MemoryInspector.ActionGrants]::Consume($grant.GrantId,$confirmation,$context.Policy,'ForceTerminate')} 'consumed grant replay'
+        $snapshot.CaptureEndUtc=[datetime]::UtcNow
+        # 终态回收不会耗尽长时间 GUI；回收后的旧编号也绝不重新有效。
+        foreach ($index in 1..260) {
+            $target=New-MiNativeActionTarget $record $true
+            $entry=[MemoryInspector.ActionGrants]::Create($target,'ForceTerminate',$context.Policy,[guid]::NewGuid().ToString('N'))
+            [MemoryInspector.ActionGrants]::Revoke($entry.GrantId)
+        }
+        Assert-M6Denied {[MemoryInspector.ActionGrants]::Consume($grant.GrantId,$confirmation,$context.Policy,'ForceTerminate')} 'pruned grant replay'
+        foreach ($case in @('Policy','Confirmation','Mode','Service','Expired','SlowIntent')) {
+            $snapshot.CaptureEndUtc=[datetime]::UtcNow;$cid=[guid]::NewGuid().ToString('N')
+            $g=New-MiActionGrant $record $snapshot Force $cid $true
+            if ($case -ceq 'Policy') {$context.Policy='changed'}
+            if ($case -ceq 'Confirmation') {$cid=[guid]::NewGuid().ToString('N')}
+            if ($case -ceq 'Service') {$context.ServiceFault=$true}
+            if ($case -ceq 'Expired') {Start-Sleep -Seconds 16}
+            $context.SlowIntent=$case -ceq 'SlowIntent'
+            # 上一项已写 Force 的目标锁禁止重复派发；为仅核验新授权使用新的独立审计夹具。
+            $caseFolder=Join-Path $fixture $case;[void][IO.Directory]::CreateDirectory($caseFolder)
+            $script:MiActions.AuditPath=Join-Path $caseFolder 'audit.jsonl'
+            $mode=if ($case -ceq 'Mode') {'Graceful'} else {'Force'}
+            $r=Invoke-MiProcessAction $mode $record $snapshot $true $g.GrantId $cid
+            if ($r.Outcome -ceq 'Requested' -or $context.Dispatches -ne 1) {throw ('Invalid grant dispatched: '+$case)}
+            $context.Policy='V3-M6-1';$context.ServiceFault=$false;$context.SlowIntent=$false
+        }
+    } finally {if ($null -ne $native) {$native.Dispose()};Stop-MiActionObservation;$child.Dispose()}
+    Write-Host 'PASS: V3-M6 native held identity/hash, windowless eligibility, exact owner/session/PID, single-use/reclaimed/expired grants, late intent deadline, policy/confirmation/action/service refusal and independent outcomes (dispatch mocked; own fixture exits naturally).'
+}

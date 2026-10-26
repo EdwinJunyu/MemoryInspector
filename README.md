@@ -82,9 +82,25 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 实现、审阅与测试边界见 [M5 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m5automated-attribution-export)。
 
+## V3-M6 / M7 — ActionGrant 与 GUI Integration（开发实现，发布门关闭）
+
+M6 在现有 ProcessActions 内实现当前用户/当前会话普通无窗口进程的单次授权，独立于追踪授权。新权限扩展的 Enabled/IdentityAccepted/ReplayAccepted/WindowsAccepted 均为 false；原有有窗口进程和服务管理仍沿用既有检查。未验收时不通过设置或专家模式开放无窗口操作。
+
+- 授权仅保存在当前执行上下文，绑定精确 PID/启动时间、所有者、会话、路径/SHA256、策略及独立确认编号，15 秒到期。持有原生进程句柄和只读映像句柄；原生核验 Critical/保护级别、提权与完整性级别，CIM 核验服务归属。用户 JSON 和归因结果不能获得执行权限。
+- 确认、复核、消费、派发、结果分别处理；意图 Flush 后再次检查身份和服务，原生强制派发紧邻检查期限/策略。每次只管理一个原实例，不结束子进程树，不自动重试未知结果。无主窗口不具有 CooperativeExit 能力，强制结束必须另行危险确认。
+- 退出句柄状态、原实例 Private Bytes 是否消失、系统 Commit 净变化、Available RAM 净变化及实际采样 UTC 分别显示；进程退出或系统净变化不能证明释放效果。
+
+M7 新增“Diagnostics · 高级诊断”页，整合已有只读归因、固定追踪请求、ETL 准备/普通用户分析、单次符号确认及受保护恢复向导入口。源码 UI 验收门保持关闭；恢复、追踪、导出分别检查对应门。状态查询须有受保护安装；UAC 更换账户或会话时拒绝，普通 GUI 不常驻管理员权限。
+
+状态、保存、Heap 恢复与历史分析独立列出；报告仅供显示，不授予动作权限。状态文件/ACL/JSON、ETL 导出和归一化均在后台，GUI 只显示有界结果。GUI 关闭不终止独立 Controller/Watchdog，也不重发未知请求。旧的受保护控制台恢复入口保留，仍执行原有门控和归属检查。
+
+针对性测试和 Review 修复记录见 [M6/M7 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m6m7actiongrant-与-gui-integration)。真实动作/UAC/部署/WPR/符号网络、性能与 Windows 10/11 完整验收未完成，VERSION 仍为 0.0.9，不能宣布 Stable v3。
+
 ### 归因页界面约定
 
 本次为现有 Windows 桌面界面的局部扩展，复用 `New-MiV4DataGrid`、`New-MiLabel` 和主窗口的配色/中文字体，不创建新的 UI 模块或改变已有操作页。Microsoft YaHei UI、浅色背景 `#F3F6FB`、正文 `#17283E`、分隔线 `#DDE5EE` 仍由 MemoryInspector.ps1 统一拥有。原生 TabControl/ComboBox/DataGridView 负责键盘、焦点和内部滚动；归因页的多选是只读诊断特例。未知值显示“不可用”，失效结果清空，选择仅跟随精确实例；后台采集与趋势分析在 Worker 中执行，界面只排版结果。设置、历史、服务及危险确认流程沿用原行为。
+
+M7 沿用上述设计约定作为维护中的视觉/交互契约：诊断表由同一个 New-MiV4DataGrid 创建，选择仅限单个 Session/Artifact，刷新清除旧选择；原生下拉、秒数和路径输入具备可访问名称。FlowLayoutPanel 负责窄窗按钮换行，表格与详情各自滚动，等待/禁用原因常驻状态行。复用 Show-MiActionTypedDialog 确认；普通状态查询、恢复和危险动作各自保留明确语义，取消不产生修改，失败清除旧报告，未知请求持续占用请求槽。符号确认通过本次随机分析编号的内存通道完成，关闭取消未派发的确认；结果预览最多 20 条/32768 字符，完整用户结果不作为高权限输入。
 
 ## Requirements and launch
 

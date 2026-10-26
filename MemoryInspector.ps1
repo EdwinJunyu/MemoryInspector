@@ -123,7 +123,7 @@ function Update-MiGuiProcessJob {
     if ($null -eq $outcome) { return }
     if ($outcome.Kind -eq 'Check') {
         if ($outcome.Key -ceq (Get-MiProcessCheckKey (Get-MiSelectedProcess))) {
-            $script:MiProcessCheck=[pscustomobject]@{Key=$outcome.Key;State=$outcome.State;Error=$outcome.Error;Clock=[Diagnostics.Stopwatch]::StartNew()}
+            $script:MiProcessCheck=[pscustomobject]@{Key=$outcome.Key;State=$outcome.State;Error=$outcome.Error;HasWindow=$outcome.HasWindow;Clock=[Diagnostics.Stopwatch]::StartNew()}
         } else { $script:MiProcessCheck=$null }
     } else {
         $script:MiProcessCheck=$null
@@ -140,9 +140,14 @@ function Show-MiProcessObservation {
     if ($Observation.State -eq 'Incomplete') { $state='TimedOut' }
     elseif ($Observation.TargetStatus -eq 'NotObserved') { $state='NotObserved';$warning=$false }
     elseif ($Observation.TargetStatus -eq 'Present') { $state='NotExited' }
+    if ($Observation.ExitState -ceq 'Exited') {$state='Exited';$warning=$false}
+    elseif ($Observation.ExitState -ceq 'Running') {$state='NotExited';$warning=$true}
     $change='不可用'
     if ($null -ne $Observation.NetCommitBytes) { $change=('{0:+0.00;-0.00;0.00} GiB' -f ([double]$Observation.NetCommitBytes/1GB)) }
-    Set-MiOperationStatus $state ('进程 '+$Observation.Operation.Name+' (PID '+$Observation.Operation.PID+')；观察：'+$Observation.TargetStatus+'；系统提交净变化 '+$change+'。完整记录请查看操作审计。') $warning
+    $ram='不可用';if ($null -ne $Observation.NetAvailableRamBytes) {$ram=('{0:+0.00;-0.00;0.00} GiB' -f ([double]$Observation.NetAvailableRamBytes/1GB))}
+    $exit=if ($Observation.ExitState) {$Observation.ExitState} else {'Unknown'}
+    $private=if ($Observation.PrivateBytesNoLongerExists -eq $true) {'原实例已退出，其 Private Bytes 不再存在'} else {'不可确认原实例 Private Bytes 已消失'}
+    Set-MiOperationStatus $state ('进程 '+$Observation.Operation.Name+' (PID '+$Observation.Operation.PID+')；枚举：'+$Observation.TargetStatus+'；句柄退出：'+$exit+'；'+$private+'；系统提交净变化 '+$change+'；Available RAM 净变化 '+$ram+'；采样 UTC '+$Observation.SampleUtc+'。并发工作负载可能影响净变化，不能证明释放效果。完整记录见操作审计。') $warning
 }
 function Set-MiStatus {
     param([string]$Text,[bool]$Warning=$false)
@@ -675,9 +680,9 @@ function Update-MiActionButtons {
                 $text='正在后台检查进程身份…'
             } catch { $text='检查未启动：'+$_.Exception.Message }
         } elseif ($script:MiProcessCheck.State -eq 'Verified') {
-            $script:MiGracefulButton.Enabled=$true
+            $script:MiGracefulButton.Enabled=($script:MiProcessCheck.HasWindow -ne $false)
             $script:MiForceButton.Enabled=[bool]$script:MiDangerCheck.Checked
-            $text='身份预检查通过；执行前仍会独立复核。'
+            $text=if ($script:MiProcessCheck.HasWindow -eq $false) {'无主窗口：仅可单独授权强制结束；执行前仍会复核。'} else {'身份预检查通过；执行前仍会独立复核。'}
         } else { $text='身份检查未通过或超时，禁止操作：'+$script:MiProcessCheck.Error }
     }
     if ($null -ne $script:ProcessCheckLabel) { $script:ProcessCheckLabel.Text=$text }
@@ -685,7 +690,7 @@ function Update-MiActionButtons {
 function Request-MiGuiProcessAction {
     param([ValidateSet('Graceful','Force')][string]$Mode)
     Update-MiActionButtons
-    if (-not $script:MiGracefulButton.Enabled -or ($Mode -eq 'Force' -and -not $script:MiForceButton.Enabled)) { return }
+    if (($Mode -eq 'Graceful' -and -not $script:MiGracefulButton.Enabled) -or ($Mode -eq 'Force' -and -not $script:MiForceButton.Enabled)) { return }
     $item=Get-MiSelectedProcess
     $key=Get-MiProcessCheckKey $item
     $modeText=if ($Mode -eq 'Force') {'强制结束（可能丢失未保存的数据）'} else {'向主窗口发送普通关闭请求'}
@@ -703,7 +708,7 @@ function Request-MiGuiProcessAction {
         return
     }
     try {
-        Start-MiProcessJob -Kind Execute -Item $item -Snapshot $script:LatestSnapshot -Mode $Mode -DangerEnabled ([bool]$script:MiDangerCheck.Checked)
+        Start-MiProcessJob -Kind Execute -Item $item -Snapshot $script:LatestSnapshot -Mode $Mode -DangerEnabled ([bool]$script:MiDangerCheck.Checked) -ConfirmationId ([guid]::NewGuid().ToString('N'))
         Set-MiOperationStatus 'Checking' ('后台复核并执行：'+$item.Name+' (PID '+$item.PID+')')
     } catch { Set-MiOperationStatus 'Rejected' ('操作未启动：'+$_.Exception.Message) $true }
     Update-MiActionButtons

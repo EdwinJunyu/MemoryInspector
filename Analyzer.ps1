@@ -181,7 +181,7 @@ function Invoke-MiWpaExportProcess {
     return [MemoryInspector.ExportNative]::Run($Tool.Path,$args,(Split-Path -Parent $Profile),$environment,(Split-Path -Parent $Profile))
 }
 function Invoke-MiAttributionExport {
-    param([string]$ArtifactId,[switch]$OnlineSymbols)
+    param([string]$ArtifactId,[switch]$OnlineSymbols,$ConsentChannel=$null)
     if (-not (Get-Command Get-MiExportReleaseStatus -ErrorAction SilentlyContinue)) {. (Join-Path $PSScriptRoot 'PrivilegeSecurity.ps1')}
     # 门控、身份拒绝在任何写入/网络确认前发生；无参数可指定程序/Profile/目录/服务器。
     Assert-MiExportReleaseAccepted
@@ -220,7 +220,16 @@ function Invoke-MiAttributionExport {
         $analysisId=[guid]::NewGuid().ToString('N');$online=$false
         if ($OnlineSymbols) {
             if (-not (Get-MiExportReleaseStatus).OnlineAccepted) {throw 'Online symbol policy acceptance pending.'}
-            $answer=Read-Host ('Download symbols from https://msdl.microsoft.com/download/symbols into this attempt cache for stack analysis. Type SYMBOLS '+$analysisId+' to authorize once; Enter continues offline')
+            $prompt='Download symbols from https://msdl.microsoft.com/download/symbols for stack analysis. Cache: '+(Join-Path (Join-Path $outputRoot $analysisId) 'symbols')+'. Type SYMBOLS '+$analysisId+' once; cancel continues offline.'
+            if ($null -eq $ConsentChannel) {$answer=Read-Host $prompt}
+            else {
+                # GUI 通过内存通道回应本次分析编号；后台等待不会调用控件或复用之前的授权。
+                $ConsentChannel.Question=[pscustomobject]@{AnalysisId=$analysisId;Prompt=$prompt}
+                $consentClock=[Diagnostics.Stopwatch]::StartNew()
+                while ($null -eq $ConsentChannel.Answer -and -not $ConsentChannel.Cancelled -and $consentClock.Elapsed.TotalSeconds -lt 90) {[Threading.Thread]::Sleep(100)}
+                if ($ConsentChannel.Cancelled) {throw 'GUI closed before symbol consent; no dispatch.'}
+                $answer=[string]$ConsentChannel.Answer
+            }
             $online=$answer -ceq ('SYMBOLS '+$analysisId)
         }
         $work=Join-Path $outputRoot $analysisId;[void][IO.Directory]::CreateDirectory($work)
@@ -249,6 +258,7 @@ function Invoke-MiAttributionExport {
         $result|Add-Member NoteProperty ArtifactId $ArtifactId
         $result|Add-Member NoteProperty SymbolStatus $symbolStatus
         $result|Add-Member NoteProperty ResultTrust 'UserOwnedDiagnosticOnly'
+        $result|Add-Member NoteProperty OutputDirectory $work
         $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($result|ConvertTo-Json -Compress -Depth 10))
         # 原生导出器退出后，归一化本身也消耗工作区/全局额度；写结果前重新测量，绝不先写大文件再删。
         $workBytes=Measure-MiExportOutput $work;$allBytes=Measure-MiProtectedTree $paths.TraceArtifacts

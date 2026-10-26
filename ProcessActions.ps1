@@ -7,6 +7,126 @@ A writable per-user action log is an operational record, NOT tamper-proof securi
 $script:MiActions = $null
 $script:MiProcessJob = $null
 $script:MiProcessCheck = $null
+# V3-M6 的权限扩展独立验收。普通有窗口进程的既有安全路径保持可用。
+function Get-MiActionGrantReleaseStatus {
+    return [pscustomobject]@{Enabled=$false;IdentityAccepted=$false;ReplayAccepted=$false;WindowsAccepted=$false;
+        Reason='M6WindowsIdentityAndSingleActionAcceptancePending';SafetyPolicyVersion='V3-M6-1'}
+}
+function Assert-MiActionGrantReleaseAccepted {
+    $gate=Get-MiActionGrantReleaseStatus
+    if (-not $gate.Enabled -or -not $gate.IdentityAccepted -or -not $gate.ReplayAccepted -or -not $gate.WindowsAccepted) {
+        throw ('ActionGrant disabled: '+$gate.Reason)
+    }
+}
+function Initialize-MiActionGrantNative {
+    if ('MemoryInspector.ActionGrants' -as [type]) {return}
+    # 原生句柄绑定精确实例，授权只存在当前执行上下文内；JSON/GUI 行对象不是授权凭证。
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.ComponentModel;
+using System.Security.Principal;
+using System.Security.Cryptography;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+namespace MemoryInspector {
+ public sealed class ActionTarget : IDisposable {
+  IntPtr handle; FileStream image;
+  public readonly int Pid; public readonly long StartTicks; public readonly string Path,Hash,OwnerSid; public readonly int Session;
+  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessTimes(IntPtr p,out long start,out long end,out long kernel,out long user);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,ExactSpelling=true)] static extern bool QueryFullProcessImageNameW(IntPtr p,uint flags,StringBuilder name,ref uint size);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool IsProcessCritical(IntPtr p,out bool critical);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetProcessInformation(IntPtr p,int cls,out uint value,uint size);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr p,uint access,out IntPtr token);
+  [DllImport("advapi32.dll",SetLastError=true)] static extern bool GetTokenInformation(IntPtr token,int cls,IntPtr data,int size,out int needed);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr p,uint ms);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr p,uint code);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr p);
+  static IntPtr TokenInfo(IntPtr token,int cls) {
+   int size;GetTokenInformation(token,cls,IntPtr.Zero,0,out size);
+   if(size<4 || size>65536)throw new InvalidOperationException("Token information unavailable");
+   IntPtr data=Marshal.AllocHGlobal(size);
+   if(!GetTokenInformation(token,cls,data,size,out size)){Marshal.FreeHGlobal(data);throw new Win32Exception();}return data;
+  }
+  string Identity(out string path,out string sid,out int session,out long ticks) {
+   if(handle==IntPtr.Zero || WaitForSingleObject(handle,0)!=258)throw new InvalidOperationException("Target exited or outcome unknown");
+   bool critical;uint protection;long start,end,kernel,user;
+   if(!IsProcessCritical(handle,out critical)||critical||!GetProcessInformation(handle,7,out protection,4)||protection!=0xfffffffeu)throw new InvalidOperationException("Critical/protected state unverifiable");
+   if(!GetProcessTimes(handle,out start,out end,out kernel,out user))throw new Win32Exception();ticks=DateTime.FromFileTimeUtc(start).Ticks;
+   var text=new StringBuilder(32768);uint length=(uint)text.Capacity;
+   if(!QueryFullProcessImageNameW(handle,0,text,ref length))throw new Win32Exception();path=text.ToString();
+   IntPtr token;if(!OpenProcessToken(handle,8,out token))throw new Win32Exception();
+   try {
+    using(var identity=new WindowsIdentity(token)){sid=identity.User.Value;}
+    IntPtr elevation=TokenInfo(token,20),integrity=IntPtr.Zero,sessionData=IntPtr.Zero;
+    try {
+     if(Marshal.ReadInt32(elevation)!=0)throw new InvalidOperationException("Elevated target refused");
+     integrity=TokenInfo(token,25);var level=new SecurityIdentifier(Marshal.ReadIntPtr(integrity)).Value;
+     if(uint.Parse(level.Substring(level.LastIndexOf('-')+1))>=0x3000)throw new InvalidOperationException("High integrity target refused");
+     sessionData=TokenInfo(token,12);session=Marshal.ReadInt32(sessionData);
+    }finally{Marshal.FreeHGlobal(elevation);if(integrity!=IntPtr.Zero)Marshal.FreeHGlobal(integrity);if(sessionData!=IntPtr.Zero)Marshal.FreeHGlobal(sessionData);}
+   }finally{CloseHandle(token);}
+   return path+"|"+sid+"|"+session+"|"+ticks;
+  }
+  public ActionTarget(int pid,long ticks,string owner,int session,bool force) {
+   if(pid<=4||pid==Process.GetCurrentProcess().Id||session<=0)throw new InvalidOperationException("Invalid target");
+   handle=OpenProcess(0x101000u|(force?1u:0u),false,pid);if(handle==IntPtr.Zero)throw new Win32Exception();
+   try {
+    string path,sid;int actualSession;long actualTicks;Identity(out path,out sid,out actualSession,out actualTicks);
+    if(ticks!=actualTicks||owner!=sid||session!=actualSession)throw new InvalidOperationException("Target identity changed");
+    for(string ancestor=path;!String.IsNullOrEmpty(ancestor);ancestor=System.IO.Path.GetDirectoryName(ancestor))
+     if((File.GetAttributes(ancestor)&FileAttributes.ReparsePoint)!=0)throw new InvalidOperationException("Reparse executable refused");
+    image=File.Open(path,FileMode.Open,FileAccess.Read,FileShare.Read);
+    if(image.Length<=0||image.Length>268435456)throw new InvalidOperationException("Executable hash bound exceeded");
+    using(var sha=SHA256.Create()){Hash=BitConverter.ToString(sha.ComputeHash(image)).Replace("-","");}
+    Pid=pid;StartTicks=ticks;Path=path;OwnerSid=sid;Session=session;
+   }catch{Dispose();throw;}
+  }
+  public void Verify() {
+   string path,sid;int session;long ticks;Identity(out path,out sid,out session,out ticks);
+   if(!String.Equals(path,Path,StringComparison.OrdinalIgnoreCase)||sid!=OwnerSid||session!=Session||ticks!=StartTicks)throw new InvalidOperationException("Target identity changed");
+  }
+  internal void Terminate() {if(!TerminateProcess(handle,1))throw new Win32Exception();}
+  public string ExitState() {uint state=WaitForSingleObject(handle,0);return state==0?"Exited":state==258?"Running":"Unknown";}
+  public void Dispose(){if(image!=null){image.Dispose();image=null;}if(handle!=IntPtr.Zero){CloseHandle(handle);handle=IntPtr.Zero;}}
+ }
+ public sealed class GrantView {
+  public readonly string GrantId,ActionType,OwnerSid,ExecutablePath,ExecutableSha256,ExecutableIdentity,SafetyPolicyVersion,ConfirmationId,GrantState;
+  public readonly int TargetPid,SessionId;public readonly long TargetStartUtcTicks;public readonly DateTime IssuedUtc,ExpiresUtc;
+  internal GrantView(string id,ActionTarget t,string action,string policy,string confirmation,string state,DateTime issued) {
+   GrantId=id;ActionType=action;OwnerSid=t.OwnerSid;ExecutablePath=t.Path;ExecutableSha256=t.Hash;ExecutableIdentity=t.Path+"|SHA256:"+t.Hash;SafetyPolicyVersion=policy;ConfirmationId=confirmation;GrantState=state;
+   TargetPid=t.Pid;TargetStartUtcTicks=t.StartTicks;SessionId=t.Session;IssuedUtc=issued;ExpiresUtc=issued.AddSeconds(15);
+  }
+ }
+ public static class ActionGrants {
+  sealed class Grant {internal ActionTarget Target;internal string Id,Action,Policy,Confirmation,State;internal DateTime Issued;internal Stopwatch Clock=Stopwatch.StartNew();}
+  static readonly object sync=new object();static readonly Dictionary<string,Grant> grants=new Dictionary<string,Grant>();
+  static readonly System.Threading.Timer expiry=new System.Threading.Timer(delegate(object unused){lock(sync){foreach(var g in grants.Values)Expire(g);}},null,1000,1000);
+  static void Expire(Grant g){if(g.State=="UserConfirmed"&&(g.Clock.Elapsed.TotalSeconds>15||DateTime.UtcNow<g.Issued||DateTime.UtcNow>g.Issued.AddSeconds(15))){g.State="Expired";g.Target.Dispose();}}
+  public static GrantView Create(ActionTarget target,string action,string policy,string confirmation) {
+   lock(sync){var remove=new List<string>();foreach(var old in grants.Values){Expire(old);if(old.State=="Expired"||old.State=="Revoked"||old.State=="Rejected"||old.State=="OutcomeVerified"||old.State=="UnknownOutcome")remove.Add(old.Id);}foreach(string key in remove)grants.Remove(key);
+    Guid id;if(grants.Count>=256||!Guid.TryParseExact(confirmation,"N",out id)||(action!="ForceTerminate"&&action!="CooperativeExit"))throw new InvalidOperationException("Invalid/bounded grant context");
+    var g=new Grant{Id=Guid.NewGuid().ToString("N"),Target=target,Action=action,Policy=policy,Confirmation=confirmation,State="UserConfirmed",Issued=DateTime.UtcNow};grants.Add(g.Id,g);
+    return new GrantView(g.Id,target,action,policy,confirmation,g.State,g.Issued);}
+  }
+  public static ActionTarget Consume(string id,string confirmation,string policy,string action) {
+   lock(sync){Grant g;if(!grants.TryGetValue(id,out g))throw new InvalidOperationException("Unknown grant; JSON is not a credential");Expire(g);
+    if(g.State!="UserConfirmed")throw new InvalidOperationException(g.State=="Revalidating"||g.State=="Consumed"||g.State=="Dispatched"||g.State=="OutcomeVerified"?"AlreadyConsumed":g.State);
+    if(g.Policy!=policy||g.Confirmation!=confirmation||g.Action!=action){g.State="Revoked";g.Target.Dispose();throw new InvalidOperationException("Grant policy/confirmation/action changed");}
+    g.State="Revalidating";return g.Target;}
+  }
+  public static void CheckDispatch(string id,string policy){lock(sync){var g=grants[id];if(g.Policy!=policy||g.State!="Revalidating"||g.Clock.Elapsed.TotalSeconds>15||DateTime.UtcNow<g.Issued||DateTime.UtcNow>g.Issued.AddSeconds(15))throw new InvalidOperationException("Expired or consumed grant cannot dispatch");g.State="Revalidated";g.State="Consumed";}}
+  public static void DispatchForce(string id,string policy){lock(sync){var g=grants[id];if(g.Action!="ForceTerminate")throw new InvalidOperationException("Wrong action");g.Target.Verify();CheckDispatch(id,policy);g.Target.Terminate();g.State="Dispatched";}}
+  public static void Finish(string id,string state){lock(sync){Grant g;if(!grants.TryGetValue(id,out g))return;
+   if((g.State=="Consumed"&&state=="Dispatched")||(g.State=="Dispatched"&&state=="OutcomeVerified")||state=="UnknownOutcome"||state=="Rejected")g.State=state;}}
+  public static void Revoke(string id){lock(sync){Grant g;if(grants.TryGetValue(id,out g)&&g.State=="UserConfirmed"){g.State="Revoked";g.Target.Dispose();}}}
+ }
+}
+'@ -ReferencedAssemblies System.dll,System.Core.dll -ErrorAction Stop
+}
 function Initialize-MiActions {
     $folder = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'MemoryInspector'
     $script:MiActions = [pscustomobject]@{
@@ -86,7 +206,8 @@ function Write-MiProcessAudit {
     }
 }
 function Assert-MiProcessTarget {
-    param($Item,$Snapshot)
+    param($Item,$Snapshot,[switch]$AllowBackground)
+    if ($AllowBackground) {Assert-MiActionGrantReleaseAccepted}
     $checkStarted=[Diagnostics.Stopwatch]::StartNew()
     $reason = Test-MiActionSnapshot -Item $Item -Snapshot $Snapshot
     if ($reason -ne 'Pass') { throw ('目标检查失败：'+$reason) }
@@ -103,7 +224,7 @@ function Assert-MiProcessTarget {
         if ($started -ne [long]$Item.StartUtcTicks -or $name -cne [string]$Item.Name) { throw 'PID 已被复用或进程身份改变。' }
         if (Test-MiProtectedProcess -Name $name -Path $path) { throw '受保护进程名称、路径不可信或位于系统目录。' }
         if ([int]$proc.SessionId -ne $script:MiActions.CurrentSession -or
-            [long]$proc.MainWindowHandle.ToInt64() -eq 0) { throw '必须是当前会话具有可用主窗口的普通应用。' }
+            (-not $AllowBackground -and [long]$proc.MainWindowHandle.ToInt64() -eq 0)) { throw '必须是当前会话具有可用主窗口的普通应用。' }
 
         $cim = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = {0}' -f $Item.PID) -OperationTimeoutSec 5 -ErrorAction Stop
         if ($null -eq $cim -or $null -eq $cim.CreationDate -or
@@ -201,8 +322,82 @@ function Close-MiProcessTargetLock {
         finally { $Operation.TargetLock.Dispose();$Operation.TargetLock=$null }
     }
 }
+function New-MiNativeActionTarget {
+    param($Item,[bool]$Force)
+    Initialize-MiActionGrantNative
+    return [MemoryInspector.ActionTarget]::new([int]$Item.PID,[long]$Item.StartUtcTicks,
+        $script:MiActions.CurrentSid,$script:MiActions.CurrentSession,$Force)
+}
+function New-MiActionGrant {
+    param($Item,$Snapshot,[ValidateSet('Graceful','Force')][string]$Mode,[string]$ConfirmationId,[bool]$DangerEnabled)
+    Assert-MiActionGrantReleaseAccepted
+    if ($ConfirmationId -cnotmatch '^[a-f0-9]{32}$' -or ($Mode -ceq 'Force' -and -not $DangerEnabled)) {throw 'Separate process-action confirmation required.'}
+    $proc=$null;$target=$null
+    try {
+        $proc=Assert-MiProcessTarget $Item $Snapshot -AllowBackground
+        if ($Mode -ceq 'Graceful' -and $proc.MainWindowHandle.ToInt64() -eq 0) {throw 'No cooperative exit capability; force requires a separate confirmation.'}
+        $target=New-MiNativeActionTarget $Item ($Mode -ceq 'Force')
+        if (-not [string]::Equals($target.Path,$proc.Path,[StringComparison]::OrdinalIgnoreCase)) {throw 'Executable identity changed.'}
+        $action=if ($Mode -ceq 'Force') {'ForceTerminate'} else {'CooperativeExit'}
+        $grant=[MemoryInspector.ActionGrants]::Create($target,$action,(Get-MiActionGrantReleaseStatus).SafetyPolicyVersion,$ConfirmationId)
+        $target=$null # 由内存授权上下文持有句柄，过期/撤销会释放；不能从 JSON 恢复。
+        if (-not (Write-MiProcessAudit $grant.GrantId 'GRANT_USER_CONFIRMED' $Mode $Item.PID $Item.Name $grant)) {
+            [MemoryInspector.ActionGrants]::Revoke($grant.GrantId);throw 'Grant confirmation audit unavailable.'
+        }
+        return $grant
+    } finally {if ($null -ne $proc) {$proc.Dispose()};if ($null -ne $target) {$target.Dispose()}}
+}
+function Invoke-MiGrantedNativeAction {
+    param($Target,$Process,[string]$Mode,[string]$GrantId)
+    if ($Mode -ceq 'Force') {[MemoryInspector.ActionGrants]::DispatchForce($GrantId,(Get-MiActionGrantReleaseStatus).SafetyPolicyVersion)}
+    else {
+        $Target.Verify();[MemoryInspector.ActionGrants]::CheckDispatch($GrantId,(Get-MiActionGrantReleaseStatus).SafetyPolicyVersion)
+        if (-not $Process.CloseMainWindow()) {throw 'Cooperative exit was not accepted; no automatic force.'}
+    }
+}
+function Invoke-MiGrantedProcessAction {
+    param($Item,$Snapshot,[string]$Mode,[bool]$DangerEnabled,[string]$GrantId,[string]$ConfirmationId)
+    Assert-MiActionGrantReleaseAccepted
+    $result=[pscustomobject]@{OperationId=$GrantId;GrantId=$GrantId;Mode=$Mode;PID=[int]$Item.PID;Name=$Item.Name;StartUtcTicks=$Item.StartUtcTicks;
+        StartedUtc=[datetime]::UtcNow;Outcome='Rejected';Error=$null;TargetLock=$null;NativeTarget=$null;BeforePrivate=$Item.PrivateBytes;
+        BeforeCommitted=$Snapshot.System.CommittedBytes;BeforeAvailable=$Snapshot.System.AvailablePhysicalBytes;
+        Observations=(New-Object 'System.Collections.Generic.List[object]')}
+    $target=$null;$proc=$null;$lock=$null;$consumed=$false;$dispatching=$false;$ownsBusy=$false
+    try {
+        if ($script:MiActions.Busy -or $null -ne $script:MiActions.Pending -or ($Mode -ceq 'Force' -and -not $DangerEnabled)) {throw 'Busy or dangerous action not confirmed.'}
+        $script:MiActions.Busy=$true;$ownsBusy=$true
+        $lock=Enter-MiProcessTargetLock $Item $Mode
+        # 原子预约后不能再次领取；复核通过才标记 Revalidated/Consumed，失败也不恢复授权。
+        $action=if ($Mode -ceq 'Force') {'ForceTerminate'} else {'CooperativeExit'}
+        $target=[MemoryInspector.ActionGrants]::Consume($GrantId,$ConfirmationId,(Get-MiActionGrantReleaseStatus).SafetyPolicyVersion,$action);$consumed=$true
+        if ($target.Pid -ne $Item.PID -or $target.StartTicks -ne $Item.StartUtcTicks -or
+            $target.OwnerSid -cne $script:MiActions.CurrentSid -or $target.Session -ne $script:MiActions.CurrentSession) {throw 'Grant target identity changed.'}
+        $proc=Assert-MiProcessTarget $Item $Snapshot -AllowBackground
+        if (-not [string]::Equals($target.Path,$proc.Path,[StringComparison]::OrdinalIgnoreCase)) {throw 'Grant executable changed.'}
+        if (-not (Write-MiProcessAudit $GrantId 'GRANT_CONSUMED' $Mode $Item.PID $Item.Name @{ConfirmationId=$ConfirmationId;ExecutableSha256=$target.Hash;Policy=(Get-MiActionGrantReleaseStatus).SafetyPolicyVersion})) {throw 'Audit unavailable; no dispatch.'}
+        Write-MiProcessTargetState $lock $GrantId $Mode 'Dispatching';$dispatching=$true
+        # Flush 可能很慢，意图落盘后重新核验服务/身份，再由原生授权上下文紧邻派发检查期限。
+        $proc.Dispose();$proc=Assert-MiProcessTarget $Item $Snapshot -AllowBackground
+        Invoke-MiGrantedNativeAction $target $proc $Mode $GrantId
+        [MemoryInspector.ActionGrants]::Finish($GrantId,'Dispatched')
+        [void](Write-MiProcessAudit $GrantId 'SENT_NOT_CONFIRMED_EXIT' $Mode $Item.PID $Item.Name @{Note='Separate handle and memory observations pending'})
+        Write-MiProcessTargetState $lock $GrantId $Mode 'Requested'
+        $result.Outcome='Requested';$result.TargetLock=$lock;$lock=$null;$result.NativeTarget=$target;$target=$null
+        $script:MiActions.Pending=$result
+    } catch {
+        $result.Error=$_.Exception.Message
+        if ($dispatching) {$result.Outcome='UnknownOutcome'}
+        if ($consumed) {[MemoryInspector.ActionGrants]::Finish($GrantId,$(if ($dispatching) {'UnknownOutcome'} else {'Rejected'}))}
+        [void](Write-MiProcessAudit $GrantId $result.Outcome $Mode $Item.PID $Item.Name @{Reason=$result.Error})
+    } finally {
+        if ($null -ne $target) {$target.Dispose()};if ($null -ne $proc) {$proc.Dispose()};if ($null -ne $lock) {$lock.Dispose()}
+        if ($ownsBusy) {$script:MiActions.Busy=$false}
+    }
+    return $result
+}
 function Invoke-MiProcessAction {
-    param([ValidateSet('Graceful','Force')][string]$Mode,$Item,$Snapshot,[bool]$DangerEnabled)
+    param([ValidateSet('Graceful','Force')][string]$Mode,$Item,$Snapshot,[bool]$DangerEnabled,[string]$GrantId='',[string]$ConfirmationId='')
+    if ($GrantId) {return Invoke-MiGrantedProcessAction $Item $Snapshot $Mode $DangerEnabled $GrantId $ConfirmationId}
     $id = [guid]::NewGuid().ToString('N')
     $started = [datetime]::UtcNow
     $result = [pscustomobject]@{
@@ -296,6 +491,8 @@ function Update-MiActionObservation {
                 $committed=$sys.CommittedBytes;$available=$sys.AvailablePhysicalBytes
             }
             $targetPrivate=$null
+            $exitState='Unknown'
+            if ($null -ne $p.NativeTarget) {$exitState=$p.NativeTarget.ExitState()}
             if ($null -ne $Snapshot.Processes -and $Snapshot.Processes.Status -ne 'Failed') {
                 $matching=@($Snapshot.Processes.Items | Where-Object { $_.PID -eq $p.PID -and $_.StartUtcTicks -eq $p.StartUtcTicks })
                 if ($matching.Count -gt 0) {
@@ -306,7 +503,7 @@ function Update-MiActionObservation {
             $p.Observations.Add([pscustomobject]@{
                 TargetSecond=$second; SampleUtc=$sampleUtc.ToString('o')
                 CommittedBytes=$committed; AvailablePhysicalBytes=$available
-                TargetPrivateBytes=$targetPrivate; TargetStatus=$observed
+                TargetPrivateBytes=$targetPrivate; TargetStatus=$observed;ExitState=$exitState
             })
         }
     }
@@ -316,21 +513,31 @@ function Update-MiActionObservation {
         if ($null -ne $p.BeforeCommitted -and $null -ne $last.CommittedBytes) {
             $net=[long]($last.CommittedBytes-$p.BeforeCommitted)
         }
+        $availableNet=$null
+        if ($null -ne $p.BeforeAvailable -and $null -ne $last.AvailablePhysicalBytes) {$availableNet=[long]($last.AvailablePhysicalBytes-$p.BeforeAvailable)}
+        $exitState=if ($null -ne $p.NativeTarget) {$p.NativeTarget.ExitState()} else {'Unknown'}
         $details=@{
             TargetStatus=$last.TargetStatus; NetSystemCommitBytes=$net
+            NetAvailableRamBytes=$availableNet;ExitState=$exitState;TargetPrivateBytesNoLongerExists=if ($exitState -ceq 'Exited') {$true} else {$null}
             Attribution='Net system change only; concurrent workloads may contribute'
             Observations=@($p.Observations.ToArray())
         }
         [void](Write-MiProcessAudit -OperationId $p.OperationId -State 'OBSERVATION_COMPLETE' -Mode $p.Mode -TargetPid $p.PID -Name $p.Name -Details $details)
         Close-MiProcessTargetLock -Operation $p -Status 'ObservationComplete'
+        if ($null -ne $p.NativeTarget) {
+            [MemoryInspector.ActionGrants]::Finish($p.GrantId,$(if ($exitState -ceq 'Unknown') {'UnknownOutcome'} else {'OutcomeVerified'}))
+            $p.NativeTarget.Dispose();$p.NativeTarget=$null
+        }
         $script:MiActions.Pending=$null
-        return [pscustomobject]@{State='Complete';Operation=$p;NetCommitBytes=$net;TargetStatus=$last.TargetStatus}
+        return [pscustomobject]@{State='Complete';Operation=$p;NetCommitBytes=$net;NetAvailableRamBytes=$availableNet;TargetStatus=$last.TargetStatus;ExitState=$exitState;
+            SampleUtc=$last.SampleUtc;PrivateBytesNoLongerExists=if ($exitState -ceq 'Exited') {$true} else {$null}}
     }
     if ($elapsed -gt 120) {
         [void](Write-MiProcessAudit -OperationId $p.OperationId -State 'OBSERVATION_INCOMPLETE' -Mode $p.Mode -TargetPid $p.PID -Name $p.Name -Details @{
             Reason='Monitoring timeout or sampling gaps';Observations=@($p.Observations.ToArray())
         })
         Close-MiProcessTargetLock -Operation $p -Status 'UnknownOutcome'
+        if ($null -ne $p.NativeTarget) {[MemoryInspector.ActionGrants]::Finish($p.GrantId,'UnknownOutcome');$p.NativeTarget.Dispose();$p.NativeTarget=$null}
         $script:MiActions.Pending=$null
         return [pscustomobject]@{State='Incomplete';Operation=$p;NetCommitBytes=$null;TargetStatus='Unknown'}
     }
@@ -345,6 +552,7 @@ function Stop-MiActionObservation {
         Observations=@($p.Observations.ToArray())
     })
     Close-MiProcessTargetLock -Operation $p -Status 'UnknownOutcome'
+    if ($null -ne $p.NativeTarget) {[MemoryInspector.ActionGrants]::Finish($p.GrantId,'UnknownOutcome');$p.NativeTarget.Dispose();$p.NativeTarget=$null}
     $script:MiActions.Pending=$null
 }
 
@@ -357,7 +565,7 @@ function Get-MiProcessCheckKey {
 function Start-MiProcessJob {
     param([ValidateSet('Check','Execute')][string]$Kind,$Item,$Snapshot,
         [ValidateSet('Graceful','Force')][string]$Mode='Graceful',[bool]$DangerEnabled=$false,
-        [string]$ModulePath=(Join-Path $PSScriptRoot 'ProcessActions.ps1'))
+        [string]$ModulePath=(Join-Path $PSScriptRoot 'ProcessActions.ps1'),[string]$ConfirmationId='')
     if ($null -ne $script:MiProcessJob) { throw '已有进程验证或执行任务，拒绝重复请求。' }
     $ps=$null
     try {
@@ -370,22 +578,26 @@ function Start-MiProcessJob {
         $target=$Item.PSObject.Copy()
         $ps=[Management.Automation.PowerShell]::Create()
         [void]$ps.AddScript(@'
-param($ModulePath,$State,$Kind,$Item,$Snapshot,$Mode,$DangerEnabled)
+param($ModulePath,$State,$Kind,$Item,$Snapshot,$Mode,$DangerEnabled,$ConfirmationId)
 $ErrorActionPreference='Stop'
 . $ModulePath
 $script:MiActions=$State
 if ($Kind -eq 'Check') {
     $proc=$null
     try {
-        $proc=Assert-MiProcessTarget -Item $Item -Snapshot $Snapshot
-        [pscustomobject]@{State='Verified';CanAudit=$State.CanAudit}
+        $expanded=(Get-MiActionGrantReleaseStatus).Enabled
+        $proc=Assert-MiProcessTarget -Item $Item -Snapshot $Snapshot -AllowBackground:$expanded
+        if ($expanded) {$native=New-MiNativeActionTarget $Item $true;try {$native.Verify()} finally {$native.Dispose()}}
+        [pscustomobject]@{State='Verified';CanAudit=$State.CanAudit;HasWindow=($proc.MainWindowHandle.ToInt64() -ne 0)}
     } finally { if ($null -ne $proc) { $proc.Dispose() } }
 } else {
-    $result=Invoke-MiProcessAction -Mode $Mode -Item $Item -Snapshot $Snapshot -DangerEnabled $DangerEnabled
+    $grant=$null
+    if ((Get-MiActionGrantReleaseStatus).Enabled) {$grant=New-MiActionGrant $Item $Snapshot $Mode $ConfirmationId $DangerEnabled}
+    $result=Invoke-MiProcessAction -Mode $Mode -Item $Item -Snapshot $Snapshot -DangerEnabled $DangerEnabled -GrantId $grant.GrantId -ConfirmationId $ConfirmationId
     [pscustomobject]@{State=$result.Outcome;Result=$result;CanAudit=$State.CanAudit}
 }
 '@).AddArgument($ModulePath).AddArgument($state).AddArgument($Kind).AddArgument($target).
-            AddArgument($Snapshot).AddArgument($Mode).AddArgument($DangerEnabled)
+            AddArgument($Snapshot).AddArgument($Mode).AddArgument($DangerEnabled).AddArgument($ConfirmationId)
         $handle=$ps.BeginInvoke()
         $script:MiProcessJob=[pscustomobject]@{
             Kind=$Kind;Key=(Get-MiProcessCheckKey $target);Item=$target
@@ -417,7 +629,7 @@ function Poll-MiProcessJob {
         }
         $state=[string]$payload.State
         if ($job.TimeoutReported) { $state=if ($job.Kind -eq 'Check') {'TimedOut'} else {'UnknownOutcome'} }
-        return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State=$state;Error=$payload.Result.Error;Result=$payload.Result}
+        return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State=$state;Error=$payload.Result.Error;Result=$payload.Result;HasWindow=$payload.HasWindow}
     } catch {
         return [pscustomobject]@{Kind=$job.Kind;Key=$job.Key;State='Rejected';Error=$_.Exception.Message;Result=$null}
     } finally {

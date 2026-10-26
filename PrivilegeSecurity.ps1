@@ -49,7 +49,7 @@ function Test-MiPrivilegedOperation {
     # 定时任务只有一个固定入口；禁止借用它携带请求、服务名或自由命令。
     if ($Operation -ceq 'TraceWatchdog') { return $RequestId -ceq 'Scheduled' -and $ServiceName -ceq '' }
     if (-not (Test-MiGuidN $RequestId)) { return $false }
-    if ($Operation -cin @('TracePreflight','TraceHealth','TraceRecovery','TraceStart','TraceStop','TraceArtifacts','TraceExportPrepare')) { return $ServiceName -ceq '' }
+    if ($Operation -cin @('TracePreflight','TraceHealth','TraceRecovery','TraceStatus','TraceStart','TraceStop','TraceArtifacts','TraceExportPrepare')) { return $ServiceName -ceq '' }
     if ($Operation -ceq 'Probe') { return [string]::IsNullOrWhiteSpace($ServiceName) }
     if ($Operation -cnotin @('ApproveService','RevokeServiceApproval','StopApprovedService','StartPreviouslyStoppedService')) {
         return $false
@@ -758,6 +758,42 @@ function Get-MiExportReleaseStatus {
     # 真实表头/单位、工具版本、非提权执行和网络行为尚未验收，不能由设置或外部 JSON 解锁。
     return [pscustomobject]@{SchemaVersion=1;Enabled=$false;OfflineAccepted=$false;OnlineAccepted=$false;NormalizationAccepted=$false;
         Reason='M2M4AndM5ExporterWindowsAcceptancePending'}
+}
+function Write-MiTraceRequestReport {
+    param([string]$RequestId,[string]$Operation,[string]$OwnerSid)
+    if (-not (Test-MiGuidN $RequestId) -or $Operation -cnotin @('TraceStatus','TraceStart','TraceStop','TraceExportPrepare','TraceRecovery') -or
+        $OwnerSid -cne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {throw 'Unbound GUI report request.'}
+    $lease=Enter-MiDeploymentLease
+    try {
+    $paths=Get-MiSecurityPaths;$report=Get-MiTraceRecoveryReport
+    $sessions=@($report.Sessions|Where-Object {$_.OwnerSid -ceq $OwnerSid})
+    $artifacts=@($report.Artifacts|Where-Object {$_.OwnerSid -ceq $OwnerSid})
+    if ($sessions.Count -gt 200 -or $artifacts.Count -gt 200) {throw 'Status report bound exceeded; use protected recovery console.'}
+    $payload=[pscustomobject]@{SchemaVersion=1;RequestId=$RequestId;Operation=$Operation;OwnerSid=$OwnerSid;Utc=[datetime]::UtcNow.ToString('o');
+        Sessions=$sessions;Artifacts=$artifacts;UpgradeBlocked=($report.UpgradeBlocked -ne $false);
+        JournalStatus=if ($report.JournalStatus) {$report.JournalStatus} else {'Verified'};
+        DeploymentBlocked=($report.DeploymentBlocked -ne $false);TaskBlocked=($report.TaskBlocked -ne $false);
+        HeapTransactions=@($report.HeapTransactions|Where-Object {$sessions.TraceSessionId -ccontains $_.TraceSessionId});
+        WprRelease=(Get-MiWprReleaseStatus);HeapRelease=(Get-MiHeapReleaseStatus);ExportRelease=(Get-MiExportReleaseStatus);
+        Guidance=$report.Guidance;ResultTrust='ProtectedStatusOnlyNotActionAuthority'}
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($payload|ConvertTo-Json -Compress -Depth 14))
+    if ($bytes.Length -gt 1048576 -or (Measure-MiProtectedTree $paths.TraceArtifacts) -gt (8589934592-$bytes.Length)) {throw 'Status report budget unavailable.'}
+    $ownerDirectory=Join-Path $paths.TraceArtifacts $OwnerSid;$directory=Join-Path $ownerDirectory 'requests'
+    foreach ($folder in @($ownerDirectory,$directory)) {
+        if (-not [IO.Directory]::Exists($folder)) {[void][IO.Directory]::CreateDirectory($folder);Set-MiDiagnosticAccess $folder $OwnerSid -Directory}
+        Assert-MiTracePath $folder
+    }
+    $path=Join-Path $directory ($RequestId+'.json');$file=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {$file.Write($bytes,0,$bytes.Length);$file.Flush($true)} finally {$file.Dispose()}
+    Set-MiDiagnosticAccess $path $OwnerSid
+    } finally {$lease.Dispose()}
+}
+function Assert-MiGuiRequesterContext {
+    param([string]$Operation,[string]$OwnerSid,[int]$SessionId)
+    if ($Operation -cnotin @('TraceStatus','TraceStart','TraceStop','TraceExportPrepare','TraceRecovery') -or
+        $OwnerSid -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -or
+        $OwnerSid -cne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -or
+        $SessionId -le 0 -or $SessionId -ne [int](Get-Process -Id $PID).SessionId) {throw 'GUI requester identity/session mismatch.'}
 }
 function Assert-MiExportReleaseAccepted {
     Assert-MiHeapReleaseAccepted

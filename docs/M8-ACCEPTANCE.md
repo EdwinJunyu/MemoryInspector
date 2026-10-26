@@ -442,3 +442,53 @@ M2–M4 全部真实安全关卡继续保留。M5 还需在隔离 Windows 10/11 
 API/事实来源：[WPAExporter](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/exporter)、[符号路径与默认回落](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/loading-symbols)、[VirtualAlloc Profile](https://github.com/microsoft/MSO-Scripts/blob/main/src/WPAP/VirtualAlloc.wpaProfile)、[Heap Profile](https://github.com/microsoft/MSO-Scripts/blob/main/src/WPAP/Heap.wpaProfile)、[Pool 事实索引](https://github.com/microsoft/HOBL/blob/f183bc4166826c7b617b231b79db6d9f9cd08589/utilities/proprietary/ParsePowerLight/Catalog/WpaRuleMatchExporter.wpaProfile)。文档/源码用于核对契约，不能替代上述实机验收。
 
 API 依据：[WPR 命令与模式](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/wpr-command-line-options)、[命名实例](https://devblogs.microsoft.com/performance-diagnostics/controlling-the-event-session-name-with-the-instance-name/)、[QueryAllTraces 可见性](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-queryalltracesw)、[ETW 会话属性](https://learn.microsoft.com/en-us/windows/desktop/ETW/event-trace-properties)、[OpenTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracew)、[CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)、[Job breakaway / 隐藏进程标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)。文档只证明 API 契约，不替代上述实机验收。
+
+## 2026-10-25 V3-M6/M7：ActionGrant 与 GUI Integration
+
+冻结依据：[v3 技术规格](https://docs.google.com/document/d/1GVln-oZKuIPkIR1C-Bh3JouyMhEO0z6X-dAscPpTHr4/edit)第 10–12、14、18–20 节及 M6/M7；固定基线 7201c6c9b69ee61956d639b3e331c79c97dbd61b。只扩展既有模块/测试和项目备注，没有新增生产模块或删除文件。VERSION 保持 0.0.9，本地提交，不推送远程。
+
+### M2–M5 安全前置条件
+
+修改前先运行既有 PrivilegeSecurityTest，退出 0，管理员 ACL 夹具仍跳过。PS Desktop 5.1.22621.6133、Windows 11 build 22631、普通令牌；受保护安装、Journal、Watchdog policy 均不存在；本机没有 M5 的 WPAExporter 实机证据，实际版本/表头/单位接受列表仍为空。M2 SYSTEM/受保护部署、M3 实录/Job/资源、M4 IFEO/恢复、M5 工具/符号网络/归一化实机验收没有完成，因此所有原发布门不变。新增 M6 Enabled/IdentityAccepted/ReplayAccepted/WindowsAccepted 与 M7 Enabled/TraceUiAccepted/ExportUiAccepted/RecoveryUiAccepted 全部 false。M6 是独立验收分支，不把 M2–M5 未验收误当作新进程权限已可开放。
+
+### M6 实现与边界
+
+- 原 ProcessActions 增加普通用户、当前会话的无窗口进程授权。保留原有有窗口进程的保守操作路径；新增权限扩展必须通过独立源码门。预验证可识别没有主窗口但身份合法的普通进程；CooperativeExit 没有窗口时拒绝，不自动转 ForceTerminate。
+- Grant 绑定随机 GrantId、ActionType、精确 PID/启动 UTC ticks、OwnerSid、SessionId、路径/SHA256、SafetyPolicyVersion、IssuedUtc/ExpiresUtc、ConfirmationId 和状态。确认与诊断/追踪授权分离，编号进入操作记录。授权只在当前执行上下文维护，不从用户 JSON、旧 GUI 缓存或 Finding 恢复。确认审计失败立即撤销。
+- 持有原生进程句柄和只读映像句柄，防止以当前 PID 重新定位终止目标或在授权期间替换映像。GetProcessTimes、QueryFullProcessImageName、TokenUser/Session/Elevation/Integrity、IsProcessCritical、ProtectionLevelInfo 分别核验；未知、提权、High Integrity、Critical/PPL、跨用户/会话一律拒绝。映像拒绝重解析路径与 >256 MiB 的未校准输入。
+- 服务归属和 CIM 身份在准备与执行复核，无法查询就拒绝。授权原子预约后不能第二次领取；持久 Dispatching 意图 Flush 后再次核验服务/实例。最终原生上下文复核策略及 UTC/单调时钟 15 秒期限，标记 Revalidated/Consumed 后单次派发，只管理原句柄对应实例，不结束子进程树，不提权。
+- 活跃授权最多 256；创建前回收过期/撤销/拒绝/已完成终态。旧 GrantId 即使已回收也只能得到 Unknown/拒绝，不会重新有效。原跨进程目标锁及追加状态继续阻断 Dispatching/未知请求；执行中或结果未知不自动重试。
+- 句柄 Exited/Running/Unknown 与快照 Present/NotObserved 分开。目标 Private Bytes 是否不再存在、系统 Commit 净变化、Available RAM 净变化、实际采样 UTC 和并发工作负载局限分别显示及记录。退出不等于证明释放内存；无完整测量则保持不可确认。
+
+### M7 实现与界面契约
+
+- 原 GuiV4 新增“Diagnostics · 高级诊断”页；已有 Attribution 页保持 Commit/RAM 独立。固定类型 VirtualAlloc/Pool/Heap、Memory/File、300–1800 秒和 Heap 路径输入，Session/Artifact 单选表、独立停止/保存/清理/历史分析状态及只读详情。刷新清除旧选择，失败不保留旧报告供操作。沿用 README 的视觉/交互约定、字体/主题/共享控件，未创建独立设计模块。
+- 原 PrivilegeBridge 只发送固定 UAC 命令及验证过的枚举/ID；没有自由 PowerShell、执行器路径、Profile、符号服务器或输出目录。GUI 保持普通权限。UAC 改用另一账户或会话时，执行器比较实际 SID/session 并拒绝。与旧服务/Probe 请求共用待处理约束，活动/未知请求不因 UI 计时而重发或终止。
+- TraceStatus 可报告任务/Journal 不可信，不假称 Watchdog 已健康。受保护报告按请求 ID、操作、当前 OwnerSid 绑定，持共享部署租约，CreateNew/Flush，固定保存于该账户 diagnostics/requests。仅列所有者的会话/文件及对应 Heap 事务；不可读/未知 Journal 默认保留升级、部署、任务阻断，报告不授予操作权。报告最多 1 MiB/200 会话/200 Artifact，计入 8 GiB 预算。
+- 追踪、ETL 准备、普通用户分析、联网符号和恢复入口分别检查验收门，桥入口再次检查。追踪/恢复打开受保护交互控制台，执行原 START/Heap/Recovery 确认与归属检查；只读状态/停止/准备使用隐藏窗口。旧手动受保护恢复控制台保留原行为，不能强制清除未知归属或未恢复义务。
+- ACL/文件/JSON、导出、归一化和预览生成在后台 runspace；GUI 仅轮询/排版。预览最多 20 条 Finding/32768 字符，完整用户结果保留在本次 OutputDirectory。后台读取完成不等于已经交付；只有 Poll 真正处理终态后才释放请求，避免快完成竞争丢失报告。
+- M5 联网确认通过同步内存通道交给 GUI，本次随机 AnalysisId、用途、固定 Microsoft HTTPS 服务器和缓存路径全部显示。取消继续离线，关闭且尚未确认则不派发，不持久复用授权。GUI 退出不结束独立 Controller/Watchdog/目标；正在导出的普通用户子进程仍受 M5 Job 生命周期和预算控制。
+
+### Review：Standards
+
+按 Review 的 code-review 对固定基线独立审阅。发现三项 P2：历史 Grant 永久占据 256 个名额、恢复/导出桥漏查独立 UI 验收门、异步报告在 return 与 finally 间完成导致尚未 EndInvoke 就被释放。均已修复。补充 260 次终态回收与旧 ID 拒绝、各操作独立 gate、300 ms 慢读和确定性快完成边界回归；另补 Heap 切换至其他类型不携带残留路径。最终 Standards 复核无剩余提交阻断项。
+
+### Review：Spec
+
+独立审阅发现两项 P2：意图 Flush 可能耗尽剩余授权期限但仍派发、历史 Grant 永久占用容量。修复后复核无剩余可确认缺陷。另补齐结果界面的句柄退出、Private Bytes、Available RAM 和时间字段，并将状态文件处理移到后台。两轴代码/日志复核不能替代真实权限、动作和 Windows 发布验收。
+
+### 验证与保留证据
+
+- ProcessActionsTest 使用本测试创建的有限 90 秒寿命无窗口程序，真实读取当前用户/会话/启动时间、Critical/PPL/Token/路径/摘要及句柄；实际 CIM 身份/服务查询允许合法无窗口对象。派发使用替身，未真实强制结束进程，夹具自然退出。真实 16 秒过期、意图写入延迟 16 秒、策略/确认/动作/所有者/会话/PID 拒绝和独立结果观测通过。
+- GuiV4Test 创建真实 WinForms 控件，在 1020×690 和 1300×850 下布局并生成 diagnostics PNG，核对第七页按钮/表/详情及全部未验收操作禁用。UAC/ACL 为替身；已测请求/SID/session/报告绑定、取消、未知子进程保持、后台慢读及快完成交付边界。AnalyzerTest 的单次 GUI 符号确认/取消/关闭使用真实内存通道，实际工具及网络仍为替身。
+- PrivilegeSecurityTest 增加实际请求者上下文拒绝、CreateNew 报告文件、所有者过滤、重复 ID 拒绝和未知 Journal 保留阻断；保护 ACL/Journal 取数为替身。未安装/卸载、注册 SYSTEM 任务、启停 WPR、写 IFEO、下载符号或运行真实目标终止。
+- 源稳定后在 Windows PowerShell Desktop 5.1.22621.6133 / STA / RemoteSigned 完整重跑 SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test，**八套全部退出 0**。12 个修改的 PowerShell 文件保留 UTF-8 BOM，14 个源码/文档严格 UTF-8 解码和 git diff --check 通过。原有阈值和行为断言没有削弱。
+- 证据保留于本地忽略目录 test-artifacts/v3-m67：前置安全回归、prerequisites-ps51.json、export-prerequisite.json、针对性日志、verified-regression-results.json、verified-*.log 和 WinForms 布局 PNG；不随源码提交。源码和测试之外的既有未跟踪验收目录保留原样。
+
+### 尚未通过的发布验收
+
+M2–M5 全部实机关卡继续待验收；M6 仍需隔离 Windows 10/11 的真实普通/提权/受保护/服务宿主/跨会话目标、原生单目标派发、重放/权限改变/故障/观察验证；M7 仍需真实 UAC 请求者绑定、Controller/Watchdog 交接、实际追踪/保存/配置恢复/分析/符号、键盘/DPI/长时 GUI 和性能测试。旧 GUI 内存峰值及采样覆盖问题未在本轮宣称解决。
+
+[NEEDS CLARIFICATION] 支持的 Windows/ADK/目标矩阵、映像与报告上限及实际资源阈值须按冻结规格第 20 节校准，不重新开放 Q1–Q31，不降低阈值换取通过。M6/M7 开发整合不等于 Release 验收完成，不能宣布 Preview C 或 Stable v3；所有未验收的新权限/高级追踪功能继续禁用。
+
+API 依据：[进程访问权限](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)、[IsProcessCritical](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocesscritical)、[ProcessProtectionLevelInfo](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ne-processthreadsapi-process_information_class)、[Token 信息类型](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class)、[TerminateProcess 的异步语义](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)。文档用于核对契约，不代表 Windows 实机安全验收。

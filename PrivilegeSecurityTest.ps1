@@ -828,3 +828,40 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
         Write-Host 'PASS: M5 protected descriptor intent/source binding, idempotent preparation, corruption refusal and user-output budget (ACL/ETL boundary mocked).'
     }
 }
+
+# V3-M7：真实请求报告文件和请求者上下文；受保护 ACL/Journal 获取由夹具提供。
+& {
+    . (Join-Path $root 'PrivilegeSecurity.ps1')
+    $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$sessionId=[int](Get-Process -Id $PID).SessionId
+    function Assert-M7Denied {param([scriptblock]$Action,[string]$Label)
+        $denied=$false;try {& $Action|Out-Null} catch {$denied=$true};if (-not $denied) {throw ('M7 accepted '+$Label)}
+    }
+    Assert-MiGuiRequesterContext 'TraceStatus' $owner $sessionId
+    Assert-M7Denied {Assert-MiGuiRequesterContext 'TraceStatus' 'S-1-5-21-1-2-3-4' $sessionId} 'another UAC account'
+    Assert-M7Denied {Assert-MiGuiRequesterContext 'TraceStatus' $owner ($sessionId+1)} 'another UAC session'
+    Assert-M7Denied {Assert-MiGuiRequesterContext 'StopApprovedService' $owner $sessionId} 'service request as trace'
+    $fixture=Join-Path $root ('test-artifacts\M7-Report-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $context=@{Untrusted=$false}
+    function Get-MiSecurityPaths {return [pscustomobject]@{TraceArtifacts=$fixture}}
+    function Enter-MiDeploymentLease {return [IO.File]::Open((Join-Path $fixture 'lease'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read)}
+    function Get-MiTraceRecoveryReport {
+        if ($context.Untrusted) {return [pscustomobject]@{JournalStatus='UntrustedOrIncomplete';UpgradeBlocked=$true;Sessions=@();Guidance='Preserve evidence'}}
+        return [pscustomobject]@{UpgradeBlocked=$true;DeploymentBlocked=$false;TaskBlocked=$true;Guidance='Do not clear pending recovery';
+            Sessions=@([pscustomobject]@{OwnerSid=$owner;TraceSessionId=('1'*32);State='CleanupPending'},[pscustomobject]@{OwnerSid='S-1-5-21-1-2-3-4';TraceSessionId=('3'*32)});
+            Artifacts=@([pscustomobject]@{OwnerSid=$owner;ArtifactId=('2'*32)});
+            HeapTransactions=@([pscustomobject]@{TraceSessionId=('1'*32);RestoreState='CleanupPending'})}
+    }
+    function Measure-MiProtectedTree {return 0L}
+    function Set-MiDiagnosticAccess {param($Path,$OwnerSid,[switch]$Directory)}
+    function Assert-MiTracePath {param($Path) if (-not (Test-Path -LiteralPath $Path) -or -not $Path.StartsWith($fixture,[StringComparison]::OrdinalIgnoreCase)) {throw 'Fixture path trust refused'}}
+    $id=[guid]::NewGuid().ToString('N');Write-MiTraceRequestReport $id 'TraceStatus' $owner
+    $path=Join-Path (Join-Path (Join-Path $fixture $owner) 'requests') ($id+'.json')
+    $report=[IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false,$true))|ConvertFrom-Json
+    if ($report.RequestId -cne $id -or $report.Sessions.Count -ne 1 -or $report.Sessions[0].OwnerSid -cne $owner -or
+        $report.HeapTransactions[0].RestoreState -cne 'CleanupPending' -or -not $report.UpgradeBlocked -or -not $report.TaskBlocked) {throw 'Report ownership/independent obligation binding failed'}
+    Assert-M7Denied {Write-MiTraceRequestReport $id 'TraceStatus' $owner} 'report overwrite'
+    $context.Untrusted=$true;$id=[guid]::NewGuid().ToString('N');Write-MiTraceRequestReport $id 'TraceStatus' $owner
+    $path=Join-Path (Split-Path -Parent $path) ($id+'.json');$report=[IO.File]::ReadAllText($path)|ConvertFrom-Json
+    if ($report.JournalStatus -cne 'UntrustedOrIncomplete' -or -not $report.DeploymentBlocked -or -not $report.TaskBlocked -or -not $report.UpgradeBlocked) {throw 'Unknown recovery report became permissive'}
+    Write-Host 'PASS: V3-M7 actual requester SID/session refusal, owner-scoped CreateNew reports, immutable request IDs and unknown-journal blocking (protected ACL/Journal mocked).'
+}
