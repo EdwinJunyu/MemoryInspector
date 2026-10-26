@@ -49,7 +49,7 @@ function Test-MiPrivilegedOperation {
     # 定时任务只有一个固定入口；禁止借用它携带请求、服务名或自由命令。
     if ($Operation -ceq 'TraceWatchdog') { return $RequestId -ceq 'Scheduled' -and $ServiceName -ceq '' }
     if (-not (Test-MiGuidN $RequestId)) { return $false }
-    if ($Operation -cin @('TracePreflight','TraceHealth','TraceRecovery','TraceStart','TraceStop','TraceArtifacts')) { return $ServiceName -ceq '' }
+    if ($Operation -cin @('TracePreflight','TraceHealth','TraceRecovery','TraceStart','TraceStop','TraceArtifacts','TraceExportPrepare')) { return $ServiceName -ceq '' }
     if ($Operation -ceq 'Probe') { return [string]::IsNullOrWhiteSpace($ServiceName) }
     if ($Operation -cnotin @('ApproveService','RevokeServiceApproval','StopApprovedService','StartPreviouslyStoppedService')) {
         return $false
@@ -224,7 +224,8 @@ function Enter-MiDeploymentLease {
     if (-not [IO.File]::Exists($p.DeploymentLease)) {
         # 首次创建竞争由 CreateNew 拒绝，不能删除/替换另一进程的锁。
         $created=[IO.File]::Open($p.DeploymentLease,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        try { Set-MiProtectedFileAcl $p.DeploymentLease } finally { $created.Dispose() }
+        # M5 普通用户仅可共享读取租约，不能改写；独占部署仍限管理员。
+        try { Set-MiProtectedFileAcl $p.DeploymentLease $true } finally { $created.Dispose() }
     }
     Assert-MiTracePath $p.DeploymentLease
     if ($Exclusive) { return [IO.File]::Open($p.DeploymentLease,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) }
@@ -704,7 +705,7 @@ function Get-MiTraceRecoveryReport {
             DeploymentBlocked=($j.Deployment -cne 'Ready');TaskBlocked=($taskStatus -cne 'DefinitionVerified');
             ServiceRecoveryBlocked=$serviceBlocked;
             WprState='ReleaseAcceptancePending';WprRelease=(Get-MiWprReleaseStatus);Artifacts=@($j.Artifacts.Values);
-            HeapRelease=(Get-MiHeapReleaseStatus);HeapTransactions=@($j.HeapTransactions.Values);
+            HeapRelease=(Get-MiHeapReleaseStatus);HeapTransactions=@($j.HeapTransactions.Values);ExportRelease=(Get-MiExportReleaseStatus);
             Guidance='Preserve protected journal and artifacts. Unknown WPR outcomes are never retried. Saved artifact recovery requires confirmed stop, no active writer and verified byte identity. Release gates remain closed until Windows acceptance.'}
     } finally { $lock.Dispose() }
 }
@@ -752,6 +753,16 @@ function Assert-MiHeapReleaseAccepted {
     Assert-MiWprReleaseAccepted
     $gate=Get-MiHeapReleaseStatus
     if (-not $gate.Enabled -or -not $gate.ConfigurationAccepted -or -not $gate.RecoveryAccepted) {throw ('Heap diagnosis disabled: '+$gate.Reason)}
+}
+function Get-MiExportReleaseStatus {
+    # 真实表头/单位、工具版本、非提权执行和网络行为尚未验收，不能由设置或外部 JSON 解锁。
+    return [pscustomobject]@{SchemaVersion=1;Enabled=$false;OfflineAccepted=$false;OnlineAccepted=$false;NormalizationAccepted=$false;
+        Reason='M2M4AndM5ExporterWindowsAcceptancePending'}
+}
+function Assert-MiExportReleaseAccepted {
+    Assert-MiHeapReleaseAccepted
+    $gate=Get-MiExportReleaseStatus
+    if (-not $gate.Enabled -or -not $gate.OfflineAccepted -or -not $gate.NormalizationAccepted) {throw ('Attribution export disabled: '+$gate.Reason)}
 }
 function Assert-MiWprReleaseAccepted {
     $gate=Get-MiWprReleaseStatus
@@ -1116,6 +1127,16 @@ function Measure-MiProtectedTree {
         $directory=$pending.Dequeue()
         foreach ($entry in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
             if (++$visited -gt 10000) {throw 'Trace storage enumeration limit exceeded.'}
+            if ($entry.PSIsContainer -and $entry.Name -cmatch '^[0-9a-f]{32}\.export$' -and
+                [IO.Path]::GetFullPath($Root) -ceq [IO.Path]::GetFullPath((Get-MiSecurityPaths).TraceArtifacts)) {
+                # 仅此固定用户输出子树允许用户写入；高权限层只计字节，从不解析/执行它的内容。
+                $sid=[IO.Path]::GetFileName($directory);$id=$entry.Name.Substring(0,32)
+                if ($sid -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$' -or
+                    $directory -cne (Join-Path $Root $sid)) {throw 'Unexpected diagnostic output scope.'}
+                Assert-MiTracePath (Join-Path $directory ($id+'.export.json'))
+                $total+=[long](Measure-MiExportOutput $entry.FullName)
+                continue
+            }
             # WPR 生成的数据继承受保护父目录；控制文件仍要求独立受保护 DACL。
             if (-not (Test-MiNoReparse $entry.FullName) -or -not (Test-MiAclRestricted $entry.FullName $false)) {throw 'Untrusted generated trace data.'}
             if ($entry.PSIsContainer) {$pending.Enqueue($entry.FullName)} else {
@@ -1472,6 +1493,13 @@ function Assert-MiTraceArtifactTransition {
         $Next.State -cnotin @('Saving','Ready','Retiring','Retained') -or $Next.SizeBytes -lt 0) {throw 'Invalid trace artifact.'}
     $session=$Journal.Sessions[$Next.TraceSessionId]
     if ($null -eq $session -or $session.OwnerSid -cne $Next.OwnerSid -or $session.PlannedArtifactId -cne $Next.ArtifactId) {throw 'Artifact has no protected session ownership.'}
+    if ($null -ne $Next.ExportDescriptor) {
+        $d=$Next.ExportDescriptor
+        if (@($d.PSObject.Properties).Count -ne 11 -or $d.SchemaVersion -ne 1 -or $d.ArtifactId -cne $Next.ArtifactId -or
+            $d.TraceSessionId -cne $Next.TraceSessionId -or $d.OwnerSid -cne $Next.OwnerSid -or $d.SizeBytes -ne $Next.SizeBytes -or
+            $d.Sha256 -cne $Next.Sha256 -or $d.TraceType -cne $session.RequestedTraceType -or $d.EventLossStatus -cne $Next.EventLossStatus -or
+            $d.AnalyzerSha256 -cnotmatch '^[A-F0-9]{64}$' -or (ConvertTo-MiTraceUtc $d.EndUtc) -lt (ConvertTo-MiTraceUtc $d.StartUtc)) {throw 'Unbound export descriptor.'}
+    }
     $created=ConvertTo-MiTraceUtc $Next.CreatedUtc;$retention=ConvertTo-MiTraceUtc $Next.RetainUntilUtc
     if (($retention-$created).TotalDays -ne 7) {throw 'Invalid artifact retention deadline.'}
     if ($Next.SizeBytes -le 0 -or $Next.SizeBytes -gt 8589934592 -or $Next.Sha256 -cnotmatch '^[A-F0-9]{64}$') {throw 'Artifact identity incomplete.'}
@@ -1480,6 +1508,8 @@ function Assert-MiTraceArtifactTransition {
         if ($Previous.$field -cne $Next.$field) {throw 'Artifact ownership changed.'}
     }
     if ($Previous.SizeBytes -ne $Next.SizeBytes -or $Previous.Sha256 -cne $Next.Sha256) {throw 'Artifact bytes changed.'}
+    if ($null -ne $Previous.ExportDescriptor -and ($Previous.ExportDescriptor|ConvertTo-Json -Compress -Depth 8) -cne
+        ($Next.ExportDescriptor|ConvertTo-Json -Compress -Depth 8)) {throw 'Bound export descriptor changed.'}
     $edges=@{Saving=@('Ready');Ready=@('Ready','Retiring');Retiring=@('Retained');Retained=@()}
     if ($Next.State -cnotin $edges[[string]$Previous.State] -or ($Next.State -cin @('Retiring','Retained') -and $Next.ActiveReferences -ne 0)) {throw 'Artifact transition or active reference conflict.'}
 }
@@ -1489,6 +1519,74 @@ function Get-MiTraceArtifactPath {
     $directory=Join-Path (Get-MiSecurityPaths).TraceArtifacts $Artifact.OwnerSid
     if ($Retained) {$directory=Join-Path $directory 'retained'}
     return Join-Path $directory ($Artifact.ArtifactId+'.etl')
+}
+function Measure-MiExportOutput {
+    param([string]$Root)
+    $pending=New-Object 'System.Collections.Generic.Queue[string]';$pending.Enqueue($Root);$total=0L;$count=0
+    while ($pending.Count -gt 0) {
+        $folder=$pending.Dequeue()
+        if (-not (Test-MiNoReparse $folder)) {throw 'Reparse diagnostic output refused.'}
+        foreach ($entry in @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop)) {
+            if (++$count -gt 10000 -or -not (Test-MiNoReparse $entry.FullName)) {throw 'Diagnostic output enumeration refused.'}
+            if ($entry.PSIsContainer) {$pending.Enqueue($entry.FullName)}
+            else {
+                if ($entry.Length -gt (8589934592-$total)) {throw 'Diagnostic output budget exceeded.'}
+                $total+=$entry.Length
+            }
+        }
+    }
+    return $total
+}
+function Set-MiExportDirectoryAccess {
+    param([string]$Path,[string]$OwnerSid)
+    Set-MiAdminDirectoryAcl $Path
+    $acl=Get-Acl -LiteralPath $Path
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        [Security.Principal.SecurityIdentifier]::new($OwnerSid),'Modify','ContainerInherit,ObjectInherit','None','Allow'))
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+function Initialize-MiArtifactExport {
+    param([string]$ArtifactId)
+    Assert-MiExportReleaseAccepted
+    if (-not (Test-MiGuidN $ArtifactId)) {throw 'Invalid export artifact identity.'}
+    $lease=Enter-MiDeploymentLease
+    try {
+        $paths=Assert-MiTrustedInstallation;[void](Invoke-MiTraceHealthCheck);$lock=Enter-MiTraceLock
+        try {
+            $j=Read-MiTraceJournal $lock;$artifact=$j.Artifacts[$ArtifactId]
+            $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            if ($null -eq $artifact -or $artifact.State -cne 'Ready' -or $artifact.OwnerSid -cne $owner -or $artifact.ActiveReferences -ne 0) {throw 'Export requires an owned saved artifact.'}
+            $session=$j.Sessions[$artifact.TraceSessionId]
+            if ($session.State -cne 'Completed' -or (Test-MiTraceObligation $session)) {throw 'Trace/Heap recovery must finish before export.'}
+            $etl=Get-MiTraceArtifactPath $artifact;Assert-MiTracePath $etl
+            $verified=Test-MiEtlArtifact $etl
+            if ($verified.SizeBytes -ne $artifact.SizeBytes -or $verified.Sha256 -cne $artifact.Sha256) {throw 'ETL integrity differs from protected save intent.'}
+            $descriptor=[pscustomobject][ordered]@{SchemaVersion=1;ArtifactId=$ArtifactId;TraceSessionId=$artifact.TraceSessionId;OwnerSid=$owner;
+                TraceType=$session.RequestedTraceType;SizeBytes=$artifact.SizeBytes;Sha256=$artifact.Sha256;EventLossStatus=$artifact.EventLossStatus;
+                StartUtc=$verified.StartUtc;EndUtc=$verified.EndUtc;AnalyzerSha256=(Get-FileHash -LiteralPath (Join-Path $paths.Install 'Analyzer.ps1') -Algorithm SHA256).Hash}
+            # 摘要记录准备者版本，不能让后续受保护升级永久失去读取同 Schema 历史 ETL 的能力。
+            if ($null -ne $artifact.ExportDescriptor) {$descriptor.AnalyzerSha256=$artifact.ExportDescriptor.AnalyzerSha256}
+            [void](ConvertTo-MiTraceUtc $descriptor.StartUtc);[void](ConvertTo-MiTraceUtc $descriptor.EndUtc)
+            if ($null -eq $artifact.ExportDescriptor) {
+                Set-MiTraceMember $artifact 'ExportDescriptor' $descriptor
+                $j=Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $artifact # Flush 意图后才写用户可读描述。
+            } elseif (($artifact.ExportDescriptor|ConvertTo-Json -Compress) -cne ($descriptor|ConvertTo-Json -Compress)) {throw 'Export descriptor/source changed; preserve evidence.'}
+            $descriptorPath=Join-Path (Split-Path -Parent $etl) ($ArtifactId+'.export.json')
+            $json=$descriptor|ConvertTo-Json -Compress
+            if ([IO.File]::Exists($descriptorPath)) {
+                Assert-MiTracePath $descriptorPath
+                if ([IO.File]::ReadAllText($descriptorPath,[Text.UTF8Encoding]::new($false,$true)) -cne $json) {throw 'Incomplete or replaced export descriptor; no overwrite.'}
+            } else {
+                $file=[IO.File]::Open($descriptorPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                try {$bytes=[Text.UTF8Encoding]::new($false).GetBytes($json);$file.Write($bytes,0,$bytes.Length);$file.Flush($true)} finally {$file.Dispose()}
+                Set-MiDiagnosticAccess $descriptorPath $owner
+            }
+            $output=Join-Path (Split-Path -Parent $etl) ($ArtifactId+'.export')
+            if (-not [IO.Directory]::Exists($output)) {[void][IO.Directory]::CreateDirectory($output);Set-MiExportDirectoryAccess $output $owner}
+            return [pscustomobject]@{SchemaVersion=1;State='Prepared';ArtifactId=$ArtifactId;
+                Guidance='Run Invoke-MiAttributionExport from installed Analyzer.ps1 in a standard-user PowerShell 5.1 session. CSV/Findings remain user-owned and never grant privileged actions.'}
+        } finally {$lock.Dispose()}
+    } finally {$lease.Dispose()}
 }
 function Set-MiDiagnosticAccess {
     param([string]$Path,[string]$OwnerSid,[switch]$Directory)
@@ -1518,7 +1616,8 @@ function Test-MiEtlArtifact {
         }
         [void]$sha.TransformFinalBlock($buffer,0,0)
         return [pscustomobject]@{SizeBytes=$stream.Length;Sha256=([BitConverter]::ToString($sha.Hash)).Replace('-','');
-            EventCount=$validation.EventCount;EventsLost=$validation.EventsLost;BuffersLost=$validation.BuffersLost}
+            EventCount=$validation.EventCount;EventsLost=$validation.EventsLost;BuffersLost=$validation.BuffersLost;
+            StartUtc=[datetime]::FromFileTimeUtc($validation.StartTime).ToString('o');EndUtc=[datetime]::FromFileTimeUtc($validation.EndTime).ToString('o')}
     } finally {$stream.Dispose();$sha.Dispose()}
 }
 function Complete-MiWprArtifact {

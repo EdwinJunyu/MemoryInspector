@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-M7 / V3-M4 protected, short-lived executor. Fixed service and trace operations only.
+M7 / V3-M5 protected, short-lived executor. Fixed service and trace operations only.
 Unaccepted WPR features remain disabled by the code-level release policy. Unknown identity, invalid ACL, changed binary, missing audit or
 running dependents always fails closed. Never kills a service host process.
 #>
@@ -12,7 +12,8 @@ param(
     [ValidateSet('Memory','File')][string]$RecordingMode='Memory',
     [ValidateRange(300,1800)][int]$DurationSeconds=300,
     [string]$TraceSessionId='',
-    [string]$HeapImagePath=''
+    [string]$HeapImagePath='',
+    [string]$ArtifactId=''
 )
 $ErrorActionPreference='Stop'
 $exitCode=2
@@ -36,8 +37,11 @@ try {
     if (($PSBoundParameters.ContainsKey('TraceSessionId') -and $Operation -cne 'TraceStop') -or
         ($Operation -ceq 'TraceStop' -and -not (Test-MiGuidN $TraceSessionId))) {throw 'Unexpected or invalid trace session parameter.'}
     if ($PSBoundParameters.ContainsKey('HeapImagePath') -and ($Operation -cne 'TraceStart' -or $TraceType -cne 'Heap')) {throw 'Unexpected Heap image parameter.'}
+    if (($PSBoundParameters.ContainsKey('ArtifactId') -and $Operation -cne 'TraceExportPrepare') -or
+        ($Operation -ceq 'TraceExportPrepare' -and -not (Test-MiGuidN $ArtifactId))) {throw 'Unexpected or invalid export artifact parameter.'}
     if ($Operation -cin @('TraceStart','TraceStop')) {Assert-MiWprReleaseAccepted}
     if ($Operation -ceq 'TraceStart' -and $TraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
+    if ($Operation -ceq 'TraceExportPrepare') {Assert-MiExportReleaseAccepted}
     $paths=Assert-MiTrustedInstallation
     if (-not [string]::Equals(
         [IO.Path]::GetFullPath($root).TrimEnd('\'),
@@ -82,6 +86,9 @@ try {
     } elseif ($Operation -ceq 'TraceStop') {
         Invoke-MiWprStop $TraceSessionId
         Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -State 'DISPATCHED' -Reason ('Asynchronous stop for '+$TraceSessionId)
+        $exitCode=0
+    } elseif ($Operation -ceq 'TraceExportPrepare') {
+        Initialize-MiArtifactExport $ArtifactId|Format-List
         $exitCode=0
     } elseif ($Operation -ceq 'TraceArtifacts') {
         $lock=Enter-MiTraceLock

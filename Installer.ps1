@@ -24,6 +24,7 @@ $lock=$null
 $stage=$null; $backup=$null; $oldManifest=$null; $registrationAttempted=$false; $journalReady=$false
 $swap=[pscustomobject]@{OldInstallMoved=$false;StageInstalled=$false;OldManifestMoved=$false;NewManifestInstalled=$false;Backup=$null;OldManifest=$null}
 try {
+    Set-MiProtectedFileAcl $paths.DeploymentLease $true # M5 普通分析只获共享读取，不能修改部署状态。
     $lock=Enter-MiTraceLock
     $wasM2=$false
     if ([IO.Directory]::Exists($paths.Install)) {

@@ -1,9 +1,267 @@
 ﻿#requires -Version 5.1
 <#
 Milestone 3 / v0.0.3: READ-ONLY anomaly detection.
-No process/service actions. Private Bytes trends are heuristics, NOT leak proof.
+No target process/service actions. Private Bytes trends are heuristics, NOT leak proof.
 Analyzes immutable scalar snapshots from Collector and historical JSONL from M2.
 #>
+$script:MiAnalyzerModulePath=$PSCommandPath
+# V3-M5：适配器只在普通用户运行。表、单位、Profile 与版本必须在受审阅源码中固定。
+function Get-MiWpaExportContract {
+    param([ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType)
+    # GUID 来源为 Microsoft 的实际 Profile；这里只构造最小表，不复制外部 Profile/插件配置。
+    $tables=@{
+        VirtualAlloc=@('e6a4a964-3a87-46ef-9762-f9d9b9208051','cfe19628-6612-4e45-ad6e-84b7423c8132','f3e2404e-9274-48de-ba7a-81b10ac0d8e3','355d0688-9ebd-41af-b2c4-0dc0f4294eaa')
+        Heap=@('1a64d983-f796-45f8-aa64-ac50b95d0e45','06155709-500b-4182-8944-29665014b5c2','fe123e27-eca6-461a-9a1b-b98056a84feb','29a4dfc2-cd62-4de8-85c3-f580af6a47dd')
+        Pool=@('bbc8f512-a49b-451a-90fc-8497f20cfad7','531557e0-ebf1-431c-b888-eec2c701c130',$null,'2bceca1e-67f0-4e41-b2d8-f1c8cad0dd4b')
+    }
+    $ids=$tables[$TraceType];$label=if ($TraceType -ceq 'Pool') {'Pool Tag'} else {'Process'}
+    $columns='<Column Guid="'+$ids[1]+'" Name="'+$label+'" IsVisible="true"/>'
+    if ($null -ne $ids[2]) {$columns+='<Column Guid="'+$ids[2]+'" Name="Type" IsVisible="true"/>'}
+    $columns+='<Column Guid="'+$ids[3]+'" Name="Size" AggregationMode="Sum" IsVisible="true"/>'
+    $keys=if ($TraceType -ceq 'Pool') {1} else {2}
+    $xml='<?xml version="1.0" encoding="utf-8"?><WpaProfileContainer xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Version="2" xmlns="http://tempuri.org/SerializableElement.xsd">'+
+        '<Content xsi:type="WpaProfile2"><Sessions><Session Index="0"/></Sessions><Views><View Guid="9ab7a932-50f1-45d9-b053-ad00fa78a9b5" IsVisible="true" Title="MemoryInspector">'+
+        '<Graphs><Graph Guid="'+$ids[0]+'" LayoutStyle="All" IsShown="true"><Preset Name="MiAllocatedBytes" GraphChartType="StackedLine" AggregationOverTime="OutstandingPeak" GraphColumnCount="'+($keys+1)+
+        '" KeyColumnCount="'+$keys+'"><Columns>'+$columns+'</Columns></Preset></Graph></Graphs><SessionIndices><SessionIndex>0</SessionIndex></SessionIndices></View></Views><ModifiedGraphs/></Content></WpaProfileContainer>'
+    return [pscustomobject]@{SchemaVersion=1;TraceType=$TraceType;ProfileId=('Mi'+$TraceType+'AllocatedBytesV1');Xml=$xml;
+        # 未取得实际工具导出证据，不臆造可支持版本/表头/字节单位；候选 Profile 不能用于实际派发。
+        AcceptedVersions=@();Headers=@();SizeColumn=$null;ByteMultiplier=$null;LabelColumn=$label;
+        MetricName=($TraceType+'.ExportedAllocatedBytes');CsvPattern='Mi_*.csv'}
+}
+function Get-MiWpaExporterIdentity {
+    $candidates=@((Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Windows Performance Toolkit\wpaexporter.exe'),
+        (Join-Path $env:ProgramFiles 'Windows Kits\10\Windows Performance Toolkit\wpaexporter.exe'))
+    foreach ($path in $candidates) {
+        if (-not [IO.File]::Exists($path)) {continue}
+        Assert-MiTracePath (Split-Path -Parent $path)
+        if (-not (Test-MiNoReparse $path) -or -not (Test-MiAclRestricted $path $false)) {throw 'Untrusted WPAExporter binary.'}
+        $signature=Get-AuthenticodeSignature -LiteralPath $path
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {throw 'WPAExporter Microsoft signature not verified.'}
+        return [pscustomobject]@{SchemaVersion=1;Path=$path;Version=(Get-Item -LiteralPath $path).VersionInfo.FileVersion;
+            Sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash}
+    }
+    return $null
+}
+function Get-MiAttributionExportAvailability {
+    param([ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType='VirtualAlloc')
+    if (-not (Get-Command Get-MiExportReleaseStatus -ErrorAction SilentlyContinue)) {. (Join-Path $PSScriptRoot 'PrivilegeSecurity.ps1')}
+    $tool=$null;$errorCode=$null
+    try {$tool=Get-MiWpaExporterIdentity} catch {$errorCode=$_.Exception.Message}
+    $contract=Get-MiWpaExportContract $TraceType
+    $supported=$null -ne $tool -and $contract.AcceptedVersions -ccontains $tool.Version -and $contract.Headers.Count -gt 0 -and $contract.ByteMultiplier -eq 1
+    $releaseReady=$true;try {Assert-MiExportReleaseAccepted} catch {$releaseReady=$false}
+    return [pscustomobject]@{SchemaVersion=1;State=if ($supported -and $releaseReady) {'Available'} else {'AnalysisUnavailable'};Tool=$tool;ProfileSupported=$supported;ReleaseReady=$releaseReady;
+        Release=(Get-MiExportReleaseStatus);ErrorCode=if ($errorCode) {$errorCode} elseif ($null -eq $tool) {'WPAExporterMissing'} elseif (-not $supported) {'ProfileOrVersionUnsupported'} else {$null};
+        ManualGuidance='Keep the ETL. In a standard-user session, open the owned .etl from diagnostics/<OwnerSid> in Microsoft WPA and choose the matching memory table. No automatic launch, elevation, upload or symbol download.'}
+}
+function ConvertFrom-MiWpaCsv {
+    param([string]$Path,$Descriptor,$Contract,[string]$SymbolStatus='NotRequested',[ValidateRange(1,16777216)][int]$MaxFindingBytes=16777216)
+    if ($Contract.ByteMultiplier -ne 1 -or $Contract.Headers.Count -lt 2 -or $Contract.Headers[-1] -cne $Contract.SizeColumn -or
+        $Contract.Headers -cnotcontains $Contract.LabelColumn) {throw 'Unverified export column/unit contract.'}
+    $start=ConvertTo-MiTraceUtc $Descriptor.StartUtc;$end=ConvertTo-MiTraceUtc $Descriptor.EndUtc
+    if ($end -lt $start) {throw 'Invalid ETL evidence time range.'}
+    if (-not (Test-MiNoReparse $Path) -or (Get-Item -LiteralPath $Path).Length -gt 67108864) {throw 'CSV is untrusted or too large.'}
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $reader=[IO.StreamReader]::new($stream,[Text.UTF8Encoding]::new($false,$true),$true)
+    $parser=[Microsoft.VisualBasic.FileIO.TextFieldParser]::new($reader)
+    $parser.SetDelimiters(',');$parser.HasFieldsEnclosedInQuotes=$true;$parser.TrimWhiteSpace=$false
+    $findings=New-Object 'System.Collections.Generic.List[object]';$seen=New-Object 'System.Collections.Generic.HashSet[string]';$rows=0;$findingBytes=0L
+    try {
+        $header=$parser.ReadFields()
+        if ($null -eq $header -or ($header -join "`0") -cne ($Contract.Headers -join "`0") -or @($header|Select-Object -Unique).Count -ne $header.Count) {throw 'Unexpected/duplicate CSV columns; no guessed aliases or units.'}
+        while (-not $parser.EndOfData) {
+            $fields=$parser.ReadFields()
+            if (++$rows -gt 100000 -or $fields.Count -ne $header.Count) {throw 'CSV row bound/shape invalid.'}
+            if (@($fields|Where-Object {$_.Length -gt 4096 -or $_ -match '[\x00-\x1f]'}).Count -gt 0) {throw 'CSV field bound/control character invalid.'}
+            $row=@{};for ($i=0;$i -lt $header.Count;$i++) {$row[$header[$i]]=$fields[$i]}
+            $label=[string]$row[$Contract.LabelColumn];$raw=[string]$row[$Contract.SizeColumn];$size=0L
+            if ($label.Length -eq 0 -or $label.Length -gt 4096 -or $label -match '[\x00-\x1f]' -or $label -match '^[=+@-]' -or
+                $label -imatch '^(total|grand total)$' -or $raw -cnotmatch '^\d{1,19}$' -or
+                -not [long]::TryParse($raw,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$size)) {throw 'Invalid CSV label/integer bytes; reject totals, formulas, rounding and overflow.'}
+            $key=($fields[0..($fields.Count-2)] -join "`0")
+            if (-not $seen.Add($key)) {throw 'Duplicate/aggregate CSV scope; do not double-count.'}
+            $scope=[ordered]@{};foreach ($name in $header[0..($header.Count-2)]) {$scope[$name]=$row[$name]}
+            $loss=$Descriptor.EventLossStatus
+            if ($loss -cnotin @('NoLossReported','LossReported')) {$loss='Unknown'}
+            $finding=[pscustomobject]@{SchemaVersion=1;FindingId=[guid]::NewGuid().ToString('N');Category=$Descriptor.TraceType;
+                TimeRangeUtc=[pscustomobject]@{StartUtc=$start.ToString('o');EndUtc=$end.ToString('o')};MetricName=$Contract.MetricName;
+                ObservedBytes=$size;GrowthBytes=$null;SourceType='WPAExporter';ProcessInstanceId=$null;TraceSessionId=$Descriptor.TraceSessionId;
+                MeasurementQuality=if ($loss -ceq 'NoLossReported') {'Complete'} else {'Partial'};AttributionConfidence='DirectlyObserved';EventLossStatus=$loss;
+                SourceProcessLabel=$label;SourceScope=[pscustomobject]$scope;SymbolStatus=$SymbolStatus;Limitations=@('Only the accepted CSV table metric is observed; allocation totals are not current RAM or retained bytes.',
+                    'CSV labels/PIDs are not verified process-instance identities. No live-process association or action authority.',
+                    'Growth and leak status cannot be inferred from this table. Symbol resolution is not verified by exporter exit code.');
+                SuggestedNextStep='Inspect the preserved ETL and matching WPA table; missing symbols do not mean no anomaly.'}
+            # 小 CSV 的逐行说明可能放大成很大的结果；在积累对象前限制实际序列化 UTF-8 字节数。
+            $findingBytes+=[Text.Encoding]::UTF8.GetByteCount(($finding|ConvertTo-Json -Compress -Depth 8))+1
+            if ($findingBytes -gt $MaxFindingBytes) {throw 'Normalized Findings exceed the output budget; source CSV retained.'}
+            $findings.Add($finding)
+        }
+    } finally {$parser.Dispose();$reader.Dispose();$stream.Dispose()}
+    return [pscustomobject]@{SchemaVersion=1;State=if ($rows -eq 0) {'AnalysisPartial'} else {'Complete'};Findings=$findings.ToArray();RowCount=$rows}
+}
+function Initialize-MiExporterNative {
+    if ('MemoryInspector.ExportNative' -as [type]) {return}
+    if ([Environment]::Is64BitProcess -ne $true) {throw 'Exporter worker requires x64.'}
+    # 只为本次创建的普通权限子进程建立 Job。先挂入 Job 再恢复线程，父进程崩溃不会遗留导出器。
+    $source=@'
+using System;
+using System.Text;
+using System.IO;
+using System.Diagnostics;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace MemoryInspector {
+ public static class ExportNative {
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct Startup {public uint Size;public string Reserved,Desktop,Title;public uint X,Y,XSize,YSize,XChars,YChars,Fill,Flags;public ushort Show,ReservedSize;public IntPtr ReservedPointer,Input,Output,Error;}
+  [StructLayout(LayoutKind.Sequential)] struct Pi {public IntPtr Process,Thread;public uint Id,ThreadId;}
+  [StructLayout(LayoutKind.Sequential)] struct Basic {public long ProcessTime,JobTime;public uint Flags;public UIntPtr Min,Max;public uint Active;public UIntPtr Affinity;public uint Priority,Scheduling;}
+  [StructLayout(LayoutKind.Sequential)] struct Io {public ulong ReadOps,WriteOps,OtherOps,ReadBytes,WriteBytes,OtherBytes;}
+  [StructLayout(LayoutKind.Sequential)] struct Extended {public Basic Basic;public Io Io;public UIntPtr ProcessMemory,JobMemory,PeakProcess,PeakJob;}
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,ExactSpelling=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string dir,ref Startup si,out Pi pi);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,ExactSpelling=true)] static extern IntPtr CreateJobObjectW(IntPtr a,string name);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j,int type,ref Extended value,uint size);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr thread);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h,uint ms);
+  [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr p,out uint code);
+  [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr j,uint code);
+  [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr p,uint code);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  static long Bytes(string root) {
+   long size=0;int count=0;var folders=new System.Collections.Generic.Queue<string>();folders.Enqueue(root);
+   while(folders.Count>0)foreach(string path in Directory.GetFileSystemEntries(folders.Dequeue())) {
+    if(++count>10000)throw new IOException("Exporter file count limit");var attr=File.GetAttributes(path);
+    if((attr&FileAttributes.ReparsePoint)!=0)throw new IOException("Exporter reparse output");
+    if((attr&FileAttributes.Directory)!=0)folders.Enqueue(path);else size=checked(size+new FileInfo(path).Length);
+   }return size;
+  }
+  public static int Run(string exe,string args,string directory,string env,string output) {
+   IntPtr job=CreateJobObjectW(IntPtr.Zero,null),block=IntPtr.Zero;Pi pi=new Pi();bool assigned=false;
+   if(job==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error());
+   try {
+    Extended limit=new Extended();limit.Basic.Flags=0x2000|0x200|0x8;limit.Basic.Active=1;limit.JobMemory=new UIntPtr(1073741824u);
+    if(!SetInformationJobObject(job,9,ref limit,(uint)Marshal.SizeOf(typeof(Extended))))throw new Win32Exception(Marshal.GetLastWin32Error());
+    block=Marshal.StringToHGlobalUni(env);Startup startup=new Startup();startup.Size=(uint)Marshal.SizeOf(typeof(Startup));
+    if(!CreateProcessW(exe,new StringBuilder("\""+exe+"\" "+args),IntPtr.Zero,IntPtr.Zero,false,0x08000404,block,directory,ref startup,out pi))throw new Win32Exception(Marshal.GetLastWin32Error());
+    if(!AssignProcessToJobObject(job,pi.Process))throw new Win32Exception(Marshal.GetLastWin32Error());assigned=true;
+    if(ResumeThread(pi.Thread)==uint.MaxValue)throw new Win32Exception(Marshal.GetLastWin32Error());
+    Stopwatch timer=Stopwatch.StartNew();
+    while(WaitForSingleObject(pi.Process,250)==258) {
+     if(timer.Elapsed.TotalSeconds>120 || Bytes(output)>67108864 || new DriveInfo(Path.GetPathRoot(output)).AvailableFreeSpace<2147483648L)throw new IOException("Exporter time/output/disk budget limit");
+    }
+    uint code;if(!GetExitCodeProcess(pi.Process,out code) || code==259)throw new IOException("Exporter outcome unknown; no retry");
+    if(Bytes(output)>67108864)throw new IOException("Exporter output budget exceeded");return unchecked((int)code);
+   }finally{
+    if(pi.Process!=IntPtr.Zero) {if(assigned)TerminateJobObject(job,125);else TerminateProcess(pi.Process,125);WaitForSingleObject(pi.Process,5000);CloseHandle(pi.Process);}
+    if(pi.Thread!=IntPtr.Zero)CloseHandle(pi.Thread);CloseHandle(job);if(block!=IntPtr.Zero)Marshal.FreeHGlobal(block);
+   }
+  }
+ }
+}
+'@
+    Add-Type -TypeDefinition $source -ReferencedAssemblies System.dll -ErrorAction Stop
+}
+function Invoke-MiWpaExportProcess {
+    param($Tool,[string]$Etl,[string]$Profile,[string]$Output,[string]$Cache,[switch]$Online)
+    if (Test-MiAdminToken) {throw 'WPAExporter must not run elevated.'}
+    foreach ($path in @($Tool.Path,$Etl,$Profile,$Output,$Cache)) {if ($path -match '["\r\n\x00]' -or $path.EndsWith('\')) {throw 'Unsafe fixed export argument.'}}
+    $fresh=Get-MiWpaExporterIdentity
+    if ($null -eq $fresh -or ($fresh|ConvertTo-Json -Compress) -cne ($Tool|ConvertTo-Json -Compress)) {throw 'Exporter identity changed.'}
+    $args='-i "'+$Etl+'" -profile "'+$Profile+'" -delimiter , -prefix Mi_ -outputfolder "'+$Output+'"'
+    if ($Online) {$args+=' -symbols'}
+    $symbols=if ($Online) {'srv*'+$Cache+'*https://msdl.microsoft.com/download/symbols'} else {$Cache}
+    $system=[Environment]::GetFolderPath('System');$windows=[Environment]::GetFolderPath('Windows')
+    # 空 _NT_SYMBOL_PATH 会回落在线默认。使用非空本地目录并清除继承环境；不改用户/机器设置。
+    $variables=New-Object 'System.Collections.Generic.SortedDictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($pair in @(@('PATH',$system),@('SystemRoot',$windows),@('TEMP',$Output),@('TMP',$Output),@('WINDIR',$windows),
+        @('_NT_SYMBOL_PATH',$symbols),@('_NT_ALT_SYMBOL_PATH',$Cache),@('_NT_SYMCACHE_PATH',$Cache))) {$variables.Add($pair[0],$pair[1])}
+    $environment=(($variables.Keys|ForEach-Object {$_+'='+$variables[$_]}) -join "`0")+"`0`0"
+    Initialize-MiExporterNative
+    return [MemoryInspector.ExportNative]::Run($Tool.Path,$args,(Split-Path -Parent $Profile),$environment,(Split-Path -Parent $Profile))
+}
+function Invoke-MiAttributionExport {
+    param([string]$ArtifactId,[switch]$OnlineSymbols)
+    if (-not (Get-Command Get-MiExportReleaseStatus -ErrorAction SilentlyContinue)) {. (Join-Path $PSScriptRoot 'PrivilegeSecurity.ps1')}
+    # 门控、身份拒绝在任何写入/网络确认前发生；无参数可指定程序/Profile/目录/服务器。
+    Assert-MiExportReleaseAccepted
+    if (Test-MiAdminToken) {throw 'Use a standard-user session for attribution export.'}
+    if (-not (Test-MiGuidN $ArtifactId)) {throw 'Invalid export artifact identity.'}
+    $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($owner -cnotmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') {throw 'Interactive user identity required.'}
+    $paths=Get-MiSecurityPaths;$lease=$null;$descriptorHandle=$null;$etlHandle=$null;$claim=$null
+    try {
+        Assert-MiTracePath $paths.DeploymentLease
+        $lease=[IO.File]::Open($paths.DeploymentLease,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $directory=Join-Path $paths.TraceArtifacts $owner;$descriptorPath=Join-Path $directory ($ArtifactId+'.export.json')
+        Assert-MiTracePath $directory;Assert-MiTracePath $descriptorPath
+        $descriptorHandle=[IO.File]::Open($descriptorPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        if ($descriptorHandle.Length -gt 32768) {throw 'Export descriptor exceeds bound.'}
+        $text=[IO.File]::ReadAllText($descriptorPath,[Text.UTF8Encoding]::new($false,$true));$descriptor=$text|ConvertFrom-Json -ErrorAction Stop
+        if (($descriptor|ConvertTo-Json -Compress) -cne $text -or @($descriptor.PSObject.Properties).Count -ne 11 -or
+            $descriptor.SchemaVersion -ne 1 -or $descriptor.ArtifactId -cne $ArtifactId -or $descriptor.OwnerSid -cne $owner -or
+            -not (Test-MiGuidN $descriptor.TraceSessionId) -or $descriptor.Sha256 -cnotmatch '^[A-F0-9]{64}$' -or
+            $descriptor.SizeBytes -le 0 -or $descriptor.SizeBytes -gt 8589934592) {throw 'Untrusted export descriptor.'}
+        $source=[IO.Path]::GetFullPath($script:MiAnalyzerModulePath)
+        if ([IO.Path]::GetDirectoryName($source) -ine $paths.Install -or $descriptor.AnalyzerSha256 -cnotmatch '^[A-F0-9]{64}$') {throw 'Analysis requires the protected installed component.'}
+        Assert-MiTracePath $source # 描述中的摘要是准备者版本；当前受保护组件可兼容读取历史 Schema。
+        $availability=Get-MiAttributionExportAvailability $descriptor.TraceType
+        if ($availability.State -cne 'Available') {return $availability}
+        $contract=Get-MiWpaExportContract $descriptor.TraceType
+        $etl=Join-Path $directory ($ArtifactId+'.etl');Assert-MiTracePath $etl
+        $etlHandle=[IO.File]::Open($etl,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $verified=Test-MiEtlArtifact $etl
+        if ($verified.Sha256 -cne $descriptor.Sha256 -or $verified.SizeBytes -ne $descriptor.SizeBytes -or
+            $verified.StartUtc -cne $descriptor.StartUtc -or $verified.EndUtc -cne $descriptor.EndUtc -or
+            $descriptor.EventLossStatus -cne $(if ($verified.EventsLost -gt 0 -or $verified.BuffersLost -gt 0) {'LossReported'} else {'NoLossReported'})) {throw 'ETL integrity/time/loss changed; no trusted Findings.'}
+        $outputRoot=Join-Path $directory ($ArtifactId+'.export')
+        if (-not (Test-MiNoReparse $outputRoot) -or (Measure-MiProtectedTree $paths.TraceArtifacts) -gt (8589934592-67108864)) {throw 'Diagnostic output path/storage budget unavailable.'}
+        $claim=[IO.File]::Open((Join-Path $outputRoot 'export.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        $analysisId=[guid]::NewGuid().ToString('N');$online=$false
+        if ($OnlineSymbols) {
+            if (-not (Get-MiExportReleaseStatus).OnlineAccepted) {throw 'Online symbol policy acceptance pending.'}
+            $answer=Read-Host ('Download symbols from https://msdl.microsoft.com/download/symbols into this attempt cache for stack analysis. Type SYMBOLS '+$analysisId+' to authorize once; Enter continues offline')
+            $online=$answer -ceq ('SYMBOLS '+$analysisId)
+        }
+        $work=Join-Path $outputRoot $analysisId;[void][IO.Directory]::CreateDirectory($work)
+        $profilePath=Join-Path $work 'memory.wpaProfile';[IO.File]::WriteAllText($profilePath,$contract.Xml,[Text.UTF8Encoding]::new($false))
+        $cache=Join-Path $work 'symbols';$output=Join-Path $work 'csv'
+        [void][IO.Directory]::CreateDirectory($cache);[void][IO.Directory]::CreateDirectory($output)
+        $intent=[pscustomobject]@{SchemaVersion=1;AnalysisId=$analysisId;ArtifactId=$ArtifactId;State='DispatchIntent';OnlineAuthorized=$online;
+            ProfileId=$contract.ProfileId;ProfileSha256=(Get-MiTraceHash $contract.Xml);Tool=$availability.Tool;Utc=[datetime]::UtcNow.ToString('o')}
+        $intentFile=[IO.File]::Open((Join-Path $work 'intent.json'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try {$bytes=[Text.UTF8Encoding]::new($false).GetBytes(($intent|ConvertTo-Json -Compress));$intentFile.Write($bytes,0,$bytes.Length);$intentFile.Flush($true)} finally {$intentFile.Dispose()}
+        $symbolStatus=if ($online) {'OnlineRequestedUnverified'} else {'NotRequested'}
+        try {
+            $exitCode=Invoke-MiWpaExportProcess $availability.Tool $etl $profilePath $output $cache -Online:$online
+            if ($exitCode -ne 0 -and $online) {
+                # 仅在子进程已确认退出时，另存一次无符号结果；未知/超时异常不重派发。
+                $output=Join-Path $work 'csv-offline';[void][IO.Directory]::CreateDirectory($output)
+                $symbolStatus='OnlineFailedOfflineFallback'
+                $exitCode=Invoke-MiWpaExportProcess $availability.Tool $etl $profilePath $output $cache
+            }
+            if ($exitCode -ne 0) {throw 'Exporter returned a known failure.'}
+            $csv=@(Get-ChildItem -LiteralPath $output -Filter $contract.CsvPattern -File -ErrorAction Stop)
+            if ($csv.Count -ne 1) {$result=[pscustomobject]@{SchemaVersion=1;State='AnalysisPartial';Findings=@();ErrorCode='ExpectedTableMissingOrAmbiguous'}}
+            else {$result=ConvertFrom-MiWpaCsv $csv[0].FullName $descriptor $contract $symbolStatus}
+        } catch {$result=[pscustomobject]@{SchemaVersion=1;State='AnalysisPartial';Findings=@();ErrorCode=$_.Exception.Message}}
+        $result|Add-Member NoteProperty AnalysisId $analysisId
+        $result|Add-Member NoteProperty ArtifactId $ArtifactId
+        $result|Add-Member NoteProperty SymbolStatus $symbolStatus
+        $result|Add-Member NoteProperty ResultTrust 'UserOwnedDiagnosticOnly'
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes(($result|ConvertTo-Json -Compress -Depth 10))
+        # 原生导出器退出后，归一化本身也消耗工作区/全局额度；写结果前重新测量，绝不先写大文件再删。
+        $workBytes=Measure-MiExportOutput $work;$allBytes=Measure-MiProtectedTree $paths.TraceArtifacts
+        $free=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($work))).AvailableFreeSpace
+        if ($bytes.Length -gt (67108864-$workBytes) -or $bytes.Length -gt (8589934592-$allBytes) -or $free -lt (2147483648L+$bytes.Length)) {
+            return [pscustomobject]@{SchemaVersion=1;State='AnalysisPartial';AnalysisId=$analysisId;ArtifactId=$ArtifactId;Findings=@();
+                ErrorCode='NormalizedResultStorageBudgetExceeded';ResultPersisted=$false;ResultTrust='UserOwnedDiagnosticOnly'}
+        }
+        $file=[IO.File]::Open((Join-Path $work 'result.json'),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try {$file.Write($bytes,0,$bytes.Length);$file.Flush($true)} finally {$file.Dispose()}
+        return $result
+    } finally {foreach ($handle in @($claim,$etlHandle,$descriptorHandle,$lease)) {if ($null -ne $handle) {$handle.Dispose()}}}
+}
 function Get-MiMedian {
     param([object[]]$Values)
     if ($null -eq $Values -or $Values.Count -eq 0) { return $null }

@@ -69,6 +69,19 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 开发回归使用真实 Journal/文件故障夹具，注册表修改与 WPR 启停使用测试替身。实际 IFEO 启用/恢复、有效 Heap ETL、SYSTEM、故障/重启与 Windows 10/11 兼容性和性能均未验收，不能宣布 Preview C / Stable v3。详见 [M4 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m4heap-configuration-transactions)。
 
+## V3-M5 — Automated Attribution Export（开发实现，发布门关闭）
+
+在现有 Analyzer、PrivilegeSecurity 与执行器内实现 ETL → 固定 WPAExporter 适配器 → 严格 CSV → AttributionFinding。M2–M4 真实部署/追踪/恢复验收仍缺失，本机也没有 WPAExporter；WPR、Heap 及 M5 离线/联网/归一化发布门全部保持关闭。**实际支持版本与 CSV 表头/单位的接受列表为空**，候选 XML 通过解析不代表 WPA 兼容；不得据模拟测试开放功能。
+
+- 固定 `TraceExportPrepare -ArtifactId` 只为已保存、已清理、属于确认账户的 ETL 写受保护描述和专属输出目录。重新消费 ETL 并核验大小、摘要、实际时间范围和事件丢失。受保护层不启动 WPAExporter，不解析用户 CSV，也不从 Finding 获得动作权限。
+- 之后在普通用户 PS5.1 会话加载已安装的 Analyzer，调用 `Invoke-MiAttributionExport -ArtifactId <id>`。工作进程默认离线，拒绝管理员/SYSTEM；没有程序、Profile、输出路径或服务器自由参数。GUI 调用整合属于 M7。缺失/不支持工具返回 AnalysisUnavailable，并保留 ETL 和 WPA 手动分析指引。
+- 普通分析持有共享只读部署租约和 ETL 读句柄，阻止升级/卸载和活动文件归档。WPAExporter 使用固定完整路径、Microsoft 签名与摘要身份；先挂入专用 Job 再运行，只管理本次创建的导出器。工程初值为 120 秒、1 GiB Job 内存、单进程、每次工作区 64 MiB、磁盘预留 2 GiB；CSV、缓存及结果继续计入原诊断数据 8 GiB 软预算。归一化 Findings 累计限制 16 MiB，结果写入前再次复核全部存储余量；无法读取预算或超限时拒绝，不补零。
+- `-OnlineSymbols` 每次询问新的分析 ID、用途、Microsoft 符号服务器与本次缓存目录；取消则离线。只设置子进程的非空本地符号路径/专属缓存，授权不持久复用。联网已知失败且子进程退出后可另存一次离线结果；超时/未知结果不重派发。实际网络隔离与版本行为仍待验收。
+- CSV 拒绝未知表头/单位、重复范围、非法引号/UTF-8、控制字符、负数/小数/溢出和汇总行；缺表或空表为 AnalysisPartial。数值保留 Int64 精度；只报告被接受表的分配量口径，GrowthBytes 与 ProcessInstanceId 保持 null，不映射到当前 PID、RAM 或泄漏结论。事件丢失降低质量，符号状态和局限单列。
+- 分析结果属于用户诊断数据，不回写受保护 TraceSession 的历史分析结论，不供高权限执行器执行。当前候选 Profile/版本矩阵尚未接受，真实有效 ETL/CSV、符号、Job、跨用户读取与资源压力验收保持关闭；VERSION 仍为 0.0.9。
+
+实现、审阅与测试边界见 [M5 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m5automated-attribution-export)。
+
 ### 归因页界面约定
 
 本次为现有 Windows 桌面界面的局部扩展，复用 `New-MiV4DataGrid`、`New-MiLabel` 和主窗口的配色/中文字体，不创建新的 UI 模块或改变已有操作页。Microsoft YaHei UI、浅色背景 `#F3F6FB`、正文 `#17283E`、分隔线 `#DDE5EE` 仍由 MemoryInspector.ps1 统一拥有。原生 TabControl/ComboBox/DataGridView 负责键盘、焦点和内部滚动；归因页的多选是只读诊断特例。未知值显示“不可用”，失效结果清空，选择仅跟随精确实例；后台采集与趋势分析在 Worker 中执行，界面只排版结果。设置、历史、服务及危险确认流程沿用原行为。

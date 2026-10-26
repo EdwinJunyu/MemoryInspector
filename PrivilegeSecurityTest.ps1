@@ -359,7 +359,7 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))} 'actual release gate'
     Assert-M3Rejected {Invoke-MiWprStop ([guid]::NewGuid().ToString('N'))} 'actual stop release gate'
     Assert-M3Rejected {Repair-MiWprSavedArtifacts} 'actual recovery release gate'
-    foreach ($operation in @('TraceStart','TraceStop','TraceArtifacts')) {
+    foreach ($operation in @('TraceStart','TraceStop','TraceArtifacts','TraceExportPrepare')) {
         if (-not (Test-MiPrivilegedOperation $operation $id)) {throw 'Fixed M3 protocol rejected.'}
         if (Test-MiPrivilegedOperation $operation $id 'RpcSs') {throw 'M3 protocol accepted service payload.'}
     }
@@ -384,6 +384,9 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N')) 'Heap' 'Memory' 300 'C:\fixture.exe'} 'M4 actual release gate'
     Assert-M3Rejected {Repair-MiHeapTransactions} 'M4 actual recovery release gate'
     Assert-M3Rejected {Set-MiHeapConfiguration $null $null} 'M4 actual registry write release gate'
+    Assert-M3Rejected {Initialize-MiArtifactExport ([guid]::NewGuid().ToString('N'))} 'M5 actual descriptor gate'
+    if ((Get-MiExportReleaseStatus).Enabled -or (Get-MiExportReleaseStatus).OfflineAccepted -or (Get-MiExportReleaseStatus).NormalizationAccepted -or
+        (Get-MiExportReleaseStatus).OnlineAccepted) {throw 'M5 actual acceptance gate opened.'}
     if ((Get-MiHeapReleaseStatus).Enabled -or (Get-MiHeapReleaseStatus).ConfigurationAccepted -or (Get-MiHeapReleaseStatus).RecoveryAccepted) {throw 'Heap acceptance gate opened.'}
     foreach ($badName in @('..\evil.exe','evil.exe\child','evil.exe:stream','*.exe','fixture.EXE','a..exe')) {
         Assert-M3Rejected {Assert-MiHeapImageName $badName} 'registry image scope'
@@ -440,7 +443,8 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     function Test-MiEtlArtifact {param($Path)
         $file=Get-Item -LiteralPath $Path -ErrorAction Stop
         if ($file.Length -eq 0) {throw 'Empty fixture ETL'}
-        return [pscustomobject]@{SizeBytes=$file.Length;Sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash;EventCount=3;EventsLost=1;BuffersLost=0}
+        return [pscustomobject]@{SizeBytes=$file.Length;Sha256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash;EventCount=3;EventsLost=1;BuffersLost=0;
+            StartUtc='2026-10-25T00:00:00.0000000Z';EndUtc='2026-10-25T00:05:00.0000000Z'}
     }
     function Add-MiTraceJournalRecord {param($Lock,$ExpectedRevision,$Kind,$Payload)
         if ($Kind -ceq 'Artifact' -and $Payload.State -ceq 'Saving' -and $test.AgeArtifact) {
@@ -785,5 +789,42 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
             } finally {$lock.Dispose()}
         }
         Write-Host 'PASS: M4 owned config transactions, compatible/unknown original values, intent/write/restore crashes, external conflicts, boot recovery and independent ETL/cleanup outcomes (registry/WPR mocked).'
+    }
+    & {
+        function Get-MiExportReleaseStatus {return [pscustomobject]@{Enabled=$true;OfflineAccepted=$true;NormalizationAccepted=$true;OnlineAccepted=$false}}
+        function Get-MiHeapReleaseStatus {return [pscustomobject]@{Enabled=$true;ConfigurationAccepted=$true;RecoveryAccepted=$true}}
+        function Assert-MiTrustedInstallation {return $test.Paths}
+        function Set-MiExportDirectoryAccess {param($Path,$OwnerSid)}
+        New-M3Fixture;$session=Invoke-MiWprStart ([guid]::NewGuid().ToString('N'))
+        $test.Paths|Add-Member NoteProperty Install (Join-Path $test.Paths.Data 'install')
+        [void][IO.Directory]::CreateDirectory($test.Paths.Install)
+        [IO.File]::WriteAllBytes((Join-Path $test.Paths.Install 'Analyzer.ps1'),[IO.File]::ReadAllBytes((Join-Path $root 'Analyzer.ps1')))
+        $lock=Enter-MiTraceLock
+        try {
+            $j=Request-MiWprStop $lock $session;$test.Observed=@();$j=Update-MiWprSession $lock $j.Sessions[$session.TraceSessionId]
+            [IO.File]::WriteAllText((Get-MiWprSessionPaths $session).Output,'Export descriptor source ETL')
+            $test.WriterLive=$false;$j=Update-MiWprSession $lock $j.Sessions[$session.TraceSessionId]
+            $artifact=$j.Artifacts[$session.PlannedArtifactId]
+        } finally {$lock.Dispose()}
+        Assert-M3Rejected {Initialize-MiArtifactExport ([guid]::NewGuid().ToString('N'))} 'unknown export artifact'
+        $prepared=Initialize-MiArtifactExport $artifact.ArtifactId
+        if ($prepared.State -cne 'Prepared' -or $test.Starts -ne 1 -or $test.Stops -ne 1) {throw 'Export preparation launched extra trace/process'}
+        $folder=Split-Path -Parent (Get-MiTraceArtifactPath $artifact);$path=Join-Path $folder ($artifact.ArtifactId+'.export.json')
+        $bytes=[IO.File]::ReadAllBytes($path);$metadata=[Text.Encoding]::UTF8.GetString($bytes)|ConvertFrom-Json
+        if ($metadata.Sha256 -cne $artifact.Sha256 -or $metadata.EventLossStatus -cne 'LossReported' -or
+            -not [IO.Directory]::Exists((Join-Path $folder ($artifact.ArtifactId+'.export')))) {throw 'Export metadata lost source quality/identity'}
+        [void](Initialize-MiArtifactExport $artifact.ArtifactId)
+        [IO.File]::WriteAllText($path,'corrupt')
+        Assert-M3Rejected {Initialize-MiArtifactExport $artifact.ArtifactId} 'corrupt descriptor not overwritten'
+        [IO.File]::WriteAllBytes($path,$bytes)
+        $lock=Enter-MiTraceLock
+        try {
+            $j=Read-MiTraceJournal $lock;$forged=$j.Artifacts[$artifact.ArtifactId]|ConvertTo-Json -Depth 12|ConvertFrom-Json
+            $forged.ExportDescriptor.OwnerSid='S-1-5-21-1-2-3-999'
+            Assert-M3Rejected {Add-MiTraceJournalRecord $lock $j.Revision 'Artifact' $forged} 'forged export descriptor owner'
+        } finally {$lock.Dispose()}
+        [IO.File]::WriteAllText((Join-Path $folder ($artifact.ArtifactId+'.export\result.txt')),'counted user output')
+        if ((Measure-MiProtectedTree $test.Paths.TraceArtifacts) -lt ($artifact.SizeBytes+$bytes.Length+19)) {throw 'Export data omitted from diagnostic budget'}
+        Write-Host 'PASS: M5 protected descriptor intent/source binding, idempotent preparation, corruption refusal and user-output budget (ACL/ETL boundary mocked).'
     }
 }

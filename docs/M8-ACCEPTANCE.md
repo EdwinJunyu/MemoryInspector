@@ -397,4 +397,48 @@ API 依据：[Microsoft Heap 录制与 TracingFlags](https://learn.microsoft.com
 
 M2/M3 既有实机关卡全部保留。M4 还需隔离 Windows 10/11 的真实 IFEO 权限/修改/兼容复用/外部冲突、进程自行重启后的 Heap 生效与有效 ETL、Memory/File 压力、Controller/Watchdog/机器重启与真实恢复故障验收。`[NEEDS CLARIFICATION]` 支持的具体 Windows/WPR/程序类型矩阵与性能参数仍需按冻结规格第 20 节校准，不重新开放 Q1–Q31 决策。上述验收前不开放 Heap，不宣布 Preview C 或 Stable v3；M5/M6/M7 与旧 GUI 内存/采样覆盖问题没有在本次宣称完成。
 
+## 2026-10-25 V3-M5：Automated Attribution Export
+
+冻结依据：[v3 原文](https://docs.google.com/document/d/1GVln-oZKuIPkIR1C-Bh3JouyMhEO0z6X-dAscPpTHr4/edit)第 9、5–8、11–14、16、18 节及 M5；基线 `f40506c7522e3ef4ea65ecfa1e98d016034e08bb`。扩展原 Analyzer、PrivilegeSecurity、ElevatedExecutor、Installer 与原有测试/备注，无新增生产模块。VERSION 仍为 0.0.9；仅本地提交，不推送。
+
+### M2–M4 安全前置条件
+
+本轮 PS Desktop 5.1.22621.6133、Windows 11 build 22631、普通令牌。受保护安装、Journal、Watchdog policy 均不存在；两个固定 ADK WPAExporter 路径均不存在。修改前 M2–M4 安全回归退出 0，但管理员 ACL 分支跳过。M2 SYSTEM/任务/Win10、11、M3 实录/ETL/资源以及 M4 实际 IFEO/故障恢复验收没有完成。因此原门控不变；新增 M5 Enabled/OfflineAccepted/OnlineAccepted/NormalizationAccepted 全部 false，运行适配器和准备描述均在副作用前拒绝。
+
+### 实现与信任边界
+
+- 高权限固定命令 TraceExportPrepare 仅接受 ArtifactId；完整安装/新健康检查、已确认停止/保存/Heap 清理、Artifact 所属账户及 ETL 再消费/哈希/时间范围全部核验后，先向原 Journal 提交不可变 ExportDescriptor，再写对应账户可读的固定描述。损坏/部分描述保留并拒绝覆盖，不猜测重建。描述中的 AnalyzerSha256 记录准备者身份；后续受保护升级可按同一 Schema 读取历史数据，不要求执行旧代码。
+- 普通用户函数 Invoke-MiAttributionExport 只接受 ArtifactId/OnlineSymbols，拒绝管理员与 SYSTEM；只从已安装、ACL 受保护的组件运行。受保护执行器与 Watchdog 不启动 WPAExporter，也不读取或执行用户 CSV/结果。用户输出是 UserOwnedDiagnosticOnly，不回写受保护 Session 历史结果、不生成 ActionGrant，不关联当前 PID。M7 再接 GUI 和异步调用。
+- 部署锁文件增加 Users 只读权限，写入仍限管理员/SYSTEM；导出持共享读取租约，独占升级/卸载不能并行。ETL 读句柄拒绝写入/删除共享，保留策略不能移动正在分析的 ETL。崩溃后 OS 释放句柄；子进程在挂入本次 Job 后才恢复运行，Job 随父进程关闭，仅限制/结束它创建的导出器，不触及诊断目标进程。
+- 候选程序只来自两个固定 ADK 路径，核验 Microsoft 签名、摘要/版本与可信目录；不使用 PATH 查找或用户插件/命令。Profile 从源码生成，移除外部 FileReference/符号/插件配置。VirtualAlloc/Heap 的 Graph/Column GUID 从 Microsoft MSO-Scripts 实际 Profile 核对；Pool GUID 仅作为 Microsoft HOBL 中的事实索引，未复制该目录专有 XML。**当前 AcceptedVersions/Headers 为空，字节单位未确认；任何实际版本均 AnalysisUnavailable，不把候选 XML 或合成 CSV 当作实际表支持。**
+- 默认不带 -symbols，子进程最小环境覆盖非空本地 _NT_SYMBOL_PATH、_NT_ALT_SYMBOL_PATH 与本次 _NT_SYMCACHE_PATH，避免空值回落在线默认。OnlineSymbols 必须独立源码验收门通过，并每次显示分析 ID、下载用途、唯一 Microsoft HTTPS 符号服务器和专属缓存，经准确输入才用于该子进程；取消继续离线，不保存可复用授权。已确认子进程退出且返回已知失败时可另存无符号结果，未知/超时不重试。
+- 子进程 Job 初始限制：1 GiB Job 内存、一个进程、120 秒；工作区含 CSV/缓存每次 64 MiB，磁盘预留 2 GiB。全部用户导出数据继续计入诊断根目录 8 GiB 软预算，拒绝重解析点、无法枚举的目录及预算读取失败；周期检查不是文件系统硬配额。逐 Finding 按实际压缩 UTF-8 累计限制 16 MiB；最终 JSON 写入前再次计量工作区、全局和磁盘余量，超限返回空 Findings 的 AnalysisPartial，不落盘超大结果，不删除源 CSV。多账户目录无法按当前令牌读取时拒绝分析，不把不可见数据当作零。
+- 固定 CSV 契约仅在实际版本/单位接受后使用。严格字段数/唯一表头、整数单位、行/字段/文件上限；拒绝重复范围、汇总行、非法引号/UTF-8/控制字符/公式、小数/负数/溢出。Finding 保留 Int64、来源、实际时间范围、SourceScope、事件丢失、符号状态、局限和下一步；分配表值不当作当前 RAM/保留量/增长。GrowthBytes 与 ProcessInstanceId 为 null，不从进程标签/PID 猜实例。缺表/空表/解析失败为 AnalysisPartial；缺失/不支持工具为 AnalysisUnavailable，ETL 保留并输出普通权限 WPA 手动指引。符号成功不能由退出码证明，缺符号不等于无异常。
+
+### 审阅与验证
+
+GrillMe 标记已按其仓库事实查证工作流核对 Profile/符号路径来源；产品决策沿用冻结文档，没有重新开启 Q1–Q31 或新增 ADR/代码模块。随后按用户要求使用 Review 对固定基线差异进行 Standards/Spec 独立审阅。
+
+### Review：Standards
+
+固定基线 `f40506c`。首轮发现小 CSV 的逐行说明可能放大归一化 JSON，绕过导出器退出前的工作区检查。现按真实序列化字节限制 Findings，并在最终 CreateNew/Flush 前重新复核存储余量；新增归一化放大、结果写入前预算耗尽回归。最终复核无剩余提交阻断项，未新增生产模块，保留中文关键注释、UTF-8 和原有安全阈值。
+
+### Review：Spec
+
+独立审阅确认同一预算缺口，修复后无剩余可确认缺陷。共享部署租约、ETL 读句柄、保留互斥、单次符号授权、未知结果不重派发及降级路径符合冻结要求；没有范围扩张。两轴均属于静态代码与测试审阅，不替代真实 WPAExporter、网络或 Windows 验收。
+
+### 验证与保留证据
+
+AnalyzerTest 的真实 CSV/UTF-8/引号/整数精度、错误拒绝和普通工作流程通过；ETL/工具/ACL/已接受版本为明确测试替身。专用 C# 导出器适配器在 PS5.1 编译通过，普通令牌真实创建两次本次拥有的隐藏 System32 cmd 子进程，经挂入 Job 后执行固定 exit，准确得到 0/7；该探针只验证启动与已知退出码，不计作真实 WPAExporter、Job 故障、压力或网络验收。
+
+全部修复后，在 Windows PowerShell Desktop 5.1.22621.6133 / STA / RemoteSigned 最终重跑 SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test，**八套全部退出 0**。原有六种 WPR Profile 的只读语法验证与实际发布门拒绝继续通过，管理员 ACL 夹具仍跳过。七个修改的 PowerShell 文件均保留 UTF-8 BOM，九个源码/文档严格 UTF-8 解码与 `git diff --check` 通过，没有降低既有阈值或跳过新增行为断言。完整结果为 `final-regression-results.json` 与 `final-*.log`。
+
+前置与后续日志保留在本地忽略目录 `test-artifacts/v3-m5/`，不随源码提交。PrivilegeInstallTest 只增加 disposable runner 的 M5 禁用校验，本机不执行安装。没有注册 SYSTEM 任务、启停 WPR、修改 IFEO、安装 ADK 或下载符号。
+
+### 仍关闭的验收关卡
+
+M2–M4 全部真实安全关卡继续保留。M5 还需在隔离 Windows 10/11 与明确 ADK/WPAExporter 版本中，验收最小 Profile、CSV 表名/表头/字节单位/层级/聚合语义、实际有效 ETL/事件丢失、普通用户 ACL/共享租约、Job/崩溃/超时/磁盘/内存压力、离线无符号流量以及单次服务器/缓存/失败降级。`[NEEDS CLARIFICATION]` 实际版本/表/单位矩阵和资源阈值需按冻结规格第 20 节校准；不能臆造接受版本或放宽检查。未验收保持禁用，不宣布高级诊断或 Stable v3 已可用。M6/M7 与既有 GUI 内存/采样覆盖问题不在本次完成范围。
+
+API/事实来源：[WPAExporter](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/exporter)、[符号路径与默认回落](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/loading-symbols)、[VirtualAlloc Profile](https://github.com/microsoft/MSO-Scripts/blob/main/src/WPAP/VirtualAlloc.wpaProfile)、[Heap Profile](https://github.com/microsoft/MSO-Scripts/blob/main/src/WPAP/Heap.wpaProfile)、[Pool 事实索引](https://github.com/microsoft/HOBL/blob/f183bc4166826c7b617b231b79db6d9f9cd08589/utilities/proprietary/ParsePowerLight/Catalog/WpaRuleMatchExporter.wpaProfile)。文档/源码用于核对契约，不能替代上述实机验收。
+
 API 依据：[WPR 命令与模式](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/wpr-command-line-options)、[命名实例](https://devblogs.microsoft.com/performance-diagnostics/controlling-the-event-session-name-with-the-instance-name/)、[QueryAllTraces 可见性](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-queryalltracesw)、[ETW 会话属性](https://learn.microsoft.com/en-us/windows/desktop/ETW/event-trace-properties)、[OpenTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracew)、[CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)、[Job breakaway / 隐藏进程标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)。文档只证明 API 契约，不替代上述实机验收。

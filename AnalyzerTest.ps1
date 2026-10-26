@@ -533,3 +533,96 @@ Assert-Mi ($logic.Count -eq 1 -and $logic[0].MemberCount -eq 2 -and $logic[0].Ob
 $instances=@(Get-MiProcessGroups @($members[0],$members[0]) V3 -Mode Instance)
 Assert-Mi ($instances.Count -eq 1 -and $instances[0].ObservedPrivateBytes -eq 10MB) 'Duplicate instance counted twice.'
 Write-Host 'PASS: V3-M1 contracts, Commit/RAM separation, pool trends, cadence/gaps/reset, PID reuse and process grouping.' -ForegroundColor Green
+
+# M5：实际 CSV/UTF-8/句柄，工具、已验收版本与 ETL 消费边界用显式替身；不录制/联网。
+& {
+    . (Join-Path $PSScriptRoot 'PrivilegeSecurity.ps1')
+    function Assert-M5Rejected {param([scriptblock]$Action,[string]$Label)
+        $denied=$false;try {& $Action|Out-Null} catch {$denied=$true};Assert-Mi $denied ('M5 accepted '+$Label)
+    }
+    $fixture=Join-Path $PSScriptRoot ('test-artifacts\WpaExport-'+[guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($fixture)
+    $availability=Get-MiAttributionExportAvailability
+    Assert-Mi (-not $availability.ReleaseReady -and $availability.State -ceq 'AnalysisUnavailable') 'M5 actual release gate opened'
+    Assert-M5Rejected {Invoke-MiAttributionExport ([guid]::NewGuid().ToString('N'))} 'actual export gate'
+    foreach ($type in @('VirtualAlloc','Pool','Heap')) {
+        $candidate=Get-MiWpaExportContract $type;[xml]$xml=$candidate.Xml
+        Assert-Mi ($candidate.AcceptedVersions.Count -eq 0 -and $candidate.Headers.Count -eq 0) 'invented accepted table/version'
+    }
+    Initialize-MiExporterNative # PS5.1 编译检查；不是 WPAExporter/Job 实机验收。
+    $contract=[pscustomobject]@{TraceType='VirtualAlloc';Headers=@('Process','Type','Size (B)');SizeColumn='Size (B)';LabelColumn='Process';ByteMultiplier=1;MetricName='VirtualAlloc.ExportedAllocatedBytes'}
+    $metadata=[pscustomobject]@{SchemaVersion=1;ArtifactId=[guid]::NewGuid().ToString('N');TraceSessionId=[guid]::NewGuid().ToString('N');
+        TraceType='VirtualAlloc';StartUtc='2026-10-25T00:00:00.0000000Z';EndUtc='2026-10-25T00:05:00.0000000Z';EventLossStatus='NoLossReported'}
+    $csv=Join-Path $fixture 'normal.csv'
+    [IO.File]::WriteAllText($csv,"Process,Type,Size (B)`r`n`"程序,甲 (7)`",Commit,9007199254740993`r`nfixture (8),Reserve,0`r`n",[Text.UTF8Encoding]::new($false))
+    $result=ConvertFrom-MiWpaCsv $csv $metadata $contract
+    Assert-Mi ($result.Findings.Count -eq 2 -and $result.Findings[0].ObservedBytes -eq 9007199254740993L -and $result.Findings[1].ObservedBytes -eq 0) 'CSV integer/quoted Unicode precision'
+    Assert-Mi ($null -eq $result.Findings[0].GrowthBytes -and $null -eq $result.Findings[0].ProcessInstanceId -and $result.Findings[0].SourceType -ceq 'WPAExporter') 'export invented growth/identity'
+    Assert-M5Rejected {ConvertFrom-MiWpaCsv $csv $metadata $contract -MaxFindingBytes 100} 'normalized result amplification budget'
+    $metadata.EventLossStatus='LossReported';$result=ConvertFrom-MiWpaCsv $csv $metadata $contract
+    Assert-Mi ($result.Findings[0].MeasurementQuality -ceq 'Partial') 'event loss hidden'
+    foreach ($bad in @("Process,Type,Size (MB)`nfixture,Commit,1", "Process,Type,Size (B)`nfixture,Commit,1.1", "Process,Type,Size (B)`nfixture,Commit,-1",
+        "Process,Type,Size (B)`nfixture,Commit,NaN", "Process,Type,Size (B)`nfixture,Commit,9223372036854775808", "Process,Type,Size (B)`nfixture,Commit,1`nfixture,Commit,2",
+        "Process,Type,Size (B)`nTotal,Commit,10", "Process,Type,Size (B)`n=BAD,Commit,1", "Process,Type,Size (B)`nfixture,Commit", "Process,Process,Size (B)`nfixture,Commit,1",
+        "Process,Type,Size (B)`n`"unterminated,Commit,1")) {
+        [IO.File]::WriteAllText($csv,$bad,[Text.UTF8Encoding]::new($false));Assert-M5Rejected {ConvertFrom-MiWpaCsv $csv $metadata $contract} 'malformed CSV'
+    }
+    [IO.File]::WriteAllText($csv,"Process,Type,Size (B)`n",[Text.UTF8Encoding]::new($false))
+    Assert-Mi ((ConvertFrom-MiWpaCsv $csv $metadata $contract).State -ceq 'AnalysisPartial') 'empty table treated as no anomaly'
+    [IO.File]::WriteAllBytes($csv,[byte[]]@(255,255,255));Assert-M5Rejected {ConvertFrom-MiWpaCsv $csv $metadata $contract} 'invalid UTF-8'
+    $test=@{Fixture=$fixture;Calls=@();Admin=$false;ToolMissing=$false;ToolUnsupported=$false}
+    function Get-MiExportReleaseStatus {return [pscustomobject]@{Enabled=$true;OfflineAccepted=$true;OnlineAccepted=$true;NormalizationAccepted=$true}}
+    function Get-MiWprReleaseStatus {return [pscustomobject]@{Enabled=$true;M2Accepted=$true;MemoryAccepted=$true}}
+    function Get-MiHeapReleaseStatus {return [pscustomobject]@{Enabled=$true;ConfigurationAccepted=$true;RecoveryAccepted=$true}}
+    function Test-MiAdminToken {return $test.Admin}
+    function Get-MiSecurityPaths {return $test.Paths}
+    function Assert-MiTracePath {param($Path)
+        if ($test.PathFault -or -not (Test-Path -LiteralPath $Path) -or
+            (-not [IO.Path]::GetFullPath($Path).StartsWith($test.Fixture,[StringComparison]::OrdinalIgnoreCase) -and $Path -ine (Join-Path $test.Paths.Install 'Analyzer.ps1'))) {throw 'Fixture trust rejection'}
+    }
+    function Get-MiWpaExporterIdentity {if ($test.ToolMissing) {return $null};return [pscustomobject]@{SchemaVersion=1;Path='C:\Windows\fixture.exe';Version='FixtureOnly';Sha256=('A'*64)}}
+    function Get-MiWpaExportContract {param($TraceType)
+        return [pscustomobject]@{TraceType=$TraceType;AcceptedVersions=if ($test.ToolUnsupported) {@()} else {@('FixtureOnly')};Headers=@('Process','Type','Size (B)');
+            SizeColumn='Size (B)';LabelColumn='Process';ByteMultiplier=1;MetricName='VirtualAlloc.ExportedAllocatedBytes';ProfileId='FixtureOnly';Xml='<fixture/>';CsvPattern='Mi_*.csv'}
+    }
+    function Test-MiEtlArtifact {param($Path)
+        return [pscustomobject]@{SizeBytes=(Get-Item -LiteralPath $Path).Length;Sha256=if ($test.CorruptEtl) {('0'*64)} else {(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash};
+            StartUtc=$test.Descriptor.StartUtc;EndUtc=$test.Descriptor.EndUtc;EventsLost=0;BuffersLost=0}
+    }
+    function Measure-MiProtectedTree {param($Root) if ($test.BudgetFault -or ($test.ResultBudgetFault -and $test.Calls.Count -gt 0)) {return 8589934592};return 0L}
+    function Read-Host {param($Prompt) if ($test.Consent -and $Prompt -match 'SYMBOLS ([a-f0-9]{32})') {return 'SYMBOLS '+$matches[1]};return ''}
+    function Invoke-MiWpaExportProcess {param($Tool,$Etl,$Profile,$Output,$Cache,[switch]$Online)
+        $test.Calls+=,[pscustomobject]@{Online=[bool]$Online;Output=$Output}
+        # 实际持有租约和 ETL 读句柄；即使替身也须证明并发归档/部署不能取得独占访问。
+        Assert-M5Rejected {[IO.File]::Open($test.Paths.DeploymentLease,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)} 'active deployment lease'
+        Assert-M5Rejected {[IO.File]::Open($Etl,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)} 'active ETL reference'
+        if ($test.ThrowProcess) {throw 'Unknown exporter outcome'}
+        if ($Online -and $test.SymbolFailure) {return 1}
+        if (-not $test.MissingTable) {[IO.File]::WriteAllText((Join-Path $Output 'Mi_fixture.csv'),"Process,Type,Size (B)`nfixture,Commit,100`n",[Text.UTF8Encoding]::new($false))}
+        return 0
+    }
+    $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $test.Paths=[pscustomobject]@{Install=$PSScriptRoot;TraceArtifacts=(Join-Path $fixture 'diagnostics');DeploymentLease=(Join-Path $fixture 'deployment.lock')}
+    [IO.File]::WriteAllText($test.Paths.DeploymentLease,'lease')
+    $directory=Join-Path $test.Paths.TraceArtifacts $owner;[void][IO.Directory]::CreateDirectory($directory)
+    $etl=Join-Path $directory ($metadata.ArtifactId+'.etl');[IO.File]::WriteAllText($etl,'fixture ETL')
+    $test.Descriptor=[pscustomobject][ordered]@{SchemaVersion=1;ArtifactId=$metadata.ArtifactId;TraceSessionId=$metadata.TraceSessionId;OwnerSid=$owner;
+        TraceType='VirtualAlloc';SizeBytes=(Get-Item $etl).Length;Sha256=(Get-FileHash $etl -Algorithm SHA256).Hash;EventLossStatus='NoLossReported';
+        StartUtc=$metadata.StartUtc;EndUtc=$metadata.EndUtc;AnalyzerSha256=(Get-FileHash (Join-Path $PSScriptRoot 'Analyzer.ps1') -Algorithm SHA256).Hash}
+    [IO.File]::WriteAllText((Join-Path $directory ($metadata.ArtifactId+'.export.json')),($test.Descriptor|ConvertTo-Json -Compress),[Text.UTF8Encoding]::new($false))
+    [void][IO.Directory]::CreateDirectory((Join-Path $directory ($metadata.ArtifactId+'.export')))
+    foreach ($case in @('Offline','OnlineCancelled','Online','SymbolFailure','MissingTable','UnknownOutcome','MissingTool','UnsupportedTool','CorruptEtl','Budget','ResultBudget','Admin')) {
+        $test.Calls=@();$test.Consent=$case -cin @('Online','SymbolFailure');$test.SymbolFailure=$case -ceq 'SymbolFailure';$test.MissingTable=$case -ceq 'MissingTable'
+        $test.ThrowProcess=$case -ceq 'UnknownOutcome';$test.ToolMissing=$case -ceq 'MissingTool';$test.ToolUnsupported=$case -ceq 'UnsupportedTool'
+        $test.CorruptEtl=$case -ceq 'CorruptEtl';$test.BudgetFault=$case -ceq 'Budget';$test.ResultBudgetFault=$case -ceq 'ResultBudget';$test.Admin=$case -ceq 'Admin'
+        if ($case -cin @('CorruptEtl','Budget','Admin')) {Assert-M5Rejected {Invoke-MiAttributionExport $metadata.ArtifactId} $case;Assert-Mi ($test.Calls.Count -eq 0) 'rejected analysis dispatched';continue}
+        $result=Invoke-MiAttributionExport $metadata.ArtifactId -OnlineSymbols:($case -cin @('OnlineCancelled','Online','SymbolFailure'))
+        if ($case -cin @('MissingTool','UnsupportedTool')) {Assert-Mi ($result.State -ceq 'AnalysisUnavailable' -and $test.Calls.Count -eq 0) 'missing/unsupported tool not degraded';continue}
+        if ($case -cin @('MissingTable','UnknownOutcome')) {Assert-Mi ($result.State -ceq 'AnalysisPartial' -and $result.Findings.Count -eq 0 -and $test.Calls.Count -eq 1) 'missing/unknown result accepted or retried';continue}
+        if ($case -ceq 'ResultBudget') {Assert-Mi ($result.State -ceq 'AnalysisPartial' -and -not $result.ResultPersisted -and $result.Findings.Count -eq 0) 'result write exceeded refreshed budget';continue}
+        Assert-Mi ($result.State -ceq 'Complete' -and $result.Findings.Count -eq 1 -and $result.ResultTrust -ceq 'UserOwnedDiagnosticOnly') 'ordinary export pipeline failed'
+        if ($case -ceq 'SymbolFailure') {Assert-Mi ($test.Calls.Count -eq 2 -and $test.Calls[0].Online -and -not $test.Calls[1].Online) 'known symbol failure fallback'}
+        else {Assert-Mi ($test.Calls.Count -eq 1 -and $test.Calls[0].Online -eq ($case -ceq 'Online')) 'network consent reused/ignored'}
+    }
+    Write-Host 'PASS: M5 strict CSV/precision/quality, fixed version refusal, ordinary-worker gates, consent/fallback, unknown outcome, and real deployment/ETL read leases (exporter mocked).'
+}

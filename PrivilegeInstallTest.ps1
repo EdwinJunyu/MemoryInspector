@@ -20,6 +20,7 @@ function Invoke-MiTestExecutor {
     $exe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $args='-NoProfile -ExecutionPolicy RemoteSigned -File "'+$paths.Executor+'" -Operation '+$Operation+' -RequestId '+$RequestId
     if ($Operation -ceq 'TraceStart') {$args+=' -TraceType '+$TraceType}
+    if ($Operation -ceq 'TraceExportPrepare') {$args+=' -ArtifactId '+[guid]::NewGuid().ToString('N')}
     $process=Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
     try { return [int]$process.ExitCode } finally { $process.Dispose() }
 }
@@ -30,6 +31,7 @@ $watchdog=Assert-MiWatchdog
 if ((Invoke-MiTestExecutor 'TracePreflight' ([guid]::NewGuid().ToString('N'))) -eq 0) { throw 'M2 unexpectedly enabled WPR.' }
 if ((Invoke-MiTestExecutor 'TraceStart' ([guid]::NewGuid().ToString('N'))) -eq 0) {throw 'Unaccepted M3 launch escaped code-level gate.'}
 if ((Invoke-MiTestExecutor 'TraceStart' ([guid]::NewGuid().ToString('N')) 'Heap') -eq 0) {throw 'Unaccepted M4 Heap request escaped code-level gate.'}
+if ((Invoke-MiTestExecutor 'TraceExportPrepare' ([guid]::NewGuid().ToString('N'))) -eq 0) {throw 'Unaccepted M5 export escaped code-level gate.'}
 if ((Invoke-MiTestExecutor 'TraceWatchdog' 'Scheduled') -eq 0) { throw 'Administrator impersonated SYSTEM watchdog.' }
 $lock=Enter-MiTraceLock
 try {
