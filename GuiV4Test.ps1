@@ -315,7 +315,7 @@ $guiAst=[Management.Automation.Language.Parser]::ParseInput($gui,[ref]$guiTokens
 function New-MiLabel { param([string]$Text,[int]$Size) return [pscustomobject]@{Text=$Text} }
 $script:Form=[pscustomobject]@{Text=''}
 $script:TrayIcon=[pscustomobject]@{Text=''}
-foreach ($expected in @('0.0.8','0.0.9','1.2.3')) {
+foreach ($expected in @('0.0.8','0.0.9','0.0.10','1.2.3')) {
     [IO.File]::WriteAllText($versionFile,(' '+$expected+[Environment]::NewLine),[Text.UTF8Encoding]::new($true))
     $script:VersionInfo=Get-MiVersionPresentation -Root $versionRoot
     foreach ($binding in @(
@@ -364,7 +364,7 @@ $manifestAssignment=$installerAst.Find({param($n)
 $sourceVersion=$actual.Version
 $entries=New-Object 'System.Collections.Generic.List[object]'
 . ([scriptblock]::Create($manifestAssignment.Extent.Text))
-if ($manifest.Version -cne $actual.Version -or $installerCode -notmatch '\$sourceVersion -cne ''0\.0\.9''' -or
+if ($manifest.Version -cne $actual.Version -or $installerCode -notmatch '\$sourceVersion -cne ''0\.0\.10''' -or
     $installerCode -notmatch '''Installed MemoryInspector ''\+\$sourceVersion') {
     throw 'Installation metadata/display differs from validated VERSION or release pin was weakened.'
 }

@@ -1,10 +1,22 @@
 # MemoryInspector
 
-**Version 0.0.9（Legacy snapshot / acceptance incomplete）**
+**Version 0.0.10 — V3 开发快照（验收未完成 / not stable）**
 
-这是保留至今修复的旧版本快照，未完成全部实机验收，不标记为稳定版。已知未通过：5 秒采样最终窗口首段仅 50/60 个有效槽（低于原 85% 要求），GUI Working Set 采样峰值 210.08 MiB（目标 <200 MiB）。两项均保留检查，待后续修复。
+此版本汇集 V3-M1 至 M7 开发代码和 M2 Windows 11 阶段验收修复，未完成全部实机验收，不标记为稳定版。旧实测仍未通过的项目：5 秒采样最终窗口首段仅 50/60 个有效槽（低于原 85% 要求），GUI Working Set 采样峰值 210.08 MiB（目标 <200 MiB）。两项均保留检查，未以版本升级宣称解决。
 
-未完成的真实 DPI/多屏、Win10、Win10/11 各 24 小时、真实存储/时钟/休眠故障、受保护部署/UAC 及专用进程/服务动作验收，详见 [验收备注和待办](docs/M8-ACCEPTANCE.md)。此前 35 分钟实测基于修复中的 0.0.8；0.0.9 版本对齐后的常规回归另行记录，不冒充重跑全部实机项目。原始进程记录、截图、临时日志和备份保留本地，不随源码提交。
+M2 Windows 11 的 12 项管理员检查已在 0.0.9 受保护安装中通过；完整普通/跨用户权限、重启/开机触发、真实 DPI/多屏、Win10、Win10/11 各 24 小时、存储/时钟/休眠故障及完整进程/服务动作仍待验收，详见 [项目备注](docs/M8-ACCEPTANCE.md)。0.0.10 本轮同步源码版本与升级信任校验，没有升级本机受保护的 0.0.9，也不冒充重跑全部实机项目。原始进程记录、截图、临时日志和备份保留本地，不随源码提交。
+
+| V3 里程碑 | 当前开发进度 | 未验收边界 |
+| --- | --- | --- |
+| M1 System Memory Attribution | 已实现只读归因与进程分组 | 不把相关性当泄漏或操作授权；长时/性能验收待完成 |
+| M2 Protected Trace Architecture | 已实现；Windows 11 管理员阶段 12 项通过 | 普通权限完整证据、重启、故障/跨用户矩阵和 Win10 待验收 |
+| M3 WPR Core | 核心与恢复事务已实现 | 实录/ETL/资源/共存未验收，禁用 |
+| M4 Heap Configuration Transactions | 配置事务与条件恢复已实现 | 实际 IFEO/Heap ETL/恢复矩阵未验收，禁用 |
+| M5 Automated Attribution Export | 受控导出与归一化已实现 | 实际版本/CSV/符号/资源接受列表未验收，禁用 |
+| M6 ActionGrant | 单次进程授权已实现 | 新增无窗口进程权限未验收，禁用 |
+| M7 GUI Integration | 高级诊断整合已实现 | 高级诊断/恢复/导出 UI 验收门未开放 |
+
+版本号不改变验收结果：M2Accepted、WPR、Heap、导出以及新增权限/UI 发布门保持关闭，普通只读监控沿用原行为。
 
 MemoryInspector is a local Windows PowerShell 5.1 application for memory monitoring, anomaly analysis and manually confirmed management operations. It is NOT a one-click cleaner. High Private Bytes or growing memory does not prove a leak or safe release.
 
@@ -23,7 +35,7 @@ MemoryInspector is a local Windows PowerShell 5.1 application for memory monitor
 
 ## V3-M2 — Protected Trace Architecture（开发阶段，实机部署验收待完成）
 
-在原 PrivilegeSecurity / ElevatedExecutor / Installer / Uninstaller 内实现受保护 TraceSession、Journal、固定 Controller 命令、SYSTEM Watchdog 和恢复入口，没有新增生产模块。VERSION 仍为 0.0.9；安装清单另有 `TraceArchitectureVersion=1`，用于区分旧安装与 M2 架构，不放宽旧版精确版本信任。
+在原 PrivilegeSecurity / ElevatedExecutor / Installer / Uninstaller 内实现受保护 TraceSession、Journal、固定 Controller 命令、SYSTEM Watchdog 和恢复入口，没有新增生产模块。源码 VERSION 为 0.0.10；安装清单另有 `TraceArchitectureVersion=1`，用于区分旧安装与 M2 架构。日常信任精确固定 0.0.10，只有安装器升级/回滚核验显式接受已知 0.0.7/0.0.8/0.0.9 来源，并继续检查完整组件、摘要、ACL、恢复义务和实际任务。
 
 - Journal 位于产品 ProgramData 的 `trace` 受保护目录，采用 UTF-8、SchemaVersion、连续 revision、哈希链及追加写入/Flush。全局独占文件锁跨进程协调；缺失、截断、重复字段、未知结构或非法状态转换拒绝继续，不自动补尾。哈希链用于发现损坏，ACL 才是普通用户写入边界；不声称抵御管理员回滚整份合法历史。
 - 会话绑定身份和启动会话，时长使用秒（默认 300、范围 300–1800）。停止、保存、配置清理及分析分别记录；Saved、CleanupPending、UnknownOutcome 都不能冒充 Completed。未完成会话、有效引用或服务恢复记录阻断升级/卸载。
@@ -57,11 +69,11 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 - 默认 7 天到期；遵守本项目“不实际删除”要求，自动清理将已核验、无活跃引用/读句柄的 ETL 移入同一受保护所有者目录下的 `retained`，仍计入 8 GiB 预算，不报告释放空间。普通监控历史不受此配额影响。用户可明确使用普通文件操作导出自己可读的副本，该副本不受本工具保留策略管理。
 - 固定 `TraceRecovery` 报告新增门控和 Artifact 状态；`RECOVER SAVED ARTIFACTS` 仅在发布验收通过后恢复已经确认停止、写者退出的已知保存事务。记录前后崩溃均重新核验实际文件，绝不补发未知 Start/Stop。未完成会话、保存/归档事务和引用继续阻断安装/卸载。
 
-本轮四种 Profile 已通过本机 WPR 的只读语法解析，八个 PS5.1 回归与 Review 双轴复核通过。实际录制/停止、有效 ETL、SYSTEM 子进程 Job breakaway、资源压力、外部追踪共存和 Windows 10/11 验收均未完成，**不把模拟测试等同于发布验收**。详细记录见 [M3 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m3wpr-core)。VERSION 仍为 0.0.9，仅本地提交，不推送。
+M3 实现轮次的四种 Profile 已通过本机 WPR 只读语法解析，八个 PS5.1 回归与 Review 双轴复核通过。实际录制/停止、有效 ETL、SYSTEM 子进程 Job breakaway、资源压力、外部追踪共存和 Windows 10/11 验收均未完成，**不把模拟测试等同于发布验收**。详细记录见 [M3 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m3wpr-core)。当前源码随 0.0.10 同步远程，发布门仍关闭。
 
 ## V3-M4 — Heap Configuration Transactions（开发实现，发布门关闭）
 
-按冻结规格第 7 节及 M4，在现有安全模块、执行器和测试内实现 Heap 专项事务，没有新增生产模块。M2/M3 的本机复核仍未通过受保护部署/SYSTEM/Win10、11 验收，因此 WPR 与独立 Heap 发布门全部保持 false；没有设置、参数或 Journal 标志可以解锁。VERSION 保持 0.0.9。
+按冻结规格第 7 节及 M4，在现有安全模块、执行器和测试内实现 Heap 专项事务，没有新增生产模块。M2 Windows 11 管理员阶段部分通过，完整 M2 安全验收和 M3 实录仍未完成，因此 WPR 与独立 Heap 发布门全部保持 false；没有设置、参数或 Journal 标志可以解锁。源码 VERSION 为 0.0.10。
 
 - Heap 请求绑定本地原生 x64 PE 文件的路径、映像名与 SHA256；目前只接受限定的普通 `.exe` 名称，其他架构、托管程序、IFEO Filter/子键等兼容性未核验时拒绝。IFEO 作用于所有同名新进程，包含其他路径/用户；控制台确认前显示该范围和目标摘要。已有实例可能需要用户自行重启，工具不启动、重启或终止目标，不增加 Heap Snapshot。
 - 固定 Registry64 IFEO 的 `TracingFlags` 是唯一写入范围。读取失败、类型未知或未确认的配置位均拒绝；原值为 DWORD 1 时复用且不写入，缺失/0 才建立修改事务。记录原值、预期值、目标身份、所有者、UTC、实际读取值、恢复状态及冲突，复用受保护追加 Journal、全局锁和 revision 检查。修改前必须提交并 Flush 意图，写后核验。
@@ -73,14 +85,14 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 ## V3-M5 — Automated Attribution Export（开发实现，发布门关闭）
 
-在现有 Analyzer、PrivilegeSecurity 与执行器内实现 ETL → 固定 WPAExporter 适配器 → 严格 CSV → AttributionFinding。M2–M4 真实部署/追踪/恢复验收仍缺失，本机也没有 WPAExporter；WPR、Heap 及 M5 离线/联网/归一化发布门全部保持关闭。**实际支持版本与 CSV 表头/单位的接受列表为空**，候选 XML 通过解析不代表 WPA 兼容；不得据模拟测试开放功能。
+在现有 Analyzer、PrivilegeSecurity 与执行器内实现 ETL → 固定 WPAExporter 适配器 → 严格 CSV → AttributionFinding。M2–M4 完整安全/追踪/恢复验收仍未完成，M5 实现轮次也没有 WPAExporter 实机证据；WPR、Heap 及 M5 离线/联网/归一化发布门全部保持关闭。**实际支持版本与 CSV 表头/单位的接受列表为空**，候选 XML 通过解析不代表 WPA 兼容；不得据模拟测试开放功能。
 
 - 固定 `TraceExportPrepare -ArtifactId` 只为已保存、已清理、属于确认账户的 ETL 写受保护描述和专属输出目录。重新消费 ETL 并核验大小、摘要、实际时间范围和事件丢失。受保护层不启动 WPAExporter，不解析用户 CSV，也不从 Finding 获得动作权限。
 - 之后在普通用户 PS5.1 会话加载已安装的 Analyzer，调用 `Invoke-MiAttributionExport -ArtifactId <id>`。工作进程默认离线，拒绝管理员/SYSTEM；没有程序、Profile、输出路径或服务器自由参数。GUI 调用整合属于 M7。缺失/不支持工具返回 AnalysisUnavailable，并保留 ETL 和 WPA 手动分析指引。
 - 普通分析持有共享只读部署租约和 ETL 读句柄，阻止升级/卸载和活动文件归档。WPAExporter 使用固定完整路径、Microsoft 签名与摘要身份；先挂入专用 Job 再运行，只管理本次创建的导出器。工程初值为 120 秒、1 GiB Job 内存、单进程、每次工作区 64 MiB、磁盘预留 2 GiB；CSV、缓存及结果继续计入原诊断数据 8 GiB 软预算。归一化 Findings 累计限制 16 MiB，结果写入前再次复核全部存储余量；无法读取预算或超限时拒绝，不补零。
 - `-OnlineSymbols` 每次询问新的分析 ID、用途、Microsoft 符号服务器与本次缓存目录；取消则离线。只设置子进程的非空本地符号路径/专属缓存，授权不持久复用。联网已知失败且子进程退出后可另存一次离线结果；超时/未知结果不重派发。实际网络隔离与版本行为仍待验收。
 - CSV 拒绝未知表头/单位、重复范围、非法引号/UTF-8、控制字符、负数/小数/溢出和汇总行；缺表或空表为 AnalysisPartial。数值保留 Int64 精度；只报告被接受表的分配量口径，GrowthBytes 与 ProcessInstanceId 保持 null，不映射到当前 PID、RAM 或泄漏结论。事件丢失降低质量，符号状态和局限单列。
-- 分析结果属于用户诊断数据，不回写受保护 TraceSession 的历史分析结论，不供高权限执行器执行。当前候选 Profile/版本矩阵尚未接受，真实有效 ETL/CSV、符号、Job、跨用户读取与资源压力验收保持关闭；VERSION 仍为 0.0.9。
+- 分析结果属于用户诊断数据，不回写受保护 TraceSession 的历史分析结论，不供高权限执行器执行。当前候选 Profile/版本矩阵尚未接受，真实有效 ETL/CSV、符号、Job、跨用户读取与资源压力验收保持关闭；源码 VERSION 为 0.0.10。
 
 实现、审阅与测试边界见 [M5 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m5automated-attribution-export)。
 
@@ -96,7 +108,7 @@ M7 新增“Diagnostics · 高级诊断”页，整合已有只读归因、固�
 
 状态、保存、Heap 恢复与历史分析独立列出；报告仅供显示，不授予动作权限。状态文件/ACL/JSON、ETL 导出和归一化均在后台，GUI 只显示有界结果。GUI 关闭不终止独立 Controller/Watchdog，也不重发未知请求。旧的受保护控制台恢复入口保留，仍执行原有门控和归属检查。
 
-针对性测试和 Review 修复记录见 [M6/M7 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m6m7actiongrant-与-gui-integration)。真实动作/UAC/部署/WPR/符号网络、性能与 Windows 10/11 完整验收未完成，VERSION 仍为 0.0.9，不能宣布 Stable v3。
+针对性测试和 Review 修复记录见 [M6/M7 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m6m7actiongrant-与-gui-integration)。真实动作/UAC/完整部署矩阵/WPR/符号网络、性能与 Windows 10/11 完整验收未完成，源码 VERSION 为 0.0.10，不能宣布 Stable v3。
 
 ### 归因页界面约定
 

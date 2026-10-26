@@ -105,7 +105,7 @@ if ($bridge -notmatch 'Start-Process' -or $bridge -notmatch 'RunAs' -or
 $install=Get-Content -LiteralPath (Join-Path $root 'Installer.ps1') -Raw -Encoding UTF8
 if ($install -notmatch 'Set-MiAdminDirectoryAcl' -or $install -notmatch 'Set-MiProtectedFileAcl' -or
     $install -notmatch 'Assert-MiTrustedInstallation') { throw 'Protected installer safeguards missing.' }
-if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.9') {
+if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0.10') {
     throw 'VERSION mismatch.'
 }
 # 版本升级必须执行真实信任函数，而非仅比较源码字符串。夹具仅模拟本目录的ACL，
@@ -118,6 +118,8 @@ if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0
         PolicyFolder=(Join-Path $fixture 'data\policy');Policy=(Join-Path $fixture 'data\policy\approved.json')
         Audit=(Join-Path $fixture 'data\audit\audit.jsonl');Manifest=(Join-Path $fixture 'data\manifest.json')
         Recovery=(Join-Path $fixture 'data\policy\recovery.json')
+        Executor=(Join-Path $fixture 'install\ElevatedExecutor.ps1')
+        WatchdogPolicy=(Join-Path $fixture 'data\watchdog-policy.json')
     }
     foreach($directory in @($versionPaths.Install,$versionPaths.Data,$versionPaths.Replay,$versionPaths.Results,$versionPaths.PolicyFolder,(Split-Path -Parent $versionPaths.Audit))){[void][IO.Directory]::CreateDirectory($directory)}
     foreach($file in @($versionPaths.Policy,$versionPaths.Audit,$versionPaths.Recovery)){[IO.File]::WriteAllText($file,'fixture',[Text.UTF8Encoding]::new($false))}
@@ -141,41 +143,64 @@ if ((Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim() -cne '0.0
     }
     function Write-VersionManifest {
         param([string]$Version,$Files)
-        $manifest=[pscustomobject]@{SchemaVersion=1;Version=$Version;Files=@($Files)}
+        $manifest=[pscustomobject]@{SchemaVersion=1;Version=$Version;Files=@($Files);TraceArchitectureVersion=1}
         [IO.File]::WriteAllText($versionPaths.Manifest,($manifest|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
     }
     function Assert-VersionTrustRejected {
-        param([string]$ExpectedMessage)
+        param([string]$ExpectedMessage,[string[]]$AllowedVersions=@('0.0.10'))
         $rejected=$false
-        try{[void](Assert-MiTrustedInstallation)}catch{
+        try{[void](Assert-MiTrustedInstallation -AllowedVersions $AllowedVersions)}catch{
             if(-not $_.Exception.Message.Contains($ExpectedMessage)){throw}
             $rejected=$true
         }
         if(-not $rejected){throw ('Version trust unexpectedly accepted: '+$ExpectedMessage)}
     }
     $allEntries=$versionEntries.ToArray()
-    Write-VersionManifest '0.0.9' $allEntries
+    # 版本升级同时核验真实 Watchdog 信任入口：只模拟任务对象读取，不跳过固定定义/ACL 校验。
+    $realScheduler=Get-MiTaskScheduler;$definition=Get-MiWatchdogDefinition $realScheduler
+    $versionTask=[pscustomobject]@{Definition=$definition;Enabled=$true;State=3;Xml='fixed version-trust task fixture'}
+    $versionTask|Add-Member ScriptMethod GetSecurityDescriptor {param($Flags) return 'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'}
+    $versionFolder=[pscustomobject]@{};$versionFolder|Add-Member ScriptMethod GetTask {param($Name)
+        if ($Name -cne 'MemoryInspector.TraceWatchdog') {throw 'Unexpected task name.'};return $versionTask
+    }
+    $versionScheduler=[pscustomobject]@{};$versionScheduler|Add-Member ScriptMethod GetFolder {param($Path) return $versionFolder}
+    function Get-MiTaskScheduler {return $versionScheduler}
+    $policy=[ordered]@{SchemaVersion=1;InstallationId=[guid]::NewGuid().ToString('N');DefinitionHash=(Get-MiTraceHash $versionTask.Xml)}
+    [IO.File]::WriteAllText($versionPaths.WatchdogPolicy,($policy|ConvertTo-Json -Compress))
+    Write-VersionManifest '0.0.10' $allEntries
     [void](Assert-MiTrustedInstallation)
-    foreach($oldVersion in @('0.0.7','0.0.8')){
+    [void](Assert-MiWatchdog)
+    $upgradeVersions=@('0.0.7','0.0.8','0.0.9','0.0.10')
+    foreach($oldVersion in @('0.0.7','0.0.8','0.0.9')){
         Write-VersionManifest $oldVersion $allEntries
         Assert-VersionTrustRejected 'Invalid installation manifest/version.'
-        [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8','0.0.9'))
+        [void](Assert-MiTrustedInstallation -AllowedVersions $upgradeVersions)
+        $oldWatchdogDenied=$false
+        try {[void](Assert-MiWatchdog)} catch {if ($_.Exception.Message -cne 'Invalid installation manifest/version.') {throw};$oldWatchdogDenied=$true}
+        if (-not $oldWatchdogDenied) {throw 'Daily watchdog trust accepted old release implicitly.'}
+        [void](Assert-MiWatchdog -AllowedVersions $upgradeVersions)
+        Write-VersionManifest $oldVersion @($allEntries|Where-Object Name -cne 'ServiceManagement.ps1')
+        Assert-VersionTrustRejected 'Missing M7 component: ServiceManagement.ps1' $upgradeVersions
     }
-    foreach($unknownVersion in @('0.0.10','1.2.3','0.0.9.1','0.0.9 ')){
+    foreach($unknownVersion in @('0.0.11','1.2.3','0.0.10.1','0.0.10 ')){
         Write-VersionManifest $unknownVersion $allEntries
         Assert-VersionTrustRejected 'Invalid installation manifest/version.'
     }
     foreach($essential in @('ElevatedExecutor.ps1','PrivilegeSecurity.ps1','ServiceManagement.ps1','ServiceBridge.ps1','VERSION')){
-        Write-VersionManifest '0.0.9' @($allEntries|Where-Object Name -cne $essential)
+        Write-VersionManifest '0.0.10' @($allEntries|Where-Object Name -cne $essential)
         Assert-VersionTrustRejected ('Missing M7 component: '+$essential)
     }
-    Write-VersionManifest '0.0.9' $allEntries
+    Write-VersionManifest '0.0.10' $allEntries
     $retainedLedger=Join-Path $versionPaths.PolicyFolder 'recovery.retained.json'
     [IO.File]::Move($versionPaths.Recovery,$retainedLedger)
     try{Assert-VersionTrustRejected 'Untrusted service recovery ledger.'}finally{[IO.File]::Move($retainedLedger,$versionPaths.Recovery)}
     [void](Assert-MiTrustedInstallation)
+    [void](Assert-MiWatchdog)
+    $versionTask.Definition.Actions.Item(1).Arguments+=' -Command rejected'
+    $taskDenied=$false;try {[void](Assert-MiWatchdog -AllowedVersions $upgradeVersions)} catch {$taskDenied=$true}
+    if (-not $taskDenied) {throw 'Upgrade version allowlist bypassed actual task definition validation.'}
 }
-Write-Host 'PASS: 0.0.9 exact trust pin, explicit old-version upgrade, unknown-version rejection and unchanged M7 component/ledger requirements (ACL mocked only in fixture).'
+Write-Host 'PASS: 0.0.10 exact trust pin, explicit 0.0.7/0.0.8/0.0.9 upgrade, unknown-version rejection and unchanged M7 component/ledger requirements (ACL mocked only in fixture).'
 # Lightweight ACL smoke test in a uniquely named throwaway temp directory.
 # This is deliberately NOT an installation and never changes Windows services.
 if (Test-MiAdminToken) {

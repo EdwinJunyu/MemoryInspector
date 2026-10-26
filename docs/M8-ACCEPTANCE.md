@@ -577,3 +577,17 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "D:\D_Main\EdwinSo
 尚未通过：完整普通/跨用户权限矩阵及不可读对象当前存在性、Controller/GUI 任意写入边界硬崩溃和全部资源压力、真实 Windows 重启/开机触发与 Win10 验收。用户明确本轮不重启，脚本也不执行重启。M2Accepted 及 M3–M7 原发布门全部保持 false，不宣布 Preview B/C 或 Stable v3。`[NEEDS CLARIFICATION]` 实际兼容矩阵与资源阈值仍按冻结第 20 节校准，不降低标准换取通过。
 
 API 依据：[固定任务停止](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-stop)、[任务安全上下文](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)、[任务状态码](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)、[注册与禁止追加主体 ACE](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskfolder-registertaskdefinition)、[设置实际任务权限](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-setsecuritydescriptor)。文档只证明 API 契约；实际通过范围以前述逐项证据为准。
+
+## 2026-10-25 0.0.10：V3 开发源码同步
+
+本轮按用户要求将当前 V3 开发源码同步远程 main，VERSION/README 标注 0.0.10，仍是验收未完成的开发快照，不是 Stable v3。先获取并合并远程 `35c606e` 的 README 更新，合并点 `168074aa41ee176c00b689684b568ab4bbf206f7` 保留双方提交历史；不强制推送、不改写 v0.0.9 标签、不额外创建 GitHub Release。以前各轮“仅本地提交”的记录属于当时执行边界，保留其历史事实。
+
+README 保留 M1–M7 的实现说明，增加当前进度表，明确高级追踪/Heap/导出/新增进程权限/UI 仍受关闭的发布门限制。M2 的 12 项 Windows 11 管理员实机通过证据来自 0.0.9；普通权限当前存在性、重启/开机触发、完整故障/跨用户矩阵和 Win10 等待验收项未提升状态。GUI 内存峰值与采样窗口覆盖的旧失败记录保留，没有降低阈值。
+
+0.0.10 日常安装与 Watchdog 信任精确固定当前版本。Installer 预检已知升级来源和回滚核验时，显式接受 0.0.7/0.0.8/0.0.9/0.0.10，并继续验证组件、文件摘要、ACL、恢复记录和固定任务；换入新清单后使用默认 0.0.10 检查。Watchdog 的显式版本参数仅供受信任安装器旧 M2 预检使用，没有向 GUI/执行器协议开放自由版本配置。这样既保持严格信任，也不会因新默认版本阻断已知 0.0.9 M2 的升级预检。
+
+安全回归实际调用信任与 Watchdog 函数：当前版本接受，旧版默认拒绝而显式升级接受，旧版缺组件仍拒绝；当前版缺组件/恢复记录、未知版本、实际任务定义变化均拒绝。GUI 版本展示夹具覆盖 0.0.10，安装器版本断言与显示取同一个 VERSION；原有精确版本测试没有删除或放宽。Review Standards/Spec 两轴复核无剩余可确认 P1/P2。
+
+本轮不升级本机 Program Files 中的 0.0.9 受保护安装，不重启、不修改任务、不启停 WPR、不写 IFEO、不进行真实进程/服务动作或联网符号。发布源码及版本校验不等于 0.0.10 的真实升级、SYSTEM、完整安全或 Windows 验收。回归与检查日志保留本地忽略目录 `test-artifacts/v0.0.10-publish/`；原始数据、截图、备份、临时日志和既有未跟踪验收目录不随源码推送。远程 CI 的结果须独立确认，不能据本地通过宣称远程或 Windows Server runner 等同 Win10/11 实机通过。
+
+首次完整回归发现 GuiV4Test 中安装器版本断言的转义正则仍固定 0.0.9，已精确改为 0.0.10。修复后实际重新完整运行 SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test，Windows PowerShell Desktop 5.1 / STA / RemoteSigned 下八套均退出 0。最终原生退出码与日志位于 `final-clean-run/`，首次失败记录保留，没有通过修改失败退出码汇总来宣称通过。六个修改的 PowerShell 文件保留 UTF-8 BOM，九个源码/文档严格 UTF-8 与 diff --check 通过。

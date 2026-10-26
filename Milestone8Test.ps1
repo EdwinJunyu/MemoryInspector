@@ -7,7 +7,7 @@ Temporary fault fixtures are created only under the current user's TEMP.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $version = ([IO.File]::ReadAllText((Join-Path $root 'VERSION'))).Trim()
-if ($version -cne '0.0.9') { throw ('Expected 0.0.9, found '+$version) }
+if ($version -cne '0.0.10') { throw ('Expected 0.0.10, found '+$version) }
 
 $files = @(Get-ChildItem -LiteralPath $root -Filter '*.ps1' -File)
 foreach ($file in $files) {

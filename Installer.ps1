@@ -14,7 +14,9 @@ foreach ($name in $names) {
     if (-not [IO.File]::Exists($file) -or -not (Test-MiNoReparse $file)) { throw ('Missing or reparse source: '+$name) }
 }
 $sourceVersion=[IO.File]::ReadAllText((Join-Path $source 'VERSION')).Trim()
-if ($sourceVersion -cne '0.0.9') { throw 'Expected VERSION 0.0.9; installation canceled.' }
+if ($sourceVersion -cne '0.0.10') { throw 'Expected VERSION 0.0.10; installation canceled.' }
+# 仅升级/回滚核验可接受这些旧版；执行器和日常 Watchdog 检查仍精确固定当前版本。
+$upgradeVersions=@('0.0.7','0.0.8','0.0.9','0.0.10')
 if (-not [IO.Directory]::Exists($paths.Data)) {
     [void][IO.Directory]::CreateDirectory($paths.Data); Set-MiAdminDirectoryAcl $paths.Data
 }
@@ -28,7 +30,7 @@ try {
     $lock=Enter-MiTraceLock
     $wasM2=$false
     if ([IO.Directory]::Exists($paths.Install)) {
-        [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8','0.0.9'))
+        [void](Assert-MiTrustedInstallation -AllowedVersions $upgradeVersions)
         $old=[IO.File]::ReadAllText($paths.Manifest)|ConvertFrom-Json
         $wasM2=$old.TraceArchitectureVersion -eq 1
     }
@@ -44,7 +46,7 @@ try {
     if ($wasM2) {
         $j=Read-MiTraceJournal $lock; Assert-MiTraceQuiescent $j
         if ($j.Deployment -cne 'Ready') { throw 'Unfinished deployment blocks upgrade; use TraceRecovery.' }
-        [void](Assert-MiWatchdog)
+        [void](Assert-MiWatchdog -AllowedVersions $upgradeVersions)
     } else {
         # 除明确的任务不存在外，其余查询错误都不能当成可覆盖。
         $folder=(Get-MiTaskScheduler).GetFolder('\')
@@ -126,7 +128,7 @@ try {
     if (-not $registrationAttempted) {
         try {
             Restore-MiInstallationSwap $paths $swap
-            if ([IO.Directory]::Exists($paths.Install)) { [void](Assert-MiTrustedInstallation -AllowedVersions @('0.0.7','0.0.8','0.0.9')) }
+            if ([IO.Directory]::Exists($paths.Install)) { [void](Assert-MiTrustedInstallation -AllowedVersions $upgradeVersions) }
             $rollbackVerified=$true
         } catch { $failure+='; rollback could not be verified: '+$_.Exception.Message }
     }
