@@ -57,6 +57,18 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 本轮四种 Profile 已通过本机 WPR 的只读语法解析，八个 PS5.1 回归与 Review 双轴复核通过。实际录制/停止、有效 ETL、SYSTEM 子进程 Job breakaway、资源压力、外部追踪共存和 Windows 10/11 验收均未完成，**不把模拟测试等同于发布验收**。详细记录见 [M3 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m3wpr-core)。VERSION 仍为 0.0.9，仅本地提交，不推送。
 
+## V3-M4 — Heap Configuration Transactions（开发实现，发布门关闭）
+
+按冻结规格第 7 节及 M4，在现有安全模块、执行器和测试内实现 Heap 专项事务，没有新增生产模块。M2/M3 的本机复核仍未通过受保护部署/SYSTEM/Win10、11 验收，因此 WPR 与独立 Heap 发布门全部保持 false；没有设置、参数或 Journal 标志可以解锁。VERSION 保持 0.0.9。
+
+- Heap 请求绑定本地原生 x64 PE 文件的路径、映像名与 SHA256；目前只接受限定的普通 `.exe` 名称，其他架构、托管程序、IFEO Filter/子键等兼容性未核验时拒绝。IFEO 作用于所有同名新进程，包含其他路径/用户；控制台确认前显示该范围和目标摘要。已有实例可能需要用户自行重启，工具不启动、重启或终止目标，不增加 Heap Snapshot。
+- 固定 Registry64 IFEO 的 `TracingFlags` 是唯一写入范围。读取失败、类型未知或未确认的配置位均拒绝；原值为 DWORD 1 时复用且不写入，缺失/0 才建立修改事务。记录原值、预期值、目标身份、所有者、UTC、实际读取值、恢复状态及冲突，复用受保护追加 Journal、全局锁和 revision 检查。修改前必须提交并 Flush 意图，写后核验。
+- 停止、ETL 保存与 Heap 恢复保持独立。恢复只处理本工具拥有的值，旁侧 IFEO 值/子键发生变化也会报告冲突，不覆盖外部修改。原先不存在的值只移除该值，新建空键保留。恢复失败进入 CleanupPending，阻断完成/升级/卸载；已知写入结果丢失时重新读取，不重复 Enable，不自动重试未知恢复写入。
+- Watchdog 在可证明追踪和写者已结束后处理配置义务；换启动会话重新核验实际 ETW 和配置。未知归属或仍有写者时拒绝写入。`TraceRecovery` 增加 `RECOVER HEAP CONFIG`，只处理已有受保护事务；发生冲突须先由管理员恢复原值，再通过只读核验记账，不能强制覆盖。此入口同样受未验收发布门限制。
+- 配置准备失败但尚未派发 WPR 时，恢复入口会核验完整 Journal、已恢复配置/无写前意图、成功枚举所得的派发标记缺失和实际 ETW 状态。证明成立后记录不可变的 `PreStartResolution`，保留异常历史并解除恢复义务；不声称曾经录制或完成 ETL。任何证据未知时继续阻断。
+
+开发回归使用真实 Journal/文件故障夹具，注册表修改与 WPR 启停使用测试替身。实际 IFEO 启用/恢复、有效 Heap ETL、SYSTEM、故障/重启与 Windows 10/11 兼容性和性能均未验收，不能宣布 Preview C / Stable v3。详见 [M4 项目备注](docs/M8-ACCEPTANCE.md#2026-10-25-v3-m4heap-configuration-transactions)。
+
 ### 归因页界面约定
 
 本次为现有 Windows 桌面界面的局部扩展，复用 `New-MiV4DataGrid`、`New-MiLabel` 和主窗口的配色/中文字体，不创建新的 UI 模块或改变已有操作页。Microsoft YaHei UI、浅色背景 `#F3F6FB`、正文 `#17283E`、分隔线 `#DDE5EE` 仍由 MemoryInspector.ps1 统一拥有。原生 TabControl/ComboBox/DataGridView 负责键盘、焦点和内部滚动；归因页的多选是只读诊断特例。未知值显示“不可用”，失效结果清空，选择仅跟随精确实例；后台采集与趋势分析在 Worker 中执行，界面只排版结果。设置、历史、服务及危险确认流程沿用原行为。

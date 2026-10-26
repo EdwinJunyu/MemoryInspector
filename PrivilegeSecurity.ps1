@@ -2,7 +2,7 @@
 <#
 Milestone 6: shared, conservative installation and privileged-protocol checks.
 Only the elevated installer/executor may WRITE protected state.
-There are no Windows service or process mutations in this module.
+No service or target-process mutations; Heap configuration writes require protected transactions.
 #>
 function Get-MiSecurityPaths {
     $pf = $env:ProgramW6432
@@ -295,11 +295,23 @@ function Assert-MiTraceSession {
     if ($Session.State -ceq 'Completed' -and ($Session.StopState -cne 'Confirmed' -or $Session.SaveState -cne 'Saved' -or
         $Session.CleanupState -cnotin @('NotRequired','Restored') -or $Session.AnalysisState -cnotin @('Complete','Unavailable') -or
         $Session.ActiveReferences -ne 0)) { throw 'Unfinished trace cannot be Completed.' }
+    if ($null -ne $Session.PreStartResolution) {
+        $resolution=$Session.PreStartResolution
+        if ($Session.State -cne 'RecoveryRequired' -or $Session.RequestedTraceType -cne 'Heap' -or
+            -not (Test-MiGuidN $Session.AuthorizationId) -or -not (Test-MiGuidN $Session.HeapTransactionId) -or
+            $Session.CleanupState -cne 'Restored' -or $null -ne $Session.StartedUtc -or $null -ne $Session.StartProcess -or
+            $null -ne $Session.OwnershipEvidence -or $null -ne $Session.StopOperationId -or $null -ne $Session.StopProcess -or $null -ne $Session.OutputArtifactId -or
+            $Session.StopState -cne 'NotStarted' -or $Session.SaveState -cne 'NotStarted' -or $Session.ActiveReferences -ne 0 -or
+            $resolution.SchemaVersion -ne 1 -or $resolution.Outcome -cne 'NoTraceDispatched' -or
+            $resolution.ConfigOutcome -cnotin @('Restored','NoWriteIntent') -or $resolution.BootSessionId -cnotmatch '^\d{1,19}$') {throw 'Invalid pre-start recovery resolution.'}
+        [void](ConvertTo-MiTraceUtc $resolution.VerifiedUtc)
+    }
 }
 function Test-MiTraceObligation {
     param($Session)
     Assert-MiTraceSession $Session
     if ($Session.CleanupState -cnotin @('NotRequired','Restored') -or $Session.ActiveReferences -ne 0) { return $true }
+    if ($null -ne $Session.PreStartResolution) {return $false}
     if ($Session.State -ceq 'Completed') { return $false }
     # 只有尚未授权、未发生外部副作用的拒绝请求才无需恢复；Saved 从来不是完成。
     return -not ($Session.State -cin @('ConflictBlocked','AuthorizationDenied','ResourcePreflightRejected') -and
@@ -312,6 +324,7 @@ function Assert-MiTraceTransition {
     if ($null -eq $Previous) {
         if ($Next.State -cne 'Requested') { throw 'Trace must begin at Requested.' }; return
     }
+    if ($null -ne $Previous.PreStartResolution) {throw 'Resolved pre-start session cannot be reopened or replayed.'}
     foreach ($field in @('TraceSessionId','WprInstanceName','OwnerSid','BootSessionId','RequestedTraceType','RecordingMode','RequestedDuration')) {
         if ($Previous.$field -cne $Next.$field) { throw 'Immutable trace identity changed.' }
     }
@@ -325,14 +338,14 @@ function Assert-MiTraceTransition {
         Stopping=@('Stopping','Saving','UnknownOutcome','TraceNotSaved','RecoveryRequired'); Saving=@('Saving','Saved','TraceNotSaved','UnknownOutcome','RecoveryRequired')
         Saved=@('Saved','Cleaning','RecoveryRequired'); Cleaning=@('Cleaning','Analyzing','CleanupPending','RecoveryRequired')
         Analyzing=@('Analyzing','Completed','AnalysisPartial','RecoveryRequired'); AnalysisPartial=@('Analyzing','RecoveryRequired')
-        CleanupPending=@('RecoveryRequired'); UnknownOutcome=@('RecoveryRequired'); TraceNotSaved=@('RecoveryRequired')
+        CleanupPending=@('CleanupPending','RecoveryRequired'); UnknownOutcome=@('UnknownOutcome','RecoveryRequired'); TraceNotSaved=@('TraceNotSaved','RecoveryRequired')
         RecoveryRequired=@('RecoveryRequired','Saving')
     }
     if (-not $edges.ContainsKey([string]$Previous.State) -or $Next.State -cnotin $edges[[string]$Previous.State]) { throw 'Illegal trace transition or replay.' }
     if ($Previous.State -ceq 'RecoveryRequired' -and $Next.State -ceq 'Saving' -and
         ($Previous.StopState -cne 'Confirmed' -or -not (Test-MiGuidN $Previous.PlannedArtifactId))) {throw 'Recovery cannot invent stop or artifact ownership.'}
     if ($Previous.CleanupState -cin @('Pending','Conflict') -and $Next.CleanupState -ceq 'NotRequired') { throw 'Cleanup obligation cannot disappear.' }
-    foreach ($field in @('StartOperationId','StopOperationId','StartProcess','StopProcess','OwnershipEvidence','WorkspaceId','PlannedArtifactId','StartIntentUtc','StopRequestedUtc','ExternalSessions')) {
+    foreach ($field in @('StartOperationId','StopOperationId','StartProcess','StopProcess','OwnershipEvidence','WorkspaceId','PlannedArtifactId','StartIntentUtc','StopRequestedUtc','ExternalSessions','HeapTransactionId','PreStartResolution')) {
         if ($null -ne $Previous.$field -and ($Previous.$field|ConvertTo-Json -Compress -Depth 12) -cne ($Next.$field|ConvertTo-Json -Compress -Depth 12)) {throw 'Bound WPR operation identity changed.'}
     }
 }
@@ -343,7 +356,7 @@ function Read-MiTraceJournal {
     Assert-MiTracePath $p.TraceRoot; Assert-MiTracePath $p.TraceJournal; Assert-MiTracePath $p.TraceWorkspace
     $text=[IO.File]::ReadAllText($p.TraceJournal,[Text.UTF8Encoding]::new($false,$true))
     if ([string]::IsNullOrWhiteSpace($text) -or -not $text.EndsWith("`n")) { throw 'Empty or torn trace journal; recovery required.' }
-    $result=[pscustomobject]@{Revision=0;Hash=('0'*64);Sessions=@{};Artifacts=@{};Challenge=$null;Response=$null;Deployment=$null;DeploymentRecord=$null;InstallationId=$null}
+    $result=[pscustomobject]@{Revision=0;Hash=('0'*64);Sessions=@{};Artifacts=@{};HeapTransactions=@{};Challenge=$null;Response=$null;Deployment=$null;DeploymentRecord=$null;InstallationId=$null}
     foreach ($line in $text.Split([char]10)) {
         if ($line.Length -eq 0) { continue }
         $entry=$line|ConvertFrom-Json -ErrorAction Stop
@@ -365,11 +378,17 @@ function Read-MiTraceJournal {
                 if ($result.Revision -eq 0 -or $payload.JournalRevision -ne $entry.Revision) { throw 'Invalid trace session revision.' }
                 $old=$result.Sessions[$payload.TraceSessionId]
                 Assert-MiTraceTransition $old $payload
+                Assert-MiHeapSessionBinding $payload $result
                 $result.Sessions[$payload.TraceSessionId]=$payload
             }
             'Artifact' {
                 Assert-MiTraceArtifactTransition $result.Artifacts[$payload.ArtifactId] $payload $result
                 $result.Artifacts[$payload.ArtifactId]=$payload
+            }
+            'HeapTransaction' {
+                if ($payload.JournalRevision -ne $entry.Revision) {throw 'Invalid Heap transaction revision.'}
+                Assert-MiHeapTransactionTransition $result.HeapTransactions[$payload.TransactionId] $payload $result
+                $result.HeapTransactions[$payload.TransactionId]=$payload
             }
             'Deployment' {
                 if ($result.Revision -eq 0 -or $payload.State -cnotin @('Pending','Ready','RecoveryRequired','Retired')) { throw 'Invalid deployment state.' }
@@ -404,9 +423,14 @@ function Add-MiTraceJournalRecord {
     if ($Kind -ceq 'Session') {
         $Payload.JournalRevision=$ExpectedRevision+1
         Assert-MiTraceTransition $current.Sessions[$Payload.TraceSessionId] $Payload
+        Assert-MiHeapSessionBinding $Payload $current
         if (-not $current.Sessions.ContainsKey($Payload.TraceSessionId) -and
             @($current.Sessions.Values|Where-Object {Test-MiTraceObligation $_}).Count -ne 0) { throw 'Existing trace requires recovery.' }
     } elseif ($Kind -ceq 'Artifact') {Assert-MiTraceArtifactTransition $current.Artifacts[$Payload.ArtifactId] $Payload $current}
+    elseif ($Kind -ceq 'HeapTransaction') {
+        $Payload.JournalRevision=$ExpectedRevision+1
+        Assert-MiHeapTransactionTransition $current.HeapTransactions[$Payload.TransactionId] $Payload $current
+    }
     elseif ($Kind -cin @('Deployment','HealthChallenge','HealthResponse')) { Assert-MiTraceControlRecord $Kind $Payload $current }
     else { throw 'Unsupported journal operation.' }
     $json=$Payload|ConvertTo-Json -Compress -Depth 12
@@ -459,6 +483,7 @@ function Initialize-MiTraceJournal {
 }
 function Assert-MiTraceQuiescent {
     param($Journal)
+    if (@($Journal.HeapTransactions.Values|Where-Object {$_.RestoreState -cnotin @('Restored','Unchanged')}).Count -gt 0) {throw 'Unfinished Heap configuration transaction blocks deployment.'}
     if (@($Journal.Sessions.Values|Where-Object {Test-MiTraceObligation $_}).Count -gt 0) { throw 'Unfinished trace or cleanup blocks deployment; use TraceRecovery.' }
     if ($null -ne $Journal.Artifacts -and @($Journal.Artifacts.Values|Where-Object {$_.State -cin @('Saving','Retiring') -or $_.ActiveReferences -gt 0}).Count -gt 0) {throw 'Artifact transaction or reference blocks deployment.'}
 }
@@ -592,6 +617,7 @@ function Update-MiTraceSupervision {
         $session.LastVerifiedUtc=$now.ToString('o')
         $j=Add-MiTraceJournalRecord $Lock $j.Revision 'Session' $session
     }
+    if ((Get-MiHeapReleaseStatus).Enabled) {$j=Update-MiHeapCleanup $Lock}
     if ((Get-MiWprReleaseStatus).Enabled -and @($j.Sessions.Values|Where-Object {Test-MiTraceObligation $_}).Count -eq 0) {$j=Invoke-MiTraceRetention $Lock}
     return $j
 }
@@ -673,10 +699,12 @@ function Get-MiTraceRecoveryReport {
             Deployment=$j.Deployment;JournalRevision=$j.Revision;Watchdog=$taskStatus;Sessions=@($j.Sessions.Values);
             UpgradeBlocked=($serviceBlocked -or $j.Deployment -cne 'Ready' -or $taskStatus -cne 'DefinitionVerified' -or
                 @($j.Sessions.Values|Where-Object {Test-MiTraceObligation $_}).Count -gt 0 -or
+                @($j.HeapTransactions.Values|Where-Object {$_.RestoreState -cnotin @('Restored','Unchanged')}).Count -gt 0 -or
                 @($j.Artifacts.Values|Where-Object {$_.State -cin @('Saving','Retiring') -or $_.ActiveReferences -gt 0}).Count -gt 0);
             DeploymentBlocked=($j.Deployment -cne 'Ready');TaskBlocked=($taskStatus -cne 'DefinitionVerified');
             ServiceRecoveryBlocked=$serviceBlocked;
-            WprState='ReleaseAcceptancePending';WprRelease=(Get-MiWprReleaseStatus);Artifacts=@($j.Artifacts.Values);HeapTransactions='NotSupportedInM3';
+            WprState='ReleaseAcceptancePending';WprRelease=(Get-MiWprReleaseStatus);Artifacts=@($j.Artifacts.Values);
+            HeapRelease=(Get-MiHeapReleaseStatus);HeapTransactions=@($j.HeapTransactions.Values);
             Guidance='Preserve protected journal and artifacts. Unknown WPR outcomes are never retried. Saved artifact recovery requires confirmed stop, no active writer and verified byte identity. Release gates remain closed until Windows acceptance.'}
     } finally { $lock.Dispose() }
 }
@@ -715,12 +743,343 @@ function Get-MiWprReleaseStatus {
     return [pscustomobject]@{SchemaVersion=1;Enabled=$false;M2Accepted=$false;MemoryAccepted=$false;FileAccepted=$false;
         Reason='M2ProtectedDeploymentAndM3WindowsAcceptancePending'}
 }
+function Get-MiHeapReleaseStatus {
+    # M4 独立验收，不允许通过用户设置/Journal/参数解锁；M2/M3 也必须先通过。
+    return [pscustomobject]@{SchemaVersion=1;Enabled=$false;ConfigurationAccepted=$false;RecoveryAccepted=$false;
+        Reason='M2M3AndM4WindowsHeapAcceptancePending'}
+}
+function Assert-MiHeapReleaseAccepted {
+    Assert-MiWprReleaseAccepted
+    $gate=Get-MiHeapReleaseStatus
+    if (-not $gate.Enabled -or -not $gate.ConfigurationAccepted -or -not $gate.RecoveryAccepted) {throw ('Heap diagnosis disabled: '+$gate.Reason)}
+}
 function Assert-MiWprReleaseAccepted {
     $gate=Get-MiWprReleaseStatus
     if (-not $gate.Enabled -or -not $gate.M2Accepted -or -not $gate.MemoryAccepted) {throw ('Advanced tracing disabled: '+$gate.Reason)}
 }
+# V3-M4：只管理固定 IFEO/TracingFlags 的完整 DWORD，不能接受注册表路径或默认清理命令。
+function Assert-MiHeapImageName {
+    param([string]$ImageName)
+    if ($ImageName -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\.exe$' -or $ImageName.Contains('..')) {throw 'Unsupported Heap image name.'}
+}
+function Get-MiHeapTargetIdentity {
+    param([string]$Path)
+    if ($Path -notmatch '^[A-Za-z]:\\' -or $Path -match '["\r\n]' -or $Path.Substring(2).Contains(':')) {throw 'Heap requires an absolute local executable path.'}
+    $full=[IO.Path]::GetFullPath($Path);$name=[IO.Path]::GetFileName($full)
+    Assert-MiHeapImageName $name
+    $ancestor=$full
+    while (-not [string]::IsNullOrEmpty($ancestor)) {
+        if (-not (Test-MiNoReparse $ancestor)) {throw 'Heap target or ancestor is missing/reparse.'}
+        $ancestor=[IO.Path]::GetDirectoryName($ancestor)
+    }
+    # 同一只读句柄同时验证 PE 与摘要；读取期间不允许文件被改写/替换。
+    $stream=[IO.File]::Open($full,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 256 -or $stream.Length -gt 1073741824) {throw 'Unsupported Heap executable size.'}
+        $reader=[IO.BinaryReader]::new($stream)
+        if ($reader.ReadUInt16() -ne 0x5A4D) {throw 'Heap target is not a PE image.'}
+        $stream.Position=60;$offset=$reader.ReadInt32()
+        if ($offset -lt 64 -or $offset+256 -gt $stream.Length) {throw 'Invalid PE header.'}
+        $stream.Position=$offset
+        if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) {throw 'Heap MVP supports native x64 desktop images only.'}
+        $stream.Position=$offset+24
+        if ($reader.ReadUInt16() -ne 0x20B) {throw 'Unsupported PE optional header.'}
+        $stream.Position=$offset+24+224
+        if ($reader.ReadUInt32() -ne 0) {throw 'Managed Heap compatibility is not accepted.'}
+        $stream.Position=0;$sha=[Security.Cryptography.SHA256]::Create()
+        try {$hash=[BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-','')} finally {$sha.Dispose()}
+        return [pscustomobject][ordered]@{Path=$full;ImageName=$name;Sha256=$hash;Machine='NativeX64'}
+    } finally {$stream.Dispose()}
+}
+function Assert-MiHeapRegistryAcl {
+    param($Key,[switch]$Ancestor)
+    $acl=$Key.GetAccessControl();$owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $trusted=@('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($owner -cnotin $trusted) {throw 'Untrusted IFEO registry owner.'}
+    $danger=[long]([Security.AccessControl.RegistryRights]::Delete -bor [Security.AccessControl.RegistryRights]::ChangePermissions -bor [Security.AccessControl.RegistryRights]::TakeOwnership) -bor 268435456 -bor 1073741824
+    if (-not $Ancestor) {$danger=$danger -bor [long][Security.AccessControl.RegistryRights]::SetValue -bor [long][Security.AccessControl.RegistryRights]::CreateSubKey}
+    foreach ($ace in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+        # CREATOR OWNER 是所有者占位符，不是 Everyone；实际所有者已经单独核验。
+        $sid=if ($ace.IdentityReference.Value -ceq 'S-1-3-0') {$owner} else {$ace.IdentityReference.Value}
+        if (($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 -and
+            $ace.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            $sid -cnotin $trusted -and ([long]$ace.RegistryRights -band $danger) -ne 0) {throw 'IFEO registry is writable by an untrusted principal.'}
+    }
+}
+function Open-MiHeapRegistryRoot {
+    param([switch]$Writable)
+    # 不使用 PSDrive、32 位重定向或调用者提供的键。每层都检查普通用户无法改写。
+    $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $path=''
+        foreach ($part in @('SOFTWARE','Microsoft','Windows NT','CurrentVersion','Image File Execution Options')) {
+            $path=if ($path -eq '') {$part} else {$path+'\'+$part}
+            $key=$base.OpenSubKey($path)
+            if ($null -eq $key) {throw 'Fixed IFEO parent is unavailable.'}
+            try {Assert-MiHeapRegistryAcl $key -Ancestor:($part -cne 'Image File Execution Options')} finally {$key.Dispose()}
+        }
+        return $base.OpenSubKey($path,[bool]$Writable)
+    } finally {$base.Dispose()}
+}
+function Read-MiHeapRegistryKey {
+    param($Key)
+    $others=@();$children=@();$exists=$false;$kind='';$value=$null
+    if ($null -ne $Key) {
+        Assert-MiHeapRegistryAcl $Key
+        foreach ($name in @($Key.GetValueNames()|Sort-Object)) {
+            if ($name -ieq 'TracingFlags') {
+                $exists=$true;$kind=$Key.GetValueKind($name).ToString()
+                if ($kind -ceq 'DWord') {$value=([long]$Key.GetValue($name) -band 4294967295)}
+            } else {
+                $others+=,[ordered]@{Name=$name;Kind=$Key.GetValueKind($name).ToString();Value=$Key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)}
+            }
+        }
+        $children=@($Key.GetSubKeyNames()|Sort-Object)
+    }
+    $context=Get-MiTraceHash (([ordered]@{Values=@($others);Children=@($children)})|ConvertTo-Json -Compress -Depth 8)
+    $supported=$children.Count -eq 0 -and @($others|Where-Object Name -ieq 'UseFilter').Count -eq 0
+    return [pscustomobject][ordered]@{KeyExists=($null -ne $Key);ValueExists=$exists;Kind=$kind;Value=$value;ContextFingerprint=$context;ScopeSupported=$supported}
+}
+function Get-MiHeapConfiguration {
+    param([string]$ImageName)
+    Assert-MiHeapImageName $ImageName
+    $parent=Open-MiHeapRegistryRoot
+    try {
+        $key=$parent.OpenSubKey($ImageName)
+        try {return Read-MiHeapRegistryKey $key} finally {if ($null -ne $key) {$key.Dispose()}}
+    } finally {$parent.Dispose()}
+}
+function Test-MiHeapConfigEqual {
+    param($Left,$Right)
+    # 不删除新建的空 IFEO 键；只比较本工具拥有的值和旁侧配置，键存在本身不是配置位。
+    return $null -ne $Left -and $null -ne $Right -and $Left.ValueExists -eq $Right.ValueExists -and
+        $Left.Kind -ceq $Right.Kind -and $Left.Value -ceq $Right.Value -and $Left.ContextFingerprint -ceq $Right.ContextFingerprint -and $Left.ScopeSupported -eq $Right.ScopeSupported
+}
+function Get-MiHeapConfigDisposition {
+    param($Config)
+    if (-not $Config.ScopeSupported) {throw 'Filtered/packaged IFEO configuration compatibility unknown.'}
+    if (-not $Config.ValueExists -or ($Config.Kind -ceq 'DWord' -and $Config.Value -eq 0)) {return 'Modify'}
+    if ($Config.Kind -ceq 'DWord' -and $Config.Value -eq 1) {return 'Compatible'}
+    throw 'Existing Heap configuration compatibility unknown; no modification allowed.'
+}
+function Assert-MiHeapSessionBinding {
+    param($Session,$Journal)
+    if ($Session.RequestedTraceType -cne 'Heap' -or $null -eq $Session.AuthorizationId) {return}
+    if (-not (Test-MiGuidN $Session.HeapTransactionId) -or $Session.CleanupState -ceq 'NotRequired') {throw 'Authorized Heap session lacks a cleanup obligation.'}
+    $tx=$Journal.HeapTransactions[$Session.HeapTransactionId]
+    if ($null -ne $tx -and $tx.TraceSessionId -cne $Session.TraceSessionId) {throw 'Heap transaction belongs to another trace.'}
+    $noIntent=$null -ne $Session.PreStartResolution -and $Session.PreStartResolution.ConfigOutcome -ceq 'NoWriteIntent' -and $null -eq $tx -and
+        @($Journal.HeapTransactions.Values|Where-Object TraceSessionId -ceq $Session.TraceSessionId).Count -eq 0
+    if ($null -ne $Session.PreStartResolution -and $Session.PreStartResolution.ConfigOutcome -ceq 'NoWriteIntent' -and -not $noIntent) {throw 'NoWriteIntent conflicts with recorded Heap intent.'}
+    if ($Session.CleanupState -ceq 'Restored' -and -not $noIntent -and ($null -eq $tx -or $tx.RestoreState -cne 'Restored')) {throw 'Heap cleanup has no verified transaction outcome.'}
+    if ($null -ne $Session.PreStartResolution -and -not $noIntent -and ($null -eq $tx -or $tx.RestoreState -cne 'Restored')) {throw 'Unproven pre-start Heap outcome.'}
+}
+function Assert-MiHeapTransactionTransition {
+    param($Previous,$Next,$Journal)
+    $fields=@('SchemaVersion','TransactionId','TraceSessionId','TargetImageIdentity','OriginalConfig','ExpectedModifiedConfig','ConfigOwner',
+        'ChangeUtc','CurrentConfig','RestoreState','ConflictDetected','ErrorCode','JournalRevision')
+    if (@($Next.PSObject.Properties).Count -ne $fields.Count) {throw 'Unexpected Heap transaction structure.'}
+    foreach ($field in $fields) {if ($Next.PSObject.Properties.Name -cnotcontains $field) {throw 'Missing Heap transaction field.'}}
+    $session=$Journal.Sessions[$Next.TraceSessionId]
+    if ($Next.SchemaVersion -ne 1 -or -not (Test-MiGuidN $Next.TransactionId) -or $null -eq $session -or
+        $session.RequestedTraceType -cne 'Heap' -or $session.HeapTransactionId -cne $Next.TransactionId -or
+        $null -eq $session.AuthorizationId -or $Next.ConfigOwner -cnotin @('MemoryInspector','External') -or
+        $Next.ConflictDetected -isnot [bool]) {throw 'Unbound Heap transaction.'}
+    Assert-MiHeapImageName $Next.TargetImageIdentity.ImageName
+    if ($Next.TargetImageIdentity.Path -notmatch '^[A-Za-z]:\\' -or
+        [IO.Path]::GetFileName($Next.TargetImageIdentity.Path) -cne $Next.TargetImageIdentity.ImageName -or
+        $Next.TargetImageIdentity.Sha256 -cnotmatch '^[A-F0-9]{64}$' -or $Next.TargetImageIdentity.Machine -cne 'NativeX64') {throw 'Invalid Heap target identity.'}
+    [void](ConvertTo-MiTraceUtc $Next.ChangeUtc)
+    if ($null -eq $Next.OriginalConfig -or $null -eq $Next.ExpectedModifiedConfig) {throw 'Missing Heap change snapshots.'}
+    foreach ($config in @($Next.OriginalConfig,$Next.ExpectedModifiedConfig,$Next.CurrentConfig)) {
+        if ($null -eq $config) {continue}
+        if (@($config.PSObject.Properties).Count -ne 6 -or $config.KeyExists -isnot [bool] -or $config.ValueExists -isnot [bool] -or $config.ScopeSupported -isnot [bool] -or
+            $config.ContextFingerprint -cnotmatch '^[A-F0-9]{64}$' -or
+            (-not $config.ValueExists -and ($config.Kind -cne '' -or $null -ne $config.Value)) -or
+            ($config.ValueExists -and (-not $config.KeyExists -or $config.Kind -cnotin @('DWord','String','ExpandString','Binary','MultiString','QWord','None','Unknown'))) -or
+            ($config.Kind -ceq 'DWord' -and (($config.Value -isnot [int] -and $config.Value -isnot [long]) -or $config.Value -lt 0 -or $config.Value -gt 4294967295))) {throw 'Invalid Heap configuration snapshot.'}
+    }
+    $disposition=Get-MiHeapConfigDisposition $Next.OriginalConfig
+    if ($Next.ExpectedModifiedConfig.ValueExists -ne $true -or $Next.ExpectedModifiedConfig.Kind -cne 'DWord' -or
+        $Next.ExpectedModifiedConfig.Value -ne 1 -or $Next.OriginalConfig.ContextFingerprint -cne $Next.ExpectedModifiedConfig.ContextFingerprint -or
+        ($Next.ConfigOwner -ceq 'External') -ne ($disposition -ceq 'Compatible')) {throw 'Heap change exceeds the owned configuration scope.'}
+    if ($Next.RestoreState -cnotin @('Intent','Applied','Unchanged','Restoring','Restored','CleanupPending','Conflict') -or
+        ($Next.ConflictDetected -ne ($Next.RestoreState -ceq 'Conflict'))) {throw 'Invalid Heap restore state.'}
+    if ($Next.RestoreState -ceq 'Restored' -and -not (Test-MiHeapConfigEqual $Next.CurrentConfig $Next.OriginalConfig)) {throw 'Heap restoration is not verified.'}
+    if ($Next.RestoreState -cin @('Applied','Unchanged') -and -not (Test-MiHeapConfigEqual $Next.CurrentConfig $Next.ExpectedModifiedConfig)) {throw 'Heap configuration result is not verified.'}
+    if ($null -eq $Previous) {
+        if ($session.State -cne 'Preparing' -or $Next.RestoreState -cne $(if ($disposition -ceq 'Compatible') {'Unchanged'} else {'Intent'})) {throw 'Heap transaction must begin before modification.'}
+        if (@($Journal.HeapTransactions.Values|Where-Object TraceSessionId -ceq $Next.TraceSessionId).Count -gt 0) {throw 'Duplicate Heap transaction.'}
+        return
+    }
+    foreach ($field in @('TransactionId','TraceSessionId','TargetImageIdentity','OriginalConfig','ExpectedModifiedConfig','ConfigOwner','ChangeUtc')) {
+        if (($Previous.$field|ConvertTo-Json -Compress -Depth 8) -cne ($Next.$field|ConvertTo-Json -Compress -Depth 8)) {throw 'Immutable Heap change intent altered.'}
+    }
+    $edges=@{Intent=@('Applied','Restoring','Restored','CleanupPending','Conflict');Applied=@('Restoring','Restored','CleanupPending','Conflict');
+        Restoring=@('Restored','CleanupPending','Conflict');CleanupPending=@('Restoring','Restored','CleanupPending','Conflict');
+        Unchanged=@('Restored','CleanupPending','Conflict');Conflict=@('Restored')}
+    if (-not $edges.ContainsKey([string]$Previous.RestoreState) -or $Next.RestoreState -cnotin $edges[[string]$Previous.RestoreState]) {throw 'Illegal Heap transaction transition; conflict needs administrator repair.'}
+}
+function Set-MiHeapConfiguration {
+    param($Lock,$Transaction,[switch]$Restore)
+    Assert-MiHeapReleaseAccepted
+    $j=Read-MiTraceJournal $Lock;$bound=$j.HeapTransactions[$Transaction.TransactionId]
+    if ($null -eq $bound -or ($bound|ConvertTo-Json -Compress -Depth 10) -cne ($Transaction|ConvertTo-Json -Compress -Depth 10) -or
+        $bound.ConfigOwner -cne 'MemoryInspector' -or $bound.RestoreState -cne $(if ($Restore) {'Restoring'} else {'Intent'})) {throw 'Registry write lacks a current protected intent.'}
+    $expected=if ($Restore) {$bound.ExpectedModifiedConfig} else {$bound.OriginalConfig}
+    $desired=if ($Restore) {$bound.OriginalConfig} else {$bound.ExpectedModifiedConfig}
+    $parent=Open-MiHeapRegistryRoot -Writable
+    try {
+        $key=$parent.OpenSubKey($bound.TargetImageIdentity.ImageName,$true)
+        try {
+            if (-not (Test-MiHeapConfigEqual (Read-MiHeapRegistryKey $key) $expected)) {throw 'Heap compare-before-write conflict.'}
+            if ($null -eq $key) {$key=$parent.CreateSubKey($bound.TargetImageIdentity.ImageName)}
+            # 创建后再读；发现其他修改便拒绝。外部管理员不受本工具互斥约束，写后仍需核验。
+            if (-not (Test-MiHeapConfigEqual (Read-MiHeapRegistryKey $key) $expected)) {throw 'Heap configuration changed before write.'}
+            if ($desired.ValueExists) {$key.SetValue('TracingFlags',[int]$desired.Value,[Microsoft.Win32.RegistryValueKind]::DWord)}
+            else {$key.DeleteValue('TracingFlags',$false)}
+            $key.Flush()
+            return Read-MiHeapRegistryKey $key
+        } finally {if ($null -ne $key) {$key.Dispose()}}
+    } finally {$parent.Dispose()}
+}
+function Initialize-MiHeapTransaction {
+    param($Lock,$Session,$Target)
+    Assert-MiHeapReleaseAccepted
+    $j=Read-MiTraceJournal $Lock
+    $fresh=Get-MiHeapTargetIdentity $Target.Path
+    if (($fresh|ConvertTo-Json -Compress) -cne ($Target|ConvertTo-Json -Compress)) {throw 'Heap executable identity changed.'}
+    $original=Get-MiHeapConfiguration $Target.ImageName;$disposition=Get-MiHeapConfigDisposition $original
+    $expected=[pscustomobject][ordered]@{KeyExists=$true;ValueExists=$true;Kind='DWord';Value=1;ContextFingerprint=$original.ContextFingerprint;ScopeSupported=$true}
+    $tx=[pscustomobject][ordered]@{SchemaVersion=1;TransactionId=$Session.HeapTransactionId;TraceSessionId=$Session.TraceSessionId;TargetImageIdentity=$Target;
+        OriginalConfig=$original;ExpectedModifiedConfig=$expected;ConfigOwner=if ($disposition -ceq 'Compatible') {'External'} else {'MemoryInspector'};
+        ChangeUtc=[datetime]::UtcNow.ToString('o');CurrentConfig=$original;RestoreState=if ($disposition -ceq 'Compatible') {'Unchanged'} else {'Intent'};
+        ConflictDetected=$false;ErrorCode=$null;JournalRevision=1}
+    $j=Add-MiTraceJournalRecord $Lock $j.Revision 'HeapTransaction' $tx
+    if ($tx.ConfigOwner -ceq 'External') {return $j}
+    # 只有 Flush 成功的 Intent 才有写入资格；失败/崩溃不会重复执行 Enable。
+    $tx.CurrentConfig=Set-MiHeapConfiguration $Lock $j.HeapTransactions[$tx.TransactionId]
+    if (-not (Test-MiHeapConfigEqual $tx.CurrentConfig $expected)) {throw 'Heap enable verification failed.'}
+    $tx.RestoreState='Applied'
+    return Add-MiTraceJournalRecord $Lock $j.Revision 'HeapTransaction' $tx
+}
+function Test-MiWprNotDispatched {
+    param($Session,$Journal)
+    if ($null -ne $Session.StartProcess -or $null -ne $Session.StartedUtc -or $null -ne $Session.DeadlineUtc -or
+        $null -ne $Session.OwnershipEvidence -or $null -ne $Session.StopOperationId -or $null -ne $Session.StopProcess -or
+        $null -ne $Session.OutputArtifactId -or $Session.StopState -cne 'NotStarted' -or $Session.SaveState -cne 'NotStarted' -or
+        @($Journal.Artifacts.Values|Where-Object TraceSessionId -ceq $Session.TraceSessionId).Count -gt 0) {return $false}
+    $paths=Get-MiWprSessionPaths $Session;$parent=(Get-MiSecurityPaths).TraceWorkspace
+    Assert-MiTracePath $parent
+    # File.Exists 会把访问错误吞成 false；枚举必须成功，才能把“没有持久化派发标记”作为证据。
+    $entries=@([IO.Directory]::GetFileSystemEntries($parent))
+    if ($entries -icontains $paths.Workspace) {
+        Assert-MiTracePath $paths.Workspace
+        $entries=@([IO.Directory]::GetFileSystemEntries($paths.Workspace))
+        if ($entries -icontains $paths.StartMarker -or $entries -icontains $paths.StopMarker) {return $false}
+    }
+    $observed=@(Get-MiEtwSessions)
+    return @($observed|Where-Object {$_.Name.StartsWith(('WPR_initiated_'+$Session.WprInstanceName+'_'),[StringComparison]::Ordinal)}).Count -eq 0
+}
+function Restore-MiHeapTransaction {
+    param($Lock,[string]$TransactionId,[switch]$RetryPending)
+    Assert-MiHeapReleaseAccepted
+    $j=Read-MiTraceJournal $Lock;$tx=$j.HeapTransactions[$TransactionId]
+    if ($null -eq $tx) {throw 'Unknown Heap transaction; no speculative cleanup.'}
+    if ($tx.RestoreState -ceq 'Restored' -or ($tx.RestoreState -ceq 'Conflict' -and -not $RetryPending)) {return $j}
+    $session=$j.Sessions[$tx.TraceSessionId]
+    try {
+        # 即使是配置恢复，也不能在未知追踪/仍在运行的启动或保存进程旁猜测性写注册表。
+        $bootChanged=$session.BootSessionId -cne (Get-MiBootSessionId)
+        $observed=@(Get-MiEtwSessions)
+        if (@($observed|Where-Object {$_.Name.StartsWith(('WPR_initiated_'+$session.WprInstanceName+'_'),[StringComparison]::Ordinal)}).Count -ne 0) {throw 'Known trace may still be recording.'}
+        if (-not $bootChanged) {
+            foreach ($process in @($session.StartProcess,$session.StopProcess)) {
+                if ($null -ne $process -and (Test-MiWprProcessRunning $process)) {throw 'Known WPR writer may still be running.'}
+            }
+            if ($session.StopState -cne 'Confirmed') {
+                if (-not (Test-MiWprNotDispatched $session $j)) {throw 'Unconfirmed WPR dispatch blocks Heap restore.'}
+            }
+        }
+        $tx.CurrentConfig=Get-MiHeapConfiguration $tx.TargetImageIdentity.ImageName
+        if (Test-MiHeapConfigEqual $tx.CurrentConfig $tx.OriginalConfig) {
+            $tx.RestoreState='Restored';$tx.ConflictDetected=$false;$tx.ErrorCode=$null
+        } elseif ($tx.RestoreState -ceq 'Conflict') {
+            return $j # 管理员须先在系统中恢复原值；本工具不覆盖已报告的外部变化。
+        } elseif (-not (Test-MiHeapConfigEqual $tx.CurrentConfig $tx.ExpectedModifiedConfig)) {
+            $tx.RestoreState='Conflict';$tx.ConflictDetected=$true;$tx.ErrorCode='ExternalConfigurationChanged'
+        } else {
+            if ($tx.RestoreState -cin @('Restoring','CleanupPending') -and -not $RetryPending) {throw 'Prior restore outcome requires explicit recovery after a fresh read; no automatic retry.'}
+            # Restoring 是写前意图；重入先查询真实值，恢复已完成时只补记结果。
+            if ($tx.RestoreState -cne 'Restoring') {
+                $tx.RestoreState='Restoring';$j=Add-MiTraceJournalRecord $Lock $j.Revision 'HeapTransaction' $tx
+            }
+            $tx.CurrentConfig=Set-MiHeapConfiguration $Lock $j.HeapTransactions[$TransactionId] -Restore
+            if (-not (Test-MiHeapConfigEqual $tx.CurrentConfig $tx.OriginalConfig)) {throw 'Heap restore verification failed.'}
+            $tx.RestoreState='Restored';$tx.ErrorCode=$null
+        }
+        return Add-MiTraceJournalRecord $Lock $j.Revision 'HeapTransaction' $tx
+    } catch {
+        $failure=$_.Exception.Message;$j=Read-MiTraceJournal $Lock;$tx=$j.HeapTransactions[$TransactionId]
+        if ($tx.RestoreState -cin @('Restored','Conflict')) {return $j}
+        $tx.RestoreState='CleanupPending';$tx.ErrorCode=$failure
+        return Add-MiTraceJournalRecord $Lock $j.Revision 'HeapTransaction' $tx
+    }
+}
+function Repair-MiHeapTransactions {
+    # 控制器恢复与 SYSTEM 启动/周期恢复共享同一条限定路径，绝不派发 Start/Stop。
+    Assert-MiHeapReleaseAccepted
+    $lease=Enter-MiDeploymentLease
+    try {
+        [void](Assert-MiWatchdog);$lock=Enter-MiTraceLock
+        try {[void](Update-MiHeapCleanup $lock -RetryPending)} finally {$lock.Dispose()}
+    } finally {$lease.Dispose()}
+}
+function Update-MiHeapCleanup {
+    param($Lock,[switch]$RetryPending)
+    $j=Read-MiTraceJournal $Lock
+    foreach ($tx in @($j.HeapTransactions.Values)) {
+        $session=$j.Sessions[$tx.TraceSessionId]
+        if ($tx.RestoreState -ceq 'Restored' -and $session.CleanupState -ceq 'Restored') {continue}
+        if ($session.State -cin @('Recording','DeadlineExceeded','Stopping','Saving')) {continue}
+        $j=Restore-MiHeapTransaction $Lock $tx.TransactionId -RetryPending:$RetryPending
+        $fresh=$j.HeapTransactions[$tx.TransactionId];$session=$j.Sessions[$tx.TraceSessionId]
+        $cleanup=if ($fresh.RestoreState -cin @('Restored','Unchanged')) {'Restored'} elseif ($fresh.RestoreState -ceq 'Conflict') {'Conflict'} else {'Pending'}
+        if ($session.CleanupState -cne $cleanup) {
+            $session.CleanupState=$cleanup
+            # 配置恢复本身不验证 ETL；显式进入已有保存恢复入口，不依赖额外一次 Watchdog 才能继续。
+            if ($cleanup -ceq 'Restored' -and $session.State -ceq 'CleanupPending') {$session.State='RecoveryRequired'}
+            $j=Add-MiTraceJournalRecord $Lock $j.Revision 'Session' $session
+        }
+    }
+    # 完整且可信的 Journal 中没有写前意图，意味着本协议从未授予配置写入资格；
+    # 这与整个 Journal 丢失/截断不同（Read-MiTraceJournal 会在此之前拒绝）。
+    foreach ($session in @($j.Sessions.Values)) {
+        if ($session.RequestedTraceType -cne 'Heap' -or $session.State -cnotin @('UnknownOutcome','RecoveryRequired') -or
+            $null -ne $session.PreStartResolution -or $null -ne $session.StartProcess -or $null -ne $session.StartedUtc -or
+            $null -ne $session.OwnershipEvidence -or $null -ne $session.StopOperationId -or $session.StopState -cne 'NotStarted') {continue}
+        $tx=$j.HeapTransactions[$session.HeapTransactionId]
+        if ($null -ne $tx -and $tx.RestoreState -cne 'Restored') {continue}
+        try {if (-not (Test-MiWprNotDispatched $session $j)) {continue}} catch {continue} # 读取失败不是“没有派发”的证据。
+        $resolution=[pscustomobject][ordered]@{SchemaVersion=1;Outcome='NoTraceDispatched';VerifiedUtc=[datetime]::UtcNow.ToString('o');
+            BootSessionId=(Get-MiBootSessionId);ConfigOutcome=if ($null -eq $tx) {'NoWriteIntent'} else {'Restored'}}
+        $session.State='RecoveryRequired';$session.CleanupState='Restored'
+        Set-MiTraceMember $session 'PreStartResolution' $resolution
+        $j=Add-MiTraceJournalRecord $Lock $j.Revision 'Session' $session
+    }
+    return $j
+}
 function Get-MiWprProfile {
-    param([ValidateSet('VirtualAlloc','Pool')][string]$TraceType,[ValidateSet('Memory','File')][string]$Mode='Memory')
+    param([ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType,[ValidateSet('Memory','File')][string]$Mode='Memory')
+    if ($TraceType -ceq 'Heap') {
+        # Heap collector 只读取已按 IFEO 配置启用的映像；没有 Snapshot 或任意 provider 输入。
+        $xml='<?xml version="1.0" encoding="utf-8"?><WindowsPerformanceRecorder Version="1.0"><Profiles>'+
+            '<HeapEventCollector Id="MiHeapCollector" Name="MemoryInspector Heap Collector"><BufferSize Value="1024"/><Buffers Value="128"/></HeapEventCollector>'+
+            '<HeapEventProvider Id="MiHeapProvider"/><Profile Id="MiHeap.Verbose.'+$Mode+'" Name="MiHeap" Description="MemoryInspector heap diagnosis" LoggingMode="'+$Mode+'" DetailLevel="Verbose">'+
+            '<Collectors><HeapEventCollectorId Value="MiHeapCollector"><HeapEventProviders><HeapEventProviderId Value="MiHeapProvider"/></HeapEventProviders></HeapEventCollectorId></Collectors></Profile></Profiles></WindowsPerformanceRecorder>'
+        return [pscustomobject]@{SchemaVersion=1;Name='MiHeap';Id=('MiHeap.Verbose.'+$Mode);Xml=$xml;Fingerprint=(Get-MiTraceHash $xml);
+            BufferBytes=[long]134217728;CollectorSuffix='MemoryInspector Heap Collector'}
+    }
     $name=if ($TraceType -ceq 'VirtualAlloc') {'MiVirtualAlloc'} else {'MiPool'}
     $keywords=if ($TraceType -ceq 'VirtualAlloc') {'<Keyword Value="VirtualAllocation"/>'} else {'<Keyword Value="Pool"/>'}
     $stacks=if ($TraceType -ceq 'VirtualAlloc') {'<Stack Value="VirtualAllocation"/>'} else {'<Stack Value="PoolAllocation"/><Stack Value="PoolFree"/>'}
@@ -809,6 +1168,9 @@ function Get-MiWprArguments {
 function Start-MiWprProcess {
     param([ValidateSet('Start','Stop')][string]$Verb,$Session)
     Assert-MiWprReleaseAccepted
+    Assert-MiTraceSession $Session
+    if ($null -ne $Session.PreStartResolution) {throw 'Resolved pre-start trace cannot be dispatched.'}
+    if ($Session.RequestedTraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
     $identity=Get-MiWprIdentity
     if (($identity|ConvertTo-Json -Compress) -cne ($Session.WprExecutableIdentity|ConvertTo-Json -Compress)) {throw 'WPR executable identity changed.'}
     $paths=Get-MiWprSessionPaths $Session
@@ -982,7 +1344,8 @@ function Get-MiWprOwnershipEvidence {
         $own[0].ThreadCreated -lt (ConvertTo-MiTraceUtc $Session.StartIntentUtc).ToFileTimeUtc() -or
         @($Observed|Where-Object {$_.Name.StartsWith(('WPR_initiated_'+$Session.WprInstanceName+'_'),[StringComparison]::Ordinal)}).Count -ne 1) {throw 'ETW instance identity cannot be established.'}
     $paths=Get-MiWprSessionPaths $Session
-    if (($own[0].Mode -band 0x02000000) -eq 0) {throw 'Expected system collector mode missing.'}
+    $systemCollector=($own[0].Mode -band 0x02000000) -ne 0
+    if ($systemCollector -ne ($Session.RequestedTraceType -cne 'Heap')) {throw 'Unexpected collector mode.'}
     if ($Session.RecordingMode -ceq 'File') {
         if ([string]::IsNullOrWhiteSpace($own[0].FileName) -or -not [IO.Path]::GetFullPath($own[0].FileName).StartsWith(
             $paths.Temporary+'\',[StringComparison]::OrdinalIgnoreCase)) {throw 'ETW temporary file location differs from protected workspace.'}
@@ -994,6 +1357,7 @@ function Get-MiWprOwnershipEvidence {
 function Assert-MiWprOwnership {
     param($Session,$Observed)
     Assert-MiWprReleaseAccepted
+    if ($Session.RequestedTraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
     if ($Session.BootSessionId -cne (Get-MiBootSessionId) -or -not (Test-MiGuidN $Session.StartOperationId) -or
         $null -eq $Session.StartProcess -or $null -eq $Session.OwnershipEvidence) {throw 'Protected WPR ownership evidence missing or wrong boot.'}
     $current=Get-MiWprOwnershipEvidence $Session $Observed
@@ -1006,7 +1370,7 @@ function Set-MiTraceMember {
     $Session|Add-Member NoteProperty $Name $Value -Force
 }
 function New-MiWprSession {
-    param([string]$Id,[ValidateSet('VirtualAlloc','Pool')][string]$TraceType='VirtualAlloc',
+    param([string]$Id,[ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType='VirtualAlloc',
         [ValidateSet('Memory','File')][string]$Mode='Memory',[ValidateRange(300,1800)][int]$DurationSeconds=300)
     if (-not (Test-MiGuidN $Id)) {throw 'Invalid trace request identity.'}
     return [pscustomobject][ordered]@{SchemaVersion=1;TraceSessionId=$Id;WprInstanceName=('MemoryInspector-'+$Id);
@@ -1017,13 +1381,21 @@ function New-MiWprSession {
         ErrorCode=$null;JournalRevision=1;StopState='NotStarted';SaveState='NotStarted';AnalysisState='NotStarted';ActiveReferences=0;AuthorizationId=$null}
 }
 function Invoke-MiWprStart {
-    param([string]$RequestId,[ValidateSet('VirtualAlloc','Pool')][string]$TraceType='VirtualAlloc',
-        [ValidateSet('Memory','File')][string]$Mode='Memory',[ValidateRange(300,1800)][int]$DurationSeconds=300)
+    param([string]$RequestId,[ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType='VirtualAlloc',
+        [ValidateSet('Memory','File')][string]$Mode='Memory',[ValidateRange(300,1800)][int]$DurationSeconds=300,[string]$HeapImagePath='')
     # 当前发行版在任何路径/任务/进程副作用之前拒绝未验收功能；没有强制开关。
     Assert-MiWprReleaseAccepted
+    if ($TraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
+    elseif ($HeapImagePath -cne '') {throw 'Heap image supplied to a non-Heap trace.'}
     if ($Mode -ceq 'File' -and -not (Get-MiWprReleaseStatus).FileAccepted) {throw 'File Mode acceptance pending.'}
     if (-not (Test-MiGuidN $RequestId)) {throw 'Invalid trace request identity.'}
     # 人工确认不持有全局锁；确认之后重新做健康、容量、冲突及身份核验。
+    $heapTarget=$null
+    if ($TraceType -ceq 'Heap') {
+        $heapTarget=Get-MiHeapTargetIdentity $HeapImagePath
+        Write-Host ('Heap configuration applies to ALL new processes named '+$heapTarget.ImageName+', including other paths/users. Target: '+$heapTarget.Path+' SHA256: '+$heapTarget.Sha256)
+        Write-Host 'Existing instances may require a manual restart after configuration. MemoryInspector never starts, restarts or terminates the target. No Heap snapshot mode.'
+    }
     $confirmation=Read-Host ('Type START '+$RequestId+' to authorize '+$TraceType+'/'+$Mode+' for '+$DurationSeconds+' seconds')
     if ($confirmation -cne ('START '+$RequestId)) {return [pscustomobject]@{State='AuthorizationDenied';TraceSessionId=$RequestId}}
     $lease=Enter-MiDeploymentLease
@@ -1046,12 +1418,21 @@ function Invoke-MiWprStart {
                     @($before|Where-Object {($_.Mode -band 0x02000000) -ne 0}).Count -ge 7) {throw 'ETW instance or system logger resources conflict.'}
                 $paths=Get-MiWprSessionPaths $session
                 if ([IO.Directory]::Exists($paths.Workspace)) {throw 'Trace workspace already exists.'}
+                if ($TraceType -ceq 'Heap') {
+                    $freshTarget=Get-MiHeapTargetIdentity $HeapImagePath
+                    if (($freshTarget|ConvertTo-Json -Compress) -cne ($heapTarget|ConvertTo-Json -Compress)) {throw 'Heap target changed after authorization.'}
+                    [void](Get-MiHeapConfigDisposition (Get-MiHeapConfiguration $heapTarget.ImageName))
+                }
             } catch {
                 $session.State='ResourcePreflightRejected';$session.ErrorCode=$_.Exception.Message
                 [void](Add-MiTraceJournalRecord $lock $j.Revision 'Session' $session);throw
             }
             $session.ProfileId=$profile.Id;$session.ProfileFingerprint=$profile.Fingerprint;$session.WprExecutableIdentity=$identity
             $session.AuthorizationId=[guid]::NewGuid().ToString('N');$session.State='Authorized'
+            if ($TraceType -ceq 'Heap') {
+                Set-MiTraceMember $session 'HeapTransactionId' ([guid]::NewGuid().ToString('N'))
+                $session.CleanupState='Pending'
+            }
             $j=Add-MiTraceJournalRecord $lock $j.Revision 'Session' $session
             $session.State='Preparing';Set-MiTraceMember $session 'StartOperationId' ([guid]::NewGuid().ToString('N'))
             Set-MiTraceMember $session 'WorkspaceId' $session.TraceSessionId
@@ -1060,6 +1441,7 @@ function Invoke-MiWprStart {
             Set-MiTraceMember $session 'StartIntentUtc' ([datetime]::UtcNow.ToString('o'))
             $j=Add-MiTraceJournalRecord $lock $j.Revision 'Session' $session
             try {
+                if ($TraceType -ceq 'Heap') {$j=Initialize-MiHeapTransaction $lock $session $heapTarget}
                 foreach ($directory in @($paths.Workspace,$paths.Temporary)) {[void][IO.Directory]::CreateDirectory($directory);Set-MiAdminDirectoryAcl $directory}
                 [IO.File]::WriteAllText($paths.Profile,$profile.Xml,[Text.UTF8Encoding]::new($false));Set-MiProtectedFileAcl $paths.Profile
                 $process=Start-MiWprProcess 'Start' $session
@@ -1076,7 +1458,8 @@ function Invoke-MiWprStart {
                 [void](Add-MiTraceJournalRecord $lock $j.Revision 'Session' $session)
                 return $session
             } catch {
-                $session.State='UnknownOutcome';$session.ErrorCode=$_.Exception.Message
+                $failure=$_.Exception.Message;$j=Read-MiTraceJournal $lock;$session=$j.Sessions[$session.TraceSessionId]
+                $session.State='UnknownOutcome';$session.ErrorCode=$failure
                 [void](Add-MiTraceJournalRecord $lock $j.Revision 'Session' $session);throw
             }
         } finally {$lock.Dispose()}
@@ -1196,6 +1579,17 @@ function Complete-MiWprArtifact {
     # 已提交的阶段只向前推进；中断后不再重放文件移动或覆盖 SaveState。
     $next=@{Saved='Cleaning';Cleaning='Analyzing';Analyzing='Completed'}
     while ($next.ContainsKey([string]$Session.State)) {
+        if ($Session.State -ceq 'Cleaning' -and $Session.RequestedTraceType -ceq 'Heap') {
+            $j=Restore-MiHeapTransaction $Lock $Session.HeapTransactionId
+            $tx=$j.HeapTransactions[$Session.HeapTransactionId]
+            $Session=$j.Sessions[$Session.TraceSessionId]
+            if ($tx.RestoreState -cnotin @('Restored','Unchanged')) {
+                $Session.State='CleanupPending';$Session.CleanupState=if ($tx.ConflictDetected) {'Conflict'} else {'Pending'}
+                $Session.ErrorCode=$tx.ErrorCode
+                return Add-MiTraceJournalRecord $Lock $j.Revision 'Session' $Session
+            }
+            $Session.CleanupState='Restored'
+        }
         $Session.State=$next[[string]$Session.State];$Session.AnalysisState='Unavailable'
         $j=Add-MiTraceJournalRecord $Lock $j.Revision 'Session' $Session
     }

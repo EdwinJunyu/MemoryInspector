@@ -371,7 +371,7 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     $profileFixture=Join-Path (Join-Path $root 'test-artifacts') ('WprProfiles-'+[guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($profileFixture)
     $parsedProfiles=0
-    foreach ($type in @('VirtualAlloc','Pool')) {foreach ($mode in @('Memory','File')) {
+    foreach ($type in @('VirtualAlloc','Pool','Heap')) {foreach ($mode in @('Memory','File')) {
         $profile=Get-MiWprProfile $type $mode
         if ((Get-MiTraceHash $profile.Xml) -cne $profile.Fingerprint -or $profile.BufferBytes -ne 134217728) {throw 'Profile fingerprint/buffer budget mismatch.'}
         $path=Join-Path $profileFixture ($type+'-'+$mode+'.wprp');[IO.File]::WriteAllText($path,$profile.Xml)
@@ -381,7 +381,21 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
             $parsedProfiles++
         }
     }}
-    Assert-M3Rejected {Get-MiWprProfile 'Heap' 'Memory'} 'M4 not enabled'
+    Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N')) 'Heap' 'Memory' 300 'C:\fixture.exe'} 'M4 actual release gate'
+    Assert-M3Rejected {Repair-MiHeapTransactions} 'M4 actual recovery release gate'
+    Assert-M3Rejected {Set-MiHeapConfiguration $null $null} 'M4 actual registry write release gate'
+    if ((Get-MiHeapReleaseStatus).Enabled -or (Get-MiHeapReleaseStatus).ConfigurationAccepted -or (Get-MiHeapReleaseStatus).RecoveryAccepted) {throw 'Heap acceptance gate opened.'}
+    foreach ($badName in @('..\evil.exe','evil.exe\child','evil.exe:stream','*.exe','fixture.EXE','a..exe')) {
+        Assert-M3Rejected {Assert-MiHeapImageName $badName} 'registry image scope'
+    }
+    foreach ($badPath in @('fixture.exe','\\server\share\fixture.exe','C:\fixture.exe:stream')) {
+        Assert-M3Rejected {Get-MiHeapTargetIdentity $badPath} 'local executable scope'
+    }
+    # 原生只读查询与 PE/哈希检查，不创建测试键，更不启用系统 Heap。
+    $nativeImage=Get-MiHeapTargetIdentity (Join-Path $env:WINDIR 'System32\cmd.exe')
+    if ($nativeImage.Machine -cne 'NativeX64' -or $nativeImage.Sha256 -cnotmatch '^[A-F0-9]{64}$') {throw 'Native PE identity invalid'}
+    $probe=Get-MiHeapConfiguration ('MiReadOnlyProbe-'+[guid]::NewGuid().ToString('N')+'.exe')
+    if ($probe.KeyExists -or $probe.ValueExists -or -not $probe.ScopeSupported) {throw 'Read-only registry probe changed configuration'}
     Initialize-MiTraceNative
     $badEtl=Join-Path $profileFixture 'invalid.etl';[IO.File]::WriteAllText($badEtl,'not an ETL')
     Assert-M3Rejected {Test-MiEtlArtifact $badEtl} 'real native ETL parser'
@@ -417,7 +431,7 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
             $temporary=(Get-MiWprSessionPaths $Session).Temporary
             $test.Observed=@($test.Observed)+[pscustomobject]@{Name=('WPR_initiated_'+$Session.WprInstanceName+'_'+$profile.CollectorSuffix);
                 Guid=[guid]::NewGuid().ToString();Handle='0000000000000123';ThreadId=123;ThreadCreated=[datetime]::UtcNow.ToFileTimeUtc();
-                Mode=0x02000000;FileName=(Join-Path $temporary 'fixture.etl');BufferKB=1024;MaximumBuffers=128}
+                Mode=if ($Session.RequestedTraceType -ceq 'Heap') {0} else {0x02000000};FileName=(Join-Path $temporary 'fixture.etl');BufferKB=1024;MaximumBuffers=128}
         } else {$test.Stops++;if ($test.StopFault) {throw 'Fixture stop dispatch outcome unknown'}}
         $time=if ($test.Expired) {[datetime]::UtcNow.AddMinutes(-10)} else {[datetime]::UtcNow}
         return [pscustomobject]@{SchemaVersion=1;Pid=123;StartUtcTicks=123456;DispatchedUtc=$time.ToString('o');Operation=$Verb}
@@ -432,7 +446,8 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
         if ($Kind -ceq 'Artifact' -and $Payload.State -ceq 'Saving' -and $test.AgeArtifact) {
             $Payload.CreatedUtc=[datetime]::UtcNow.AddDays(-8).ToString('o');$Payload.RetainUntilUtc=(ConvertTo-MiTraceUtc $Payload.CreatedUtc).AddDays(7).ToString('o')
         }
-        if ($test.Fault -ceq ($Kind+':'+$Payload.State)) {$test.Fault='';throw 'Injected append boundary failure'}
+        $state=if ($Kind -ceq 'HeapTransaction') {$Payload.RestoreState} else {$Payload.State}
+        if ($test.Fault -ceq ($Kind+':'+$state)) {$test.Fault='';throw 'Injected append boundary failure'}
         return & $realAppend $Lock $ExpectedRevision $Kind $Payload
     }
     function New-M3Fixture {
@@ -572,4 +587,203 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
             (Measure-MiProtectedTree $test.Paths.TraceArtifacts) -ne $artifact.SizeBytes) {throw 'Retention lost bytes or misreported storage.'}
     } finally {$lock.Dispose()}
     Write-Host 'PASS: M3 start/cancel/health/gates, modes/ownership/replay, resource/deadline stops, independent outcomes and four save crash boundaries (WPR and ACL mocked).'
+    # M4 复用真实 Journal/文件与 M3 生命周期；仅注册表、目标身份、WPR 和健康边界使用夹具。
+    & {
+        function Get-MiHeapReleaseStatus {return [pscustomobject]@{Enabled=$true;ConfigurationAccepted=$true;RecoveryAccepted=$true}}
+        function Get-MiHeapTargetIdentity {param($Path)
+            $test.TargetReads++
+            if ($test.TargetFault -or $test.TargetReads -eq $test.TargetFailAt) {throw 'Injected target replacement'}
+            return [pscustomobject][ordered]@{Path='C:\fixture.exe';ImageName='fixture.exe';Sha256=('B'*64);Machine='NativeX64'}
+        }
+        function Get-MiHeapConfiguration {param($ImageName)
+            if ($ImageName -cne 'fixture.exe') {throw 'Unbounded registry target'}
+            $test.RegistryReads++
+            if ($test.RegistryReadFault -or $test.RegistryReads -eq $test.RegistryFailAt) {throw 'Registry read unavailable'}
+            return $test.Registry|ConvertTo-Json -Compress|ConvertFrom-Json
+        }
+        function Test-MiWprProcessRunning {param($Identity)
+            if ($Identity.Operation -ceq 'Start') {return $false};return $test.WriterLive
+        }
+        function Set-MiHeapConfiguration {param($Lock,$Transaction,[switch]$Restore)
+            $j=Read-MiTraceJournal $Lock;$tx=$j.HeapTransactions[$Transaction.TransactionId]
+            if ($null -eq $tx -or $tx.ConfigOwner -cne 'MemoryInspector' -or
+                ($tx|ConvertTo-Json -Depth 10 -Compress) -cne ($Transaction|ConvertTo-Json -Depth 10 -Compress) -or
+                $tx.RestoreState -cne $(if ($Restore) {'Restoring'} else {'Intent'})) {throw 'Fixture write lacks protected intent'}
+            $expected=if ($Restore) {$tx.ExpectedModifiedConfig} else {$tx.OriginalConfig}
+            if (-not (Test-MiHeapConfigEqual $test.Registry $expected)) {throw 'Fixture compare-before-write conflict'}
+            if ($test.RegistryWriteFault -ceq 'Before') {$test.RegistryWriteFault='';throw 'Registry write failed before mutation'}
+            if ($Restore) {$test.Restores++;$test.Registry=$tx.OriginalConfig|ConvertTo-Json -Compress|ConvertFrom-Json}
+            else {$test.Enables++;$test.Registry=$tx.ExpectedModifiedConfig|ConvertTo-Json -Compress|ConvertFrom-Json}
+            if ($test.RegistryWriteFault -ceq 'After') {$test.RegistryWriteFault='';throw 'Registry result lost after mutation'}
+            return Get-MiHeapConfiguration 'fixture.exe'
+        }
+        function New-M4Fixture {
+            New-M3Fixture
+            $test.Enables=0;$test.Restores=0
+            $test.Registry=[pscustomobject][ordered]@{KeyExists=$false;ValueExists=$false;Kind='';Value=$null;ContextFingerprint=('C'*64);ScopeSupported=$true}
+        }
+        function Stop-M4Fixture {
+            param($Lock,$Session,[switch]$MissingOutput)
+            $j=Request-MiWprStop $Lock $Session;$test.Observed=@()
+            $j=Update-MiWprSession $Lock $j.Sessions[$Session.TraceSessionId]
+            if (-not $MissingOutput) {[IO.File]::WriteAllText((Get-MiWprSessionPaths $Session).Output,'Heap fixture ETL')}
+            $test.WriterLive=$false
+            return Update-MiWprSession $Lock $j.Sessions[$Session.TraceSessionId]
+        }
+        # M2/M3 即使被测试替身开放，M4 自己的未验收门仍须先拒绝。
+        $openGate=${function:Get-MiHeapReleaseStatus}
+        function Get-MiHeapReleaseStatus {return [pscustomobject]@{Enabled=$false;ConfigurationAccepted=$false;RecoveryAccepted=$false}}
+        New-M4Fixture
+        Assert-M3Rejected {Invoke-MiWprStart ([guid]::NewGuid().ToString('N')) 'Heap' 'Memory' 300 'C:\fixture.exe'} 'independent M4 gate'
+        if ($test.Enables -ne 0 -or $test.Starts -ne 0) {throw 'Closed Heap gate had a side effect'}
+        ${function:Get-MiHeapReleaseStatus}=$openGate
+        foreach ($original in @('Absent','Zero','Compatible','UnknownBits','WrongType','Filtered','ReadFailure','Cancelled','TargetChanged')) {
+            New-M4Fixture
+            if ($original -cin @('Zero','Compatible','UnknownBits','WrongType')) {
+                $test.Registry.KeyExists=$true;$test.Registry.ValueExists=$true;$test.Registry.Kind='DWord'
+                $test.Registry.Value=if ($original -ceq 'Compatible') {1} elseif ($original -ceq 'UnknownBits') {3} else {0}
+            }
+            if ($original -ceq 'WrongType') {$test.Registry.Kind='String';$test.Registry.Value=$null}
+            if ($original -ceq 'Filtered') {$test.Registry.ScopeSupported=$false}
+            $test.RegistryReadFault=$original -ceq 'ReadFailure';$test.Cancel=$original -ceq 'Cancelled';$test.TargetFault=$original -ceq 'TargetChanged'
+            $id=[guid]::NewGuid().ToString('N')
+            if ($original -cin @('UnknownBits','WrongType','Filtered','ReadFailure','TargetChanged')) {
+                Assert-M3Rejected {Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe'} $original
+                if ($test.Enables -ne 0 -or $test.Starts -ne 0) {throw 'Rejected Heap request modified configuration'}
+                continue
+            }
+            $session=Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe'
+            if ($original -ceq 'Cancelled') {if ($test.Enables -ne 0 -or $test.Starts -ne 0) {throw 'Cancel wrote configuration'};continue}
+            $lock=Enter-MiTraceLock
+            try {
+                $j=Read-MiTraceJournal $lock
+                Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'Heap active obligation'
+                $forged=$j.HeapTransactions[$session.HeapTransactionId]|ConvertTo-Json -Depth 10|ConvertFrom-Json
+                $forged.OriginalConfig.Value=99
+                Assert-M3Rejected {Add-MiTraceJournalRecord $lock $j.Revision 'HeapTransaction' $forged} 'immutable original value'
+                $j=Stop-M4Fixture $lock $session
+                if ($j.Sessions[$id].State -cne 'Completed' -or $j.Sessions[$id].CleanupState -cne 'Restored') {throw 'Heap normal completion failed'}
+                $tx=$j.HeapTransactions[$session.HeapTransactionId]
+                if (-not (Test-MiHeapConfigEqual $test.Registry $tx.OriginalConfig)) {throw 'Original Heap value not restored'}
+                $writes=if ($original -ceq 'Compatible') {0} else {1}
+                if ($test.Enables -ne $writes -or $test.Restores -ne $writes) {throw 'Compatible configuration was modified or owned change not restored'}
+                Assert-MiTraceQuiescent $j
+                Assert-M3Rejected {Add-MiTraceJournalRecord $lock $j.Revision 'HeapTransaction' $tx} 'terminal transaction replay'
+            } finally {$lock.Dispose()}
+        }
+        foreach ($fault in @('HeapTransaction:Intent','HeapTransaction:Applied','WriteBefore','WriteAfter','LateTargetRead','LateConfigRead')) {
+            New-M4Fixture
+            if ($fault.StartsWith('HeapTransaction:')) {$test.Fault=$fault}
+            elseif ($fault -ceq 'LateTargetRead') {$test.TargetFailAt=3}
+            elseif ($fault -ceq 'LateConfigRead') {$test.RegistryFailAt=2}
+            else {$test.RegistryWriteFault=if ($fault -ceq 'WriteBefore') {'Before'} else {'After'}}
+            $id=[guid]::NewGuid().ToString('N')
+            Assert-M3Rejected {Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe'} $fault
+            $lock=Enter-MiTraceLock
+            try {
+                $j=Read-MiTraceJournal $lock
+                if ($test.Starts -ne 0 -or $test.Enables -gt 1) {throw 'Heap preparation retried/dispatched after failure'}
+                Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'interrupted Heap preparation blocks deployment'
+                $j=Update-MiTraceSupervision $lock '100'
+                if ($j.HeapTransactions.Count -gt 0 -and @($j.HeapTransactions.Values)[0].RestoreState -cne 'Restored') {throw 'Heap write-intent crash recovery failed'}
+                Assert-MiTraceQuiescent $j
+                $resolved=$j.Sessions[$id]
+                if ($resolved.PreStartResolution.Outcome -cne 'NoTraceDispatched' -or $resolved.State -ceq 'Completed') {throw 'Pre-start failure was not honestly resolved'}
+                if ($j.HeapTransactions.Count -eq 0 -and ($resolved.PreStartResolution.ConfigOutcome -cne 'NoWriteIntent' -or $test.Enables -ne 0)) {throw 'No-intent failure did not resolve without a configuration write'}
+                Assert-M3Rejected {Add-MiTraceJournalRecord $lock $j.Revision 'Session' $resolved} 'resolved pre-start replay'
+                Assert-M3Rejected {& $realTransport 'Start' $resolved} 'resolved pre-start dispatch'
+                $forged=$resolved|ConvertTo-Json -Depth 12|ConvertFrom-Json
+                $forged.PreStartResolution.ConfigOutcome=if ($j.HeapTransactions.Count -eq 0) {'Restored'} else {'NoWriteIntent'}
+                Assert-M3Rejected {Assert-MiHeapSessionBinding $forged $j} 'forged pre-start configuration outcome'
+                $before=$j.Revision;$j=Update-MiTraceSupervision $lock '100'
+                if ($j.Revision -ne $before) {throw 'Resolved pre-start repeatedly journaled'}
+                if ($test.Enables -gt 1 -or $test.Stops -ne 0) {throw 'Preparation recovery retried WPR or enable'}
+            } finally {$lock.Dispose()}
+        }
+        foreach ($fault in @('ExternalBits','ExternalContext','RestoreBefore','RestoreAfter','RestoreRecord','ReadFailure','MissingEtl','BootChanged','UnknownStart')) {
+            New-M4Fixture;$id=[guid]::NewGuid().ToString('N')
+            $session=Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe'
+            $lock=Enter-MiTraceLock
+            try {
+                if ($fault -ceq 'UnknownStart') {
+                    $j=Read-MiTraceJournal $lock;$current=$j.Sessions[$id];$current.State='UnknownOutcome';$j=Add-MiTraceJournalRecord $lock $j.Revision 'Session' $current
+                    $j=Update-MiTraceSupervision $lock '100'
+                    if ($test.Restores -ne 0 -or $test.Stops -ne 0) {throw 'Unknown active trace caused speculative cleanup'}
+                    continue
+                }
+                if ($fault -ceq 'ExternalBits') {$test.Registry.Value=3}
+                if ($fault -ceq 'ExternalContext') {$test.Registry.ContextFingerprint=('D'*64)}
+                if ($fault -ceq 'RestoreBefore') {$test.RegistryWriteFault='Before'}
+                if ($fault -ceq 'RestoreAfter') {$test.RegistryWriteFault='After'}
+                if ($fault -ceq 'RestoreRecord') {$test.Fault='HeapTransaction:Restored'}
+                if ($fault -ceq 'ReadFailure') {$test.RegistryReadFault=$true}
+                if ($fault -ceq 'BootChanged') {
+                    $test.Observed=@();$test.WriterLive=$false
+                    function Get-MiBootSessionId {return '200'}
+                    $j=Update-MiTraceSupervision $lock '200'
+                    if ($j.HeapTransactions[$session.HeapTransactionId].RestoreState -cne 'Restored' -or $test.Stops -ne 0) {throw 'Boot recovery failed'}
+                    function Get-MiBootSessionId {return '100'}
+                    continue
+                }
+                $j=Stop-M4Fixture $lock $session -MissingOutput:($fault -ceq 'MissingEtl')
+                $j=Update-MiTraceSupervision $lock '100';$current=$j.Sessions[$id];$tx=$j.HeapTransactions[$session.HeapTransactionId]
+                if ($fault -cin @('ExternalBits','ExternalContext')) {
+                    if ($tx.RestoreState -cne 'Conflict' -or $test.Restores -ne 0 -or $current.State -ceq 'Completed' -or $current.SaveState -cne 'Saved') {throw 'External Heap conflict overwritten or hidden'}
+                    Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'external conflict blocks deployment'
+                    $j=Update-MiHeapCleanup $lock -RetryPending
+                    if ($test.Restores -ne 0) {throw 'Explicit conflict recovery overwrote external values'}
+                    $test.Registry=$tx.OriginalConfig|ConvertTo-Json -Compress|ConvertFrom-Json
+                    $j=Update-MiHeapCleanup $lock -RetryPending
+                    if ($j.HeapTransactions[$tx.TransactionId].RestoreState -cne 'Restored') {throw 'Administrator repair not reconciled'}
+                } elseif ($fault -ceq 'MissingEtl') {
+                    if ($current.SaveState -cne 'Failed' -or $current.StopState -cne 'Confirmed' -or $tx.RestoreState -cne 'Restored') {throw 'ETL failure erased independent Heap restoration'}
+                } elseif ($fault -cin @('RestoreAfter','RestoreRecord')) {
+                    if ($tx.RestoreState -cne 'Restored' -or $test.Restores -ne 1) {throw 'Restore acknowledgement crash repeated/lost mutation'}
+                } else {
+                    if ($tx.RestoreState -cne 'CleanupPending' -or $current.State -ceq 'Completed') {throw 'Restore failure not tracked'}
+                    $test.RegistryReadFault=$false
+                    $j=Update-MiHeapCleanup $lock -RetryPending
+                    if ($j.HeapTransactions[$tx.TransactionId].RestoreState -cne 'Restored' -or $test.Restores -ne 1) {throw 'Explicit pending recovery failed'}
+                }
+                if ($test.Starts -ne 1 -or $test.Stops -ne 1) {throw 'Heap recovery replayed WPR'}
+            } finally {$lock.Dispose()}
+        }
+        # 不依赖额外 Watchdog 的显式恢复闭环：先核验配置，再核验已保存 ETL。
+        New-M4Fixture;$id=[guid]::NewGuid().ToString('N')
+        $session=Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe';$lock=Enter-MiTraceLock
+        try {
+            $test.RegistryWriteFault='Before';$j=Stop-M4Fixture $lock $session
+            if ($j.Sessions[$id].State -cne 'CleanupPending') {throw 'Direct cleanup failure fixture invalid'}
+            $j=Update-MiHeapCleanup $lock -RetryPending
+            if ($j.Sessions[$id].State -cne 'RecoveryRequired') {throw 'Explicit config recovery cannot enter saved artifact recovery'}
+        } finally {$lock.Dispose()}
+        Repair-MiWprSavedArtifacts
+        $lock=Enter-MiTraceLock
+        try {
+            $j=Read-MiTraceJournal $lock;Assert-MiTraceQuiescent $j
+            if ($j.Sessions[$id].State -cne 'Completed' -or $test.Restores -ne 1 -or $test.Stops -ne 1) {throw 'Explicit recovery closure failed'}
+        } finally {$lock.Dispose()}
+        foreach ($uncertain in @('StartMarker','StopMarker','WorkspaceReadFailure','EtwPresent')) {
+            New-M4Fixture;$test.Fault='HeapTransaction:Applied';$id=[guid]::NewGuid().ToString('N')
+            Assert-M3Rejected {Invoke-MiWprStart $id 'Heap' 'Memory' 300 'C:\fixture.exe'} 'interrupted enable for dispatch-proof test'
+            $lock=Enter-MiTraceLock
+            try {
+                $j=Read-MiTraceJournal $lock;$session=$j.Sessions[$id];$paths=Get-MiWprSessionPaths $session
+                if ($uncertain -cin @('StartMarker','StopMarker')) {
+                    [void][IO.Directory]::CreateDirectory($paths.Workspace)
+                    $marker=if ($uncertain -ceq 'StartMarker') {$paths.StartMarker} else {$paths.StopMarker}
+                    [IO.File]::WriteAllText($marker,'DispatchIntent')
+                }
+                if ($uncertain -ceq 'WorkspaceReadFailure') {$test.PathFault=$true}
+                if ($uncertain -ceq 'EtwPresent') {$test.Observed=@([pscustomobject]@{Name=('WPR_initiated_'+$session.WprInstanceName+'_unknown')})}
+                if ($uncertain -ceq 'WorkspaceReadFailure') {
+                    Assert-M3Rejected {Update-MiHeapCleanup $lock} 'unreadable journal/workspace'
+                    $test.PathFault=$false;$j=Read-MiTraceJournal $lock
+                } else {$j=Update-MiHeapCleanup $lock}
+                if ($null -ne $j.Sessions[$id].PreStartResolution -or $test.Restores -ne 0) {throw 'Uncertain dispatch was cleared/restored'}
+                Assert-M3Rejected {Assert-MiTraceQuiescent $j} 'uncertain dispatch remains blocked'
+            } finally {$lock.Dispose()}
+        }
+        Write-Host 'PASS: M4 owned config transactions, compatible/unknown original values, intent/write/restore crashes, external conflicts, boot recovery and independent ETL/cleanup outcomes (registry/WPR mocked).'
+    }
 }

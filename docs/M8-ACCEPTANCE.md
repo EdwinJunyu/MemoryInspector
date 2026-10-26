@@ -355,4 +355,46 @@ Windows PowerShell Desktop 5.1 / STA / RemoteSigned：SmokeTest、AnalyzerTest�
 
 所有上述验收通过前不修改源码内 release gate，不宣布 Preview B 或 Stable v3。此前 GUI 内存峰值和长时采样覆盖问题仍开放，M3 未修改相应阈值。Heap/M4、WPAExporter/M5、ActionGrant/M6 和 GUI/M7 不在本次范围。
 
+## 2026-10-25 V3-M4：Heap Configuration Transactions
+
+冻结依据：[v3 原文](https://docs.google.com/document/d/1GVln-oZKuIPkIR1C-Bh3JouyMhEO0z6X-dAscPpTHr4/edit)第 7、5–6、11–14、16、18 节及 M4；基线 `5daf938529836f2c0c489d6340946379257569ad`。只修改现有 PrivilegeSecurity、ElevatedExecutor、PrivilegeSecurityTest、PrivilegeInstallTest 及两份备注；无新增模块、无数据删除，VERSION 保持 0.0.9。仅本地提交，不推送。
+
+### M2/M3 前置核验
+
+本机 Windows 11 build 22631，普通令牌；Program Files 受保护安装、Trace Journal、Watchdog policy 均不存在。先运行未修改前的 Windows PowerShell 5.1 安全回归，退出 0，管理员 ACL 分支跳过。M2 的真实 SYSTEM/任务 DACL/启动触发及 Win10/11 验收仍未完成，M3 的真实 WPR 所有权/录制/保存/资源保护同样未验收。原 WPR 发布门保持关闭，新增 Heap Enabled、ConfigurationAccepted、RecoveryAccepted 全为 false；执行器和注册表写入入口均在副作用前拒绝，无法用 JSON、参数或专家选项绕过。
+
+### 实现与安全边界
+
+- Heap 作为固定 TraceStart 类型，独立校验 HeapImagePath 参数归属；没有任意注册表路径、自由命令、目标进程启动/重启/Kill 或 Snapshot。固定 HeapEventCollector/HeapEventProvider 的 Memory/File Profile 仍绑定 SHA256、命名实例、ETW GUID/handle/线程创建时间、预算、期限和实际文件路径，Heap 用户 collector 与原 system collector 模式分别核验。
+- 目标身份从同一受限共享文件句柄读取 PE 与 SHA256；本地绝对路径、文件及父级不得为重解析点。格式检查限定为原生 x64 PE 和受限 `.exe` 基名；x86/托管、IFEO Filter/子键明确拒绝。打包原生程序等具体类型仍未验收，Heap 总门保持关闭，不声称全程序类型支持。配置按映像名作用于所有同名新实例，跨路径/用户；确认前明确显示范围、目标路径/摘要，以及用户可能需要自行重启已有实例。工具不会代为重启。
+- 事务包含 TransactionId、TargetImageIdentity、OriginalConfig、ExpectedModifiedConfig、ConfigOwner、ChangeUtc、CurrentConfig、RestoreState、ConflictDetected 和 revision。复用受保护哈希链 Journal、追加 Flush、全局文件锁/CAS；未知结构、非法转换、替换原值/目标或重放均拒绝。ChangeUtc 是写前意图的 UTC；Applied 另由读后核验成立，不用意图时间宣称实际已经修改。
+- 唯一可写对象是 Registry64/HKLM 固定 IFEO 映像下的 TracingFlags。核验注册表所有者、有效 ACL 和父级替换权限；CREATOR OWNER 按已核验实际所有者处理，继承专用 ACE 不误当当前键授权。原值缺失或 DWORD 0 可按授权设 1；原值 1 不写入并记 External；其他位/类型/读取失败拒绝。旁侧值和子键指纹用于发现外部变化，写前比较并在写后重新核验。
+- 每次实际写入必须有已 Flush 的 Intent/Restoring，不能从会话名推断修改权。恢复只复原原来的 TracingFlags 值/缺失状态，不恢复整个 IFEO；新建空键保留，其他值/键不删除。外部改动进入 Conflict，不盲目覆盖；管理员须先在系统中恢复原值，显式恢复入口再核验并记账。管理员不受本工具锁约束，注册表 API 不提供与外部管理工具之间的原子 CAS；本实现采用紧邻写入的比较/读后核验，不宣称能抵御恶意管理员竞态。
+- CleanupPending 和 Conflict 保留恢复义务，禁止 Completed、升级、卸载与部署 Ready。停止确认、保存状态、Heap 恢复结果独立，ETL 失败后仍处理可证明安全的配置恢复。未知 WPR 启动/停止或活跃写者不触发猜测性注册表写入，换启动会话重新核验 ETW；写入已完成但记账失败时只补记真实结果。未知恢复结果不自动重写；`RECOVER HEAP CONFIG` 显式重新读取后，才允许对尚需恢复的已拥有值尝试恢复。所有修改/恢复路径同受关闭的 Heap 发布门限制。
+- 配置准备失败且 WPR 未派发时，使用不可变 PreStartResolution 辅助结果消除已经解决的恢复义务，保留 RecoveryRequired 的异常历史，不假称 Completed。要求完整 Journal、事务已 Restored 或严格证明不存在写前意图、无启动/停止/保存身份及 Artifact、成功枚举确认两种派发标记缺失、实际 ETW 查询成功且无该实例；读取失败和未知派发继续阻断。终结后禁止记录重放、重开或再次派发，不能用该结果解除其他会话的事务。
+
+### Review 与验证
+
+首轮 PS5.1 安全回归通过，新增 M4 场景覆盖原值缺失/0/兼容 1/未知位/错误类型/Filter、读取失败/取消/目标变化、写前意图失败、修改前后异常、恢复写入前后及恢复记账中断、外部配置/旁侧变化、重启、未知活跃追踪，以及保存失败与配置恢复的独立结果。真实 Journal、文件锁、哈希与 ETL 保存路径执行，注册表/WPR/ACL/健康响应边界使用测试替身。
+
+### Review：Standards
+
+固定基线 `5daf938`，独立审阅未提交差异。首轮发现配置修复成功后会话仍停留 CleanupPending，必须等额外 Watchdog 扫描才能进入保存恢复。现显式转 RecoveryRequired，再由已有保存恢复重新核验 ETL；新增不依赖 Watchdog 的恢复流程，断言 Completed 与 Assert-MiTraceQuiescent。复核无剩余阻断项，用户的既有模块、中文注释、UTF-8、行为测试与本地提交边界均保留。
+
+### Review：Spec
+
+独立首轮发现准备失败但未派发 WPR 的已恢复会话永久阻断部署。现通过上述 PreStartResolution 安全终结这类义务，并校验事务双向绑定和 NoWriteIntent/Restored 的精确对应关系。增加 Intent/Applied/写入前后、授权后目标/配置延迟读取失败的恢复闭环，以及派发标记/ETW/路径不可读/伪造结果保持阻断的测试。复核无剩余 actionable finding。两轴均为静态审阅，不等同于实机验收。
+
+最终 Windows PowerShell Desktop 5.1.22621.6133 / STA / RemoteSigned：SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test **八套全部退出 0**。原生只读 PE/摘要、固定注册表缺失键查询、六种 Profile 的实际 WPR 语法解析通过；实际发布门、注册表写入与恢复门的拒绝测试通过。管理员 ACL 分支仍跳过；真实 IFEO 写入/恢复及 WPR 启停由替身代替，不计作发布验收。
+
+中途新增“路径不可读”故障夹具触发全局 Journal ACL 拒绝，测试最初错误地期待返回状态，已改为断言拒绝且恢复读取后义务仍在；没有放宽生产检查。最终在全部修复后重新运行八套回归。受影响 PowerShell 文件保持 UTF-8 BOM，`git diff --check` 通过，历史/允许名单及普通监控逻辑未修改。
+
+证据保留于本地忽略目录 `test-artifacts/v3-m4/`：前置检查、安全回归、六种 Profile 的只读语法验证及完整回归日志。没有在本机注册 SYSTEM 任务、安装/卸载、启停 WPR、启用 IFEO 或重启目标。PrivilegeInstallTest 仅新增 disposable runner 的 Heap 禁用验证，本轮不执行该安装测试。
+
+API 依据：[Microsoft Heap 录制与 TracingFlags](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/recording-for-heap-analysis)、[HeapEventProvider](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/heapeventprovider)。文档用于确认配置/Profile 契约，不能替代 Windows 实机恢复验收。
+
+### 仍关闭的验收关卡
+
+M2/M3 既有实机关卡全部保留。M4 还需隔离 Windows 10/11 的真实 IFEO 权限/修改/兼容复用/外部冲突、进程自行重启后的 Heap 生效与有效 ETL、Memory/File 压力、Controller/Watchdog/机器重启与真实恢复故障验收。`[NEEDS CLARIFICATION]` 支持的具体 Windows/WPR/程序类型矩阵与性能参数仍需按冻结规格第 20 节校准，不重新开放 Q1–Q31 决策。上述验收前不开放 Heap，不宣布 Preview C 或 Stable v3；M5/M6/M7 与旧 GUI 内存/采样覆盖问题没有在本次宣称完成。
+
 API 依据：[WPR 命令与模式](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/wpr-command-line-options)、[命名实例](https://devblogs.microsoft.com/performance-diagnostics/controlling-the-event-session-name-with-the-instance-name/)、[QueryAllTraces 可见性](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-queryalltracesw)、[ETW 会话属性](https://learn.microsoft.com/en-us/windows/desktop/ETW/event-trace-properties)、[OpenTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracew)、[CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)、[Job breakaway / 隐藏进程标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)。文档只证明 API 契约，不替代上述实机验收。

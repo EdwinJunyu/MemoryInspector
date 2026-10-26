@@ -16,9 +16,10 @@ if ([IO.Directory]::Exists($paths.Install) -or [IO.Directory]::Exists($paths.Dat
     throw 'CI installation fixture requires fresh paths. Refusing to overwrite existing installation.'
 }
 function Invoke-MiTestExecutor {
-    param([string]$Operation,[string]$RequestId)
+    param([string]$Operation,[string]$RequestId,[ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType='VirtualAlloc')
     $exe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $args='-NoProfile -ExecutionPolicy RemoteSigned -File "'+$paths.Executor+'" -Operation '+$Operation+' -RequestId '+$RequestId
+    if ($Operation -ceq 'TraceStart') {$args+=' -TraceType '+$TraceType}
     $process=Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
     try { return [int]$process.ExitCode } finally { $process.Dispose() }
 }
@@ -28,10 +29,12 @@ $watchdog=Assert-MiWatchdog
 [void](Invoke-MiTraceHealthCheck)
 if ((Invoke-MiTestExecutor 'TracePreflight' ([guid]::NewGuid().ToString('N'))) -eq 0) { throw 'M2 unexpectedly enabled WPR.' }
 if ((Invoke-MiTestExecutor 'TraceStart' ([guid]::NewGuid().ToString('N'))) -eq 0) {throw 'Unaccepted M3 launch escaped code-level gate.'}
+if ((Invoke-MiTestExecutor 'TraceStart' ([guid]::NewGuid().ToString('N')) 'Heap') -eq 0) {throw 'Unaccepted M4 Heap request escaped code-level gate.'}
 if ((Invoke-MiTestExecutor 'TraceWatchdog' 'Scheduled') -eq 0) { throw 'Administrator impersonated SYSTEM watchdog.' }
 $lock=Enter-MiTraceLock
 try {
     $j=Read-MiTraceJournal $lock; Assert-MiTraceQuiescent $j
+    if ($j.HeapTransactions.Count -ne 0) {throw 'Disabled Heap request created a transaction.'}
     if (@($j.Sessions.Values).Count -ne 1 -or @($j.Sessions.Values)[0].ErrorCode -cne 'TraceBackendUnavailable') {throw 'Preflight did not persist explicit M3 gate.'}
 } finally {$lock.Dispose()}
 # 真实任务被禁用后必须拒绝高权限请求，恢复原值仅用于本次隔离测试。

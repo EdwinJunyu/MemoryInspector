@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-M7 / V3-M3 protected, short-lived executor. Fixed service and trace operations only.
+M7 / V3-M4 protected, short-lived executor. Fixed service and trace operations only.
 Unaccepted WPR features remain disabled by the code-level release policy. Unknown identity, invalid ACL, changed binary, missing audit or
 running dependents always fails closed. Never kills a service host process.
 #>
@@ -8,10 +8,11 @@ param(
     [Parameter(Mandatory=$true)][string]$Operation,
     [Parameter(Mandatory=$true)][string]$RequestId,
     [string]$ServiceName='',
-    [ValidateSet('VirtualAlloc','Pool')][string]$TraceType='VirtualAlloc',
+    [ValidateSet('VirtualAlloc','Pool','Heap')][string]$TraceType='VirtualAlloc',
     [ValidateSet('Memory','File')][string]$RecordingMode='Memory',
     [ValidateRange(300,1800)][int]$DurationSeconds=300,
-    [string]$TraceSessionId=''
+    [string]$TraceSessionId='',
+    [string]$HeapImagePath=''
 )
 $ErrorActionPreference='Stop'
 $exitCode=2
@@ -34,7 +35,9 @@ try {
     }
     if (($PSBoundParameters.ContainsKey('TraceSessionId') -and $Operation -cne 'TraceStop') -or
         ($Operation -ceq 'TraceStop' -and -not (Test-MiGuidN $TraceSessionId))) {throw 'Unexpected or invalid trace session parameter.'}
+    if ($PSBoundParameters.ContainsKey('HeapImagePath') -and ($Operation -cne 'TraceStart' -or $TraceType -cne 'Heap')) {throw 'Unexpected Heap image parameter.'}
     if ($Operation -cin @('TraceStart','TraceStop')) {Assert-MiWprReleaseAccepted}
+    if ($Operation -ceq 'TraceStart' -and $TraceType -ceq 'Heap') {Assert-MiHeapReleaseAccepted}
     $paths=Assert-MiTrustedInstallation
     if (-not [string]::Equals(
         [IO.Path]::GetFullPath($root).TrimEnd('\'),
@@ -72,7 +75,7 @@ try {
         Invoke-MiTracePreflight $RequestId | Format-List
         $exitCode=2 # M2 不开放实际 WPR，拒绝不能伪装成成功启动。
     } elseif ($Operation -ceq 'TraceStart') {
-        $trace=Invoke-MiWprStart $RequestId $TraceType $RecordingMode $DurationSeconds
+        $trace=Invoke-MiWprStart $RequestId $TraceType $RecordingMode $DurationSeconds $HeapImagePath
         $trace|Format-List
         $exitCode=if ($trace.State -ceq 'Recording') {0} else {2}
         Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -State $trace.State -Reason 'Fixed profile trace request'
@@ -86,13 +89,17 @@ try {
         $exitCode=0
     } elseif ($Operation -ceq 'TraceRecovery') {
         Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
-        $answer=Read-Host 'Type VERIFY DEPLOYMENT or RECOVER SAVED ARTIFACTS; Enter only keeps the report'
+        $answer=Read-Host 'Type VERIFY DEPLOYMENT, RECOVER SAVED ARTIFACTS or RECOVER HEAP CONFIG; Enter only keeps the report'
         if ($answer -ceq 'VERIFY DEPLOYMENT') {
             Invoke-MiTraceDeploymentRecovery
             Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
         }
         if ($answer -ceq 'RECOVER SAVED ARTIFACTS') {
             Repair-MiWprSavedArtifacts
+            Get-MiTraceRecoveryReport|ConvertTo-Json -Depth 12|Write-Output
+        }
+        if ($answer -ceq 'RECOVER HEAP CONFIG') {
+            Repair-MiHeapTransactions
             Get-MiTraceRecoveryReport|ConvertTo-Json -Depth 12|Write-Output
         }
         $exitCode=0 # 仅表示生成报告；报告明确独立列出恢复阻断。
