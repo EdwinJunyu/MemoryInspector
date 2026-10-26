@@ -1,4 +1,4 @@
-﻿# MemoryInspector 0.0.9 — Milestone 8 acceptance checklist
+# MemoryInspector 0.0.9 — Milestone 8 acceptance checklist
 
 **Status: 旧版本 / legacy snapshot; acceptance incomplete.** Automated CI cannot substitute for Windows 10 and 11 desktop validation or a 24-hour GUI run.
 
@@ -278,3 +278,36 @@ Review **Standards / Spec** 两轴首轮各发现一项 P2：新增采样分支�
 本地证据位于 `test-artifacts/v3-m1/`：smoke-reviewed.log、analyzer-optimized.log、GuiV4Test-optimized.log、PersistenceTest.log、ProcessActionsTest.log、PrivilegeSecurityTest.log、ServiceManagementTest.log、Milestone8Test-optimized.log、legacy-parity.log、performance-reviewed.json、performance-optimized.json、attribution-1020/1300.png。初轮失败及性能夹具类型加载错误日志保留，未改写为通过；测试产物不纳入源码提交。
 
 **仍未验证与开放问题：**非管理员主机的管理员 ACL 分支为 SKIP；没有执行 PrivilegeInstallTest、受保护部署/UAC/卸载、真实管理操作、Windows 10、本轮长期 GUI/24 小时、真实故障/休眠/回拨或 DPI/多屏验收。旧版 <200 MiB 峰值和部分窗口覆盖不足仍然开放，本轮未放宽或宣称解决。WPR、Watchdog、Heap、WPAExporter、ActionGrant 未开放，M2–M7 仍需独立实现与验收。
+
+## 2026-10-25 V3-M2：Protected Trace Architecture
+
+冻结依据：v3 规格第 5、6、11–13、16 节及 V3-M2；起始本地提交 `1515f77`。本轮只实现 M2，在原有生产文件与测试中扩展，无新增代码模块，不修改普通监控/归因算法、采样周期或 ActionGrant 权限。VERSION 保持 0.0.9，新增安装清单架构标记；仅本地提交，不推送。
+
+### 实现与安全边界
+
+- TraceSession 完整字段、不可变身份、合法状态转换、全局 Journal revision CAS、追加 UTF-8 JSONL 与链式摘要；状态修改持有固定跨进程文件锁，持久化意图后才调用任务注册/删除。损坏、空文件、半条尾记录、重复 JSON 字段、未知 schema/状态及过期 revision 均拒绝。不用可编辑用户 JSON 作为授权凭证；只有受保护执行器的固定协议能进入控制路径。
+- 停止、保存、清理、分析和活跃引用分别记录。Saved 不等于 Completed，未知结果不能重派发，待恢复会话阻断新会话及部署。M2 不配置实际 WPR Profile，因此预检查以 TraceBackendUnavailable 结束且不发生录制；Profile/WPR 归属、真实停止及 ETL 保存属于 M3，不能用本阶段数据模型测试代替。
+- 固定 LocalSystem 任务使用受保护 DACL、固定系统 PS5.1 路径及安装执行器、固定参数，启动触发与每分钟重复，IgnoreNew、45 秒执行上限。核验动作、账户 SID、任务设置、完整 XML 指纹及安装文件哈希；健康挑战在 SYSTEM 完成扫描后回应，绑定 nonce、安装/启动身份、定义指纹、链头和截止时间。等待时释放全局锁，40 秒单调计时避免锁死与无限等待。
+- Watchdog 在无工作时不追加心跳；未授权预检查中断可安全终结。检测已记录的过期/换启动会话后保留证据；实际 WPR 归属不可证明时进入 RecoveryRequired，不执行全局 cancel、进程 Kill 或未知命令。不得宣传当前已满足真实追踪的截止后两分钟停止验收。
+- 安装/卸载独占部署租约，M2 服务执行器持共享租约；服务确认不占据 Watchdog 状态锁。安装目录及清单分步记录成功标记，失败时只恢复确实完成的步骤，所有旧文件及失败 staging 保留。首次迁移的注册前失败可在验证旧安装、日志与任务不存在后重试；注册结果未知不自动重试。退休日志可复用以重装。卸载归档产品文件，保留用户历史、策略、审计、Journal；数据 purge 当前拒绝。
+- TraceRecovery 是安装内的固定管理员控制台入口，输出部署、任务、会话、服务恢复阻断及局限。仅对完整现存安装做新的 SYSTEM 健康核验后解除对应部署阻断；不清除未知会话或坏日志。日志不可读时生成阻断报告和人工指引。完整 GUI Wizard 属于 M7。
+
+### Review 与修复
+
+应用 Review 的 code-review（Standards / Spec 两轴），另做架构对抗审阅。用户明确选择不追加跨模型复核。
+
+架构审阅促成：健康握手不持锁等待、跨记录状态约束、恢复时保留执行器/清单/任务依赖、有界任务运行及明确管理员威胁边界。哈希链不声称能抵御已取得管理员权限者回滚整个合法历史。
+
+双轴首轮发现安装回滚窗口：旧目录已移走而新目录尚未就位、旧清单路径已赋值但备份尚未成功，均可能错误回滚。现按四个成功标记分别逆序恢复，并增加三个真实文件移动失败夹具。Spec 另发现首次迁移失败的恢复入口、卸载后重装和恢复报告阻断不一致，均补齐保留 Journal 的有限恢复路径及分项阻断字段。Standards 轴与 Spec 轴最终复核均无剩余提交阻断项；两轴结果分别记录，没有把静态通过等同于实机验收。
+
+### 验证记录与尚未通过的发布门槛
+
+普通权限 Windows PowerShell Desktop 5.1 / RemoteSigned 下，SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test 八个回归最终均退出 0；日志保存在本地忽略目录 `test-artifacts/v3-m2/`。初轮 GuiV4Test 检测安装成功提示丢失 VERSION 显示约定，已恢复原版本驱动提示，未删除或放宽检查。初轮 Milestone8Test 另发现新中文注释的执行器缺少 BOM，已统一 UTF-8 BOM 后通过。
+
+新增回归实际使用文件及独占句柄，覆盖：锁竞争/释放、服务部署租约互斥、一次活跃会话、CAS、身份变化、终态重放、Saved/cleanup/analysis 完成约束、时长边界、损坏/重复字段、健康 nonce/账户/启动/定义/链头绑定与过期/重放、预检查中断恢复、截止记录、重启身份变化、不重试未知归属、三处安装移动失败后原文件与清单保留。Task Scheduler COM 定义真实创建在内存内，核验动作、主体和运行时限变更拒绝；未注册任务。
+
+PrivilegeInstallTest 已扩展真实 SYSTEM 握手、任务禁用时拒绝、非 SYSTEM 冒充拒绝、M3 门控和卸载重装；此脚本仅限全新 disposable Windows runner，本轮未在用户机器执行。管理员 ACL 分支为 SKIP；普通测试的 ACL/身份仅在自有夹具内模拟，不能称作权限实机验收通过。
+
+**仍未验证：**真实 Program Files/ProgramData 安装、任务注册/DACL、SYSTEM 执行与开机触发、调度延迟、真实断电/进程崩溃/磁盘满、Windows 10/11 分别部署验收。第一次从旧版迁移前需关闭旧 GUI 和旧提权执行器，旧版不认识 M2 部署租约。任务注册后失败、实际状态未知或坏日志保持阻断，管理员需保留证据并修复可信状态，不能删除日志解锁。高级 WPR/Heap/ETL 功能保持禁用，不能宣布 Preview B 或 Stable v3。此前 <200 MiB 峰值与长时采样覆盖问题仍开放，本轮未重新验证或调整门槛。
+
+Task Scheduler API 依据：[重复触发](https://learn.microsoft.com/en-us/windows/win32/taskschd/repeating-a-task)、[任务安全上下文](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)、[任务安全描述符](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-setsecuritydescriptor)。这些 API 文档不替代本项目的实机部署验收。

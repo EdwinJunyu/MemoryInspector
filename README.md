@@ -19,7 +19,29 @@ MemoryInspector is a local Windows PowerShell 5.1 application for memory monitor
 - 全进程采集不完整时，汇总标记 Partial，只显示可读部分；不据此给出完整汇总增长。Commit 减去 Private Bytes 的残差保持 Unresolved，不能把 Pool 或 Working Set 加进去凑成 Commit。Working Set 仍在原进程页逐个查看，不求和当作 RAM 总占用。
 - 系统 Finding 与可选 RAM 字段写入现有 system JSONL；路径及父实例元数据写入原 process JSONL，沿用原配额和 schema=1 的兼容读取。旧记录缺少字段时不补零、不删除。归因结果不能作为 ActionGrant 或任何高权限凭证。
 
-尚未开放 WPR、Watchdog、Heap 配置、WPAExporter、ActionGrant；它们属于后续独立阶段。开发验证与已知限制见 [项目验收备注](docs/M8-ACCEPTANCE.md)。
+实际 WPR、Heap 配置、WPAExporter、ActionGrant 尚未开放；Watchdog 的 M2 架构见下文。开发验证与已知限制见 [项目验收备注](docs/M8-ACCEPTANCE.md)。
+
+## V3-M2 — Protected Trace Architecture（开发阶段，实机部署验收待完成）
+
+在原 PrivilegeSecurity / ElevatedExecutor / Installer / Uninstaller 内实现受保护 TraceSession、Journal、固定 Controller 命令、SYSTEM Watchdog 和恢复入口，没有新增生产模块。VERSION 仍为 0.0.9；安装清单另有 `TraceArchitectureVersion=1`，用于区分旧安装与 M2 架构，不放宽旧版精确版本信任。
+
+- Journal 位于产品 ProgramData 的 `trace` 受保护目录，采用 UTF-8、SchemaVersion、连续 revision、哈希链及追加写入/Flush。全局独占文件锁跨进程协调；缺失、截断、重复字段、未知结构或非法状态转换拒绝继续，不自动补尾。哈希链用于发现损坏，ACL 才是普通用户写入边界；不声称抵御管理员回滚整份合法历史。
+- 会话绑定身份和启动会话，时长使用秒（默认 300、范围 300–1800）。停止、保存、配置清理及分析分别记录；Saved、CleanupPending、UnknownOutcome 都不能冒充 Completed。未完成会话、有效引用或服务恢复记录阻断升级/卸载。
+- 安装器注册固定 `\MemoryInspector.TraceWatchdog`：LocalSystem、受保护任务 DACL、固定 Windows PowerShell 5.1/执行器/参数、启动触发与每分钟重复、IgnoreNew、单次运行上限 45 秒。健康检查写入最长约 40 秒的挑战，释放锁后等待 SYSTEM 扫描响应，再核验 nonce、启动身份、安装身份、任务指纹及 Journal 链头。任务存在不等于可用。
+- M2 预检查仅记录固定 VirtualAlloc / Memory / 5 分钟请求，明确返回 `TraceBackendUnavailable`，不运行 WPR。Watchdog 可结束尚未授权的中断预检查；对已录制但无法建立实际归属的状态，只记录截止/重启证据并进入 RecoveryRequired，不停止未知追踪、不重复未知操作。M3 才能接入实际 WPR 所有权与停止/保存适配器。
+- 安装保留旧目录、旧清单和失败 staging。注册前失败按每一步成功状态恢复；注册后结果不明时保留匹配的执行器/清单/Journal。已退休日志支持安全重装。卸载只移除已核验的固定任务，并把程序文件归档到产品 ProgramData 的 `retired`；历史、审计和策略保留，`-PurgeProtectedData` 当前拒绝。
+- 服务管理持有共享部署租约，安装/卸载持有独占租约；长时间人工确认不会占住 Watchdog 的状态锁。旧版首次迁移前仍须关闭旧 GUI、结束旧版提权操作，旧执行器没有 M2 租约协议。
+
+仅在隔离 Windows 环境检查源码后运行安装器。安装后的管理员 Windows PowerShell 5.1 恢复入口为：
+
+```powershell
+$executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
+& $executor -Operation TraceRecovery -RequestId ([guid]::NewGuid().ToString('N'))
+```
+
+默认输出诊断报告；输入 `VERIFY DEPLOYMENT` 只重新核验已有完整安装和新的 SYSTEM 响应，成功后解除对应部署阻断。它不能删除日志、清除未知会话、重建被篡改任务或跳过配置恢复。初次迁移在任务注册前失败且已核验回滚时，可重跑安装器，保留并复用原 Journal。日志损坏或实际 WPR 归属不可证明时只提供人工指引，继续阻断。完整 GUI Recovery Wizard 整合属于 M7。
+
+本轮只执行普通权限回归、真实文件故障夹具及内存 COM 定义检查，**未在本机安装 SYSTEM 任务**。真实安装/健康响应/禁用任务拒绝/卸载重装已加入原 PrivilegeInstallTest，仍需隔离环境执行；Windows 10/11 启动、调度延迟和权限实测未完成，因此不能据此开放高级追踪或宣布 Preview B / Stable v3。
 
 ### 归因页界面约定
 

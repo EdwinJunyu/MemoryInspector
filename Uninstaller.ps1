@@ -1,47 +1,44 @@
 ﻿#requires -Version 5.1
-<# Controlled uninstall; leaves user monitoring history and protected audits by default.
-Requires an elevated shell and a verified M6 installation. #>
+<# Protected uninstall: verify all obligations, remove only the known task,
+archive installed payload, retain histories and audits. No recursive deletion. #>
 param([switch]$PurgeProtectedData)
 $ErrorActionPreference='Stop'
 . (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'PrivilegeSecurity.ps1')
 if (-not (Test-MiAdminToken)) { throw 'Administrator permission required.' }
 $paths=Assert-MiTrustedInstallation
-$answer=Read-Host 'Type UNINSTALL MEMORYINSPECTOR to remove the protected program files'
+if ($PurgeProtectedData) { throw 'Protected data purge is disabled by the retention policy; no changes made.' }
+$answer=Read-Host 'Type UNINSTALL MEMORYINSPECTOR to archive the protected program files'
 if ($answer -cne 'UNINSTALL MEMORYINSPECTOR') { throw 'Uninstall cancelled.' }
-$manifest=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($paths.Manifest,[Text.Encoding]::UTF8))
-foreach ($entry in @($manifest.Files)) {
-    $name=[string]$entry.Name
-    if ($name -cnotmatch '^[A-Za-z0-9_-]+\.(ps1|cmd)$' -and $name -cne 'VERSION') {
-        throw 'Unexpected installed file; aborting.'
+$lease=Enter-MiDeploymentLease -Exclusive
+$lock=$null
+try {
+    $lock=Enter-MiTraceLock
+    $paths=Assert-MiTrustedInstallation
+    $manifest=[IO.File]::ReadAllText($paths.Manifest)|ConvertFrom-Json
+    if ($manifest.TraceArchitectureVersion -ne 1) { throw 'Use the matching legacy uninstaller for a legacy installation.' }
+    $j=Read-MiTraceJournal $lock; Assert-MiTraceQuiescent $j
+    if ($j.Deployment -cne 'Ready') { throw 'Unfinished deployment blocks uninstall; use TraceRecovery.' }
+    $watchdog=Assert-MiWatchdog
+    $recovery=[IO.File]::ReadAllText($paths.Recovery)|ConvertFrom-Json
+    if ($recovery.SchemaVersion -ne 1 -or $null -eq $recovery.Records -or
+        @($recovery.Records|Where-Object {$_.Status -cnotin @('StopFailed','RestoreConfirmed')}).Count -gt 0) { throw 'Service recovery blocks uninstall.' }
+    $actual=@(Get-ChildItem -LiteralPath $paths.Install -Force -File)
+    if ($actual.Count -ne @($manifest.Files).Count -or @(Get-ChildItem -LiteralPath $paths.Install -Force -Directory).Count -ne 0) {
+        throw 'Installation contains unexpected content; nothing archived.'
     }
-    $f=Join-Path $paths.Install $name
-    if (-not (Test-MiNoReparse $f)) { throw 'Unexpected reparse point; aborting.' }
-}
-# Fail rather than recursively deleting unknown files.
-$actual=@(Get-ChildItem -LiteralPath $paths.Install -Force -File)
-if ($actual.Count -ne @($manifest.Files).Count -or
-    @(Get-ChildItem -LiteralPath $paths.Install -Force -Directory).Count -ne 0) {
-    throw 'Installation contains unexpected content. No files removed.'
-}
-foreach ($entry in @($manifest.Files)) {
-    [IO.File]::Delete((Join-Path $paths.Install ([string]$entry.Name)))
-}
-[IO.Directory]::Delete($paths.Install,$false)
-Write-Host 'Program files removed. Per-user monitoring history was preserved.' -ForegroundColor Green
-if ($PurgeProtectedData) {
-    $sure=Read-Host 'Type PURGE AUDIT to irreversibly remove protected M6 audit and replay history'
-    if ($sure -cne 'PURGE AUDIT') { Write-Warning 'Protected data retained.'; return }
-    # This is admin-only and verified against known protected paths, never a caller-supplied directory.
-    if (-not (Test-MiAclRestricted $paths.Data $true) -or -not (Test-MiNoReparse $paths.Data)) {
-        throw 'Protected data directory no longer trusted; manual inspection required.'
-    }
-    foreach ($folder in @($paths.Replay,$paths.Results,(Split-Path -Parent $paths.Audit))) {
-        if (-not (Test-MiAclRestricted $folder $true) -or -not (Test-MiNoReparse $folder)) {
-            throw 'Unsafe protected data subdirectory; manual inspection required.'
-        }
-    }
-    [IO.Directory]::Delete($paths.Data,$true)
-    Write-Host 'Protected M6 data was explicitly purged.'
-} else {
-    Write-Host ('Protected audit and replay data retained at '+$paths.Data)
-}
+    # 先持久化删除意图，任务删除返回未知时保留执行器，禁止自动再次删除。
+    $j=Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='RecoveryRequired';Intent='UnregisterWatchdog'})
+    (Get-MiTaskScheduler).GetFolder('\').DeleteTask('MemoryInspector.TraceWatchdog',0)
+    $stillPresent=$null
+    try { $stillPresent=(Get-MiTaskScheduler).GetFolder('\').GetTask('MemoryInspector.TraceWatchdog') }
+    catch { if ($_.Exception.HResult -ne -2147024894) { throw } }
+    if ($null -ne $stillPresent) { throw 'Watchdog removal outcome unknown; executor retained.' }
+    $retired=Join-Path $paths.Data 'retired'
+    if ([IO.Directory]::Exists($retired)) { Assert-MiTracePath $retired }
+    else { [void][IO.Directory]::CreateDirectory($retired); Set-MiAdminDirectoryAcl $retired }
+    $destination=Join-Path $retired ('install-'+[guid]::NewGuid().ToString('N'))
+    [IO.Directory]::Move($paths.Install,$destination)
+    [void](Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='Retired'}))
+    Write-Host ('Program files archived at '+$destination) -ForegroundColor Green
+    Write-Host ('User history, protected audit, policy and trace records retained at '+$paths.Data)
+} finally { if ($null -ne $lock) { $lock.Dispose() }; $lease.Dispose() }

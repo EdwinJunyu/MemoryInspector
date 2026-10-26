@@ -19,11 +19,27 @@ function Invoke-MiTestExecutor {
     param([string]$Operation,[string]$RequestId)
     $exe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $args='-NoProfile -ExecutionPolicy RemoteSigned -File "'+$paths.Executor+'" -Operation '+$Operation+' -RequestId '+$RequestId
-    $process=Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -ErrorAction Stop
+    $process=Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
     try { return [int]$process.ExitCode } finally { $process.Dispose() }
 }
 & (Join-Path $root 'Installer.ps1')
 [void](Assert-MiTrustedInstallation)
+$watchdog=Assert-MiWatchdog
+[void](Invoke-MiTraceHealthCheck)
+if ((Invoke-MiTestExecutor 'TracePreflight' ([guid]::NewGuid().ToString('N'))) -eq 0) { throw 'M2 unexpectedly enabled WPR.' }
+if ((Invoke-MiTestExecutor 'TraceWatchdog' 'Scheduled') -eq 0) { throw 'Administrator impersonated SYSTEM watchdog.' }
+$lock=Enter-MiTraceLock
+try {
+    $j=Read-MiTraceJournal $lock; Assert-MiTraceQuiescent $j
+    if (@($j.Sessions.Values).Count -ne 1 -or @($j.Sessions.Values)[0].ErrorCode -cne 'TraceBackendUnavailable') {throw 'Preflight did not persist explicit M3 gate.'}
+} finally {$lock.Dispose()}
+# 真实任务被禁用后必须拒绝高权限请求，恢复原值仅用于本次隔离测试。
+$watchdog.Task.Enabled=$false
+try {
+    if ((Invoke-MiTestExecutor Probe ([guid]::NewGuid().ToString('N'))) -eq 0) {throw 'Disabled watchdog escaped gate.'}
+} finally {$watchdog.Task.Enabled=$true}
+[void](Invoke-MiTraceHealthCheck)
+Write-Host 'PASS: real SYSTEM health handshake, exact fixed task gate, M3 recording disabled.'
 # P1-03：仅 disposable runner，验证真实受保护目录内持有独占句柄时的 ACL 设置及锁释放。
 # 不请求任何 SCM 变更，不删除锁文件；该部分覆盖单元测试中模拟 ACL 无法验证的 Windows 行为。
 . (Join-Path $paths.Install 'ServiceManagement.ps1')
@@ -67,7 +83,7 @@ $svcExe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $svcId=[guid]::NewGuid().ToString('N')
 $svcArgs='-NoProfile -ExecutionPolicy RemoteSigned -File "'+$paths.Executor+
     '" -Operation StopApprovedService -RequestId '+$svcId+' -ServiceName RpcSs'
-$svcProc=Start-Process -FilePath $svcExe -ArgumentList $svcArgs -PassThru -Wait -ErrorAction Stop
+$svcProc=Start-Process -FilePath $svcExe -ArgumentList $svcArgs -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
 try { if ($svcProc.ExitCode -eq 0) { throw 'Critical service stop should be rejected.' } }
 finally { $svcProc.Dispose() }
 # Modify one installed file as administrator, verify manifest check rejects the next probe,
@@ -94,3 +110,8 @@ if (-not [IO.File]::Exists($paths.Audit) -or -not [IO.File]::Exists($paths.Polic
     throw 'Uninstall unexpectedly removed protected audit / allowlist records.'
 }
 Write-Host 'PASS: M8 protected uninstall retained privileged audit and policy data.' -ForegroundColor Green
+# 保留 Journal 的正常卸载必须允许安全重装，不得删除日志才能再次安装。
+& (Join-Path $root 'Installer.ps1')
+[void](Invoke-MiTraceHealthCheck)
+& (Join-Path $root 'Uninstaller.ps1')
+Write-Host 'PASS: M2 retired journal reused after verified uninstall/reinstall; task and payload removed from active paths.'

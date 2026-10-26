@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 M7 protected, short-lived executor. Probe plus explicitly approved Windows service
 operations only. Unknown identity, invalid ACL, changed binary, missing audit or
@@ -32,6 +32,15 @@ try {
         throw 'Executor must run from verified protected installation.'
     }
     $trusted=$true
+    $installationManifest=[IO.File]::ReadAllText($paths.Manifest)|ConvertFrom-Json
+    if ($installationManifest.TraceArchitectureVersion -eq 1 -and $Operation -cne 'TraceRecovery') {
+        [void](Assert-MiWatchdog)
+    }
+    if ($Operation -ceq 'TraceWatchdog') {
+        # 定时任务不使用普通请求的 nonce；SYSTEM 身份、固定任务与完整安装均另行核验。
+        Invoke-MiTraceWatchdog
+        exit 0
+    }
     # Atomic CreateNew claim prevents replay, including concurrent elevated processes.
     $marker=Join-Path $paths.Replay ($RequestId.ToLowerInvariant()+'.nonce')
     $stream=[IO.File]::Open($marker,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
@@ -44,9 +53,34 @@ try {
         Write-MiPrivilegedAudit -RequestId $RequestId -State 'REQUESTED' -Reason 'UAC readiness probe'
         Write-MiPrivilegedAudit -RequestId $RequestId -State 'CONFIRMED' -Reason 'Protected install/replay/audit checks passed'
         $exitCode=0
+    } elseif ($Operation -ceq 'TraceHealth') {
+        [void](Invoke-MiTraceHealthCheck)
+        Write-MiPrivilegedAudit -RequestId $RequestId -Action $Operation -State 'CONFIRMED' -Reason 'Fresh SYSTEM scan and challenge response verified'
+        $exitCode=0
+    } elseif ($Operation -ceq 'TracePreflight') {
+        Invoke-MiTracePreflight $RequestId | Format-List
+        $exitCode=2 # M2 不开放实际 WPR，拒绝不能伪装成成功启动。
+    } elseif ($Operation -ceq 'TraceRecovery') {
+        Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
+        $answer=Read-Host 'Type VERIFY DEPLOYMENT to revalidate an intact deployment; Enter only keeps the report'
+        if ($answer -ceq 'VERIFY DEPLOYMENT') {
+            Invoke-MiTraceDeploymentRecovery
+            Get-MiTraceRecoveryReport | ConvertTo-Json -Depth 12 | Write-Output
+        }
+        $exitCode=0 # 仅表示生成报告；报告明确独立列出恢复阻断。
     } else {
-        . (Join-Path $root 'ServiceManagement.ps1')
-        $outcome=Invoke-MiServiceMutation -Operation $Operation -ServiceName $ServiceName -RequestId $RequestId
+        $lease=Enter-MiDeploymentLease
+        try {
+            $paths=Assert-MiTrustedInstallation
+            $manifest=[IO.File]::ReadAllText($paths.Manifest)|ConvertFrom-Json
+            if ($manifest.TraceArchitectureVersion -eq 1) {
+                $stateLock=Enter-MiTraceLock
+                try { if ((Read-MiTraceJournal $stateLock).Deployment -cne 'Ready') { throw 'Deployment recovery required.' } }
+                finally { $stateLock.Dispose() }
+            }
+            . (Join-Path $root 'ServiceManagement.ps1')
+            $outcome=Invoke-MiServiceMutation -Operation $Operation -ServiceName $ServiceName -RequestId $RequestId
+        } finally { $lease.Dispose() }
         $exitCode=if ($outcome -eq 'Confirmed') {0} elseif ($outcome -eq 'TimedOut') {3} else {2}
     }
 } catch {
