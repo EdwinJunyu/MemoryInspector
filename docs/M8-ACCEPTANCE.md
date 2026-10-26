@@ -492,3 +492,88 @@ M2–M5 全部实机关卡继续待验收；M6 仍需隔离 Windows 10/11 的真
 [NEEDS CLARIFICATION] 支持的 Windows/ADK/目标矩阵、映像与报告上限及实际资源阈值须按冻结规格第 20 节校准，不重新开放 Q1–Q31，不降低阈值换取通过。M6/M7 开发整合不等于 Release 验收完成，不能宣布 Preview C 或 Stable v3；所有未验收的新权限/高级追踪功能继续禁用。
 
 API 依据：[进程访问权限](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)、[IsProcessCritical](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocesscritical)、[ProcessProtectionLevelInfo](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/ne-processthreadsapi-process_information_class)、[Token 信息类型](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class)、[TerminateProcess 的异步语义](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)。文档用于核对契约，不代表 Windows 实机安全验收。
+
+## 2026-10-25 V3-M2：Windows 11 实机安全验收（部分通过）
+
+冻结依据仍为 [v3 技术规格](https://docs.google.com/document/d/1GVln-oZKuIPkIR1C-Bh3JouyMhEO0z6X-dAscPpTHr4/edit) 的受保护部署、Watchdog、健康检查和恢复要求；固定审阅基线 `f88de279bb952f43195881dadfe73689bda89eed`。本轮仅修改原安全模块、安装验收脚本、安全测试和备注，没有新增生产模块、修改版本、推送远程或打开发布门。
+
+### 当前机器和阻断证据
+
+- Windows 11 build 22631；Windows PowerShell Desktop 5.1.22621.6133；日常终端为普通令牌。独立只读提权探针曾成功，实际报告 Administrator=true；它不安装、不注册任务，不能代替受保护部署验收。
+- 两次自动安装提权尝试（隐藏窗口、可见窗口）均在脚本启动前返回 Windows“操作已被用户取消”。用户明确表示没有看到 UAC 提示，不能推断为用户主动拒绝。可见重试期间在同一登录会话检测到 consent.exe，随后消失；当时没有 live-launch、控制台 transcript 或 live-summary。后续真实执行来自用户手动管理员窗口。
+- 自动提权取消后首次复核产品目录/任务均不存在；随后用户在手动管理员窗口真实运行初装，生成 live-summary.json，首项 ProtectedInstallation 在实际任务 ACL 校验处失败。产品安装、Journal 和任务已保留；部署为 RecoveryRequired/ManualRecovery，首次链头 revision=4。再次不带 Continue 的执行正确拒绝覆盖既有路径。
+- 用户运行诊断取得 live-inspection.json：实际 SDDL 为 `O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SY)`，所有者 BA 正确，但缺少保护标志且有额外 SYSTEM FR；注册 XML 内仍含原 D:P。普通令牌真实查询固定任务返回 E_ACCESSDENIED。该证据只能说明任务查询被拒绝，不能声称实际执行了写接口。
+- 注册适配器现使用 TASK_DONT_ADD_PRINCIPAL_ACE，并通过官方 SetSecurityDescriptor(exact,16) 后重新获取实际对象，保留原严格保护标志/主体/权限检查。用户运行本次限定修复后，实际观察为 `O:BAG:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)`，受保护标志存在且仅两条完整权限；acl-set-observation.json 与受保护修复意图均保留。修复本身不生成策略、不改 payload/manifest、不解除 RecoveryRequired，也不打开功能。
+- 随后通过已核验初装链补齐策略、正式 SYSTEM 健康恢复和原 Installer 事务部署修复源码。任务定义故障测试曾把 GetSecurityDescriptor 返回的 PAI 当作注册 XML 的 P，导致原指纹不匹配；已分离两种描述符，并从受保护原值恢复原指纹，不改 policy 来接纳变化。恢复入口要求明确的先前 AttemptId、同 run 失败报告、原值摘要、原 XML 等于已有策略指纹，且当前差异只能是这一项序列化变化。
+- 另一实机轮次通过周期回收后，最终连续健康检查曾超时。发现 IgnoreNew 下前轮已回应但仍在退出时立即 Run 会被忽略；现先 Flush 挑战并优先观察现有响应，无响应且任务重新核验为 Ready 时仅 Run 一次。保留原 40 秒期限、nonce/启动/定义/安装/扫描 hash/UTC 校验、锁释放和未知结果不重派发；超时仍拒绝，不能声称消除了所有调度竞争。
+- 运行证据保留本地忽略目录 `test-artifacts/v3-m2-win11/`。其中 admin-probe.json 只是提权/环境探针；baseline-security.log、harness-security.log 和 final-*.log 是开发回归，不能计作安装或 SYSTEM 验收。普通默认安装测试 SKIP 也不能计作通过。
+
+### 本轮真实验收结果
+
+最终管理员 AttemptId=`57b5b2ead4f44bdcbe387c6e916eec39`，Status=`ChecksPassedWithPendingAcceptance`；**12 项检查全部 Passed**。受保护报告为产品 Results 下 `m2-win11-57b5b2ead4f44bdcbe387c6e916eec39.json`，工作区镜像为 live-summary.json。最后完整 Journal revision=53，链头 `6A737435DBA6B00BB67420517A407D69F30764006AA2C2BE1BB4DB7175ACCF94`；部署 Ready 且无活跃追踪/配置义务，全部高级发布门仍关闭。
+
+| 检查范围 | 真实结果与边界 |
+| --- | --- |
+| 受保护安装、16 项清单/摘要/ACL、固定 SYSTEM 任务 | 通过；实际任务 PAI，只有 SYSTEM/Administrators 完全控制 |
+| SYSTEM challenge/response 与连续健康检查 | 通过；实际 SID S-1-5-18、nonce/启动/安装/定义和扫描链头绑定 |
+| 禁用任务、任务 XML/DACL、安装文件篡改 | 均拒绝；原值恢复后重新核验通过，故障备份和失败报告保留 |
+| 实际 Probe、重放、管理员冒充 SYSTEM、未验收 TraceStart | Probe 单次成功，其余拒绝；没有启动 WPR |
+| 跨进程持久部署意图与正式恢复 | RecoveryRequired → 新的实际 SYSTEM 核验 → Ready；不是任意写入边界崩溃验收 |
+| 本工具 Watchdog 中断、每分钟真实回收未授权意图 | 终止结果 267014；随后周期触发约 39.8 秒回收为 AuthorizationDenied/PreflightInterrupted，无 WPR/Heap 副作用 |
+| 普通令牌访问探针 | 21 项写入/改 DACL/删除均返回 ACCESS_DENIED；Journal 读取也拒绝；任务 Lookup=Denied、ReadEnabled/Write=NotReached。部分目标当前存在性无法由普通令牌确认，完整验收仍 Pending |
+| Windows 重启/开机触发 | 用户明确选择本轮暂不重启，保持 Pending；未启用 TaskScheduler Operational 日志或修改 Windows 重启设置 |
+
+普通报告 normal-access.json 的 Status=`AccessDeniedObservedCurrentExistencePending`，脚本按设计退出 1，不能改记 Passed。完整 M2、Preview B/C 和 Stable v3 均未验收通过。
+
+最终快照检查的共享部署租约在该次实机轮次后补入源码，已由回归核验，没有将这条新增锁路径计入上述实机通过范围。快照始终只作历史关联证据。
+
+### 原脚本中的实机模式
+
+管理员 Windows PowerShell 5.1 中，首次执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "D:\D_Main\EdwinSoftware\tool\MemoryInspector-main\PrivilegeInstallTest.ps1" -LiveM2
+```
+
+默认无参数模式仍只允许一次性 CI runner，包含卸载/重装流程，不能用于个人机器。`-LiveM2` 必须显式选择，只创建/操作本次拥有的固定安装与任务，保留安装，不卸载、不重启 Windows、不启停 WPR、不写 IFEO、不终止诊断目标。预存安装/数据/同名任务一律拒绝；续跑要求 `-LiveM2 -ContinueLiveM2` 并核验受保护归属标记、当前 SID、源目录和 run ID，不能把未知安装认领为夹具。
+
+- 全程持独立验收独占锁；故障注入及最终存在快照检查持共享部署租约，阻止另一个验收或安装/卸载并行修改。等待 SYSTEM 健康响应时不占用它所需的 TraceLock。
+- 核验真实安装清单/摘要/ACL、固定 LocalSystem 任务定义/权限、实际 nonce challenge/response、任务禁用/定义偏差/DACL 偏差/安装文件篡改拒绝、恢复后的健康响应、实际 Probe 重放拒绝和管理员不能冒充 SYSTEM。
+- 每次任务禁用、XML/DACL/文件故障前，先在受保护 Results 中 CreateNew/Flush 原值、SHA256 和写前意图，随后追加 MutationApplied/Restored。`finally` 负责正常恢复，但不声称能在进程崩溃时运行。中断后保留备份并先核验实际固定资源；续跑不自动覆盖不可信状态。故障后的安全阻断不能通过重写任务指纹、Journal 或发布门消除。
+- 独立子进程提交部署 RecoveryRequired 意图并退出，由另一进程运行原恢复函数重新核验完整安装及 SYSTEM 响应。这仅验证持久意图跨进程恢复，不等于写入任意边界的 Controller 崩溃验收。
+- 仅在没有活跃追踪时中断本工具固定 Watchdog 任务，要求观察到确切任务终止结果；随后等待每分钟真实触发回收未授权、尚未录制的 Requested 意图。不能扩大为 WPR 停止/ETL 保存/Heap 恢复或开机触发验收。
+- 最终报告保存受保护 Results 副本及工作区镜像。报告只是证据，不是可编辑解锁配置；即使局部检查通过，也保留重启、Windows 10 和普通权限探针 Pending。
+
+`-InspectLiveM2` 只读取本次标记、任务定义/实际 SDDL 和完整 Journal；仅打开既有锁，不创建锁或改变 ACL。`-RepairLiveM2TaskAcl` 只支持本次无策略、无 Session/Heap 的精确首次 ACL 失败，先核验可信安装/归属/实际固定配置/原 ACE 白名单，持验收、部署和状态锁，受保护 CreateNew/Flush 原 SDDL/XML/链头后才设置固定权限，随后严格复核；不处理未知任务。
+
+ACL 已严格通过后，`-LiveM2 -ContinueLiveM2` 可以补齐本次中断的首次注册：必须是完整四条哈希链 Initialize/PrepareInstallation/RegisterWatchdog/精确 ACL 错误、revision=4、没有 Session/Heap/Artifact、策略缺失、任务实际定义/ACL 全部通过。写前追加补齐意图，再 CreateNew/Flush 策略；已有或部分写入的策略不覆盖。之后由原部署恢复函数取得新的真实 SYSTEM 响应才能 Ready。若源文件已修复，则通过原 Installer 正式事务升级到修复源码，不直接改安装文件或伪造 manifest。通用 TraceRecovery 仍不能修复未知任务或重建丢失策略。
+
+在安装确实完成后，普通 Windows PowerShell 5.1 单独执行：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "D:\D_Main\EdwinSoftware\tool\MemoryInspector-main\PrivilegeInstallTest.ps1" -ProbeLiveM2Normal
+```
+
+探针持普通令牌可读的既有部署共享租约，先尝试零访问权 OPEN_EXISTING 句柄逐项目标确认存在，再请求文件/目录的写入、修改 DACL 和删除权，不写字节或删除文件；还检查 Journal 读取拒绝。意外获得权限立即关闭句柄并失败。缺失对象、意外错误或未安装不能被记作通过。元数据也被拒绝时，只能关联受保护管理员快照：校验 ACL/重解析、schema/attempt/账户/启动/15 分钟时限，工作区 JSON 仅用于选择 GUID。该快照是历史证据，共享租约只阻止普通采样期间变更，不能追溯排除快照后升级或中断；因此标记 HistoricalProtectedAdministratorSnapshot_CurrentExistencePending，落盘观测后抛错，完整普通权限验收继续 Pending。没有放宽 manifest/Journal/产品目录 ACL 来让测试通过。
+
+任务查找、Enabled getter 和 setter 分段记录；查找或 getter 拒绝时 Write=NotReached，不能声称调用了写接口。普通探针输出 normal-access.json，与提权报告分别保留，不能替代完整非管理员/跨用户权限矩阵。
+
+### Review：Standards
+
+按 Review code-review 工作流独立复核。发现并修复故障原值只在内存、故障恢复未统一禁止追加主体 ACE、历史快照被扩大为当前存在性证明等问题；补齐写前持久化、统一注册/实际 ACL 标志、分离注册描述符和实际 ACL，并将历史关联证据降为 Pending。IgnoreNew 健康修复、限定初装补齐和原指纹恢复入口均另行复核。最终代码审阅不等于剩余重启/完整权限矩阵实测。
+
+### Review：Spec
+
+独立复核发现故障原值持久化、验收/部署并发竞争、普通探针的对象存在证据和任务阶段归类、历史快照与当前部署存在间隙等问题。现保留严格校验和全部门控，以受保护原值/意图、专用锁与部署租约、阶段分账和不完整证据明确 Pending 修复；没有降低阈值换取通过。初装补齐意图落盘后但策略创建前中断、或部分策略写入仍拒绝自动续跑，不能声称任意阶段崩溃都能自动恢复。
+
+### 开发验证及待完成项
+
+新增安全测试实际运行原验收助手：拒绝普通令牌启动实机模式、拒绝缺失安装；真实文件验证四种故障原值/摘要/意图、CreateNew 拒绝覆盖、阶段顺序、越界路径拒绝，以及检查成功/失败均释放租约。原生句柄探针对测试创建的可写文件必须报告验收失败且保持字节不变。这里只模拟 ACL 和部署租约，未触碰真实产品安装。
+
+另覆盖注册 create/update flags、实际 setter/重取、保护位丢失拒绝；精确初装历史/无策略补齐、任务不可信和重放拒绝；错误 run/attempt、备份 SHA/原指纹不符、额外 XML 变化拒绝，恢复不改 policy；IgnoreNew Finishing/Ready/已有响应、挑战被替换/任务变化、Run 时锁已释放与单次派发；快照 ACL/schema/身份/启动/过期/未来时间/失败 summary/路径选择拒绝。调度器、ACL 和健康边界替身明确标注，不替代上述实机结果。
+
+全部源码修复后，在 Windows PowerShell Desktop 5.1.22621.6133 / STA / RemoteSigned 完整重跑 SmokeTest、PersistenceTest、AnalyzerTest、GuiV4Test、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test，**八套全部退出 0**，结果为 verified-regression-results.json 与 verified-*.log。三个修改的 PowerShell 文件保留 UTF-8 BOM，五个源码/文档严格 UTF-8 解码及 git diff --check 通过。源与实际安装的 PrivilegeSecurity SHA256 同为 `5C99F2B856DA6C3209FCE4A120BAEF07A44845705DD1E27FC3EAD7E88D0BA968`，确认实机运行了修复版本；final-prerequisites.json 另记录 WPR/Heap/Export 验收门全部 false。Review 最终 Standards、Spec 两轴均无剩余可确认 P1/P2，不以此替代 Pending 实测。
+
+尚未通过：完整普通/跨用户权限矩阵及不可读对象当前存在性、Controller/GUI 任意写入边界硬崩溃和全部资源压力、真实 Windows 重启/开机触发与 Win10 验收。用户明确本轮不重启，脚本也不执行重启。M2Accepted 及 M3–M7 原发布门全部保持 false，不宣布 Preview B/C 或 Stable v3。`[NEEDS CLARIFICATION]` 实际兼容矩阵与资源阈值仍按冻结第 20 节校准，不降低标准换取通过。
+
+API 依据：[固定任务停止](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-stop)、[任务安全上下文](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)、[任务状态码](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-error-and-success-constants)、[注册与禁止追加主体 ACE](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskfolder-registertaskdefinition)、[设置实际任务权限](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-setsecuritydescriptor)。文档只证明 API 契约；实际通过范围以前述逐项证据为准。

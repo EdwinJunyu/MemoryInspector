@@ -5,7 +5,7 @@ $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $MyInvocation.MyCommand.Path
 $files=@('PrivilegeSecurity.ps1','PrivilegeBridge.ps1','ElevatedExecutor.ps1',
     'Installer.ps1','Uninstaller.ps1','MemoryInspector.ps1','GuiV4.ps1',
-    'ServiceManagement.ps1','ServiceBridge.ps1')
+    'ServiceManagement.ps1','ServiceBridge.ps1','PrivilegeInstallTest.ps1')
 foreach ($f in $files) {
     $tokens=$null;$errors=$null
     [void][Management.Automation.Language.Parser]::ParseFile(
@@ -13,6 +13,70 @@ foreach ($f in $files) {
     if ($errors.Count -gt 0) { throw ('M6 parse failure '+$f+': '+($errors|Out-String)) }
 }
 . (Join-Path $root 'PrivilegeSecurity.ps1')
+# 实机验收辅助函数使用真实临时文件回归；仅 ACL/部署租约为夹具，不安装、不发 UAC。
+& {
+    $tokens=$null;$errors=$null
+    $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'PrivilegeInstallTest.ps1'),[ref]$tokens,[ref]$errors)
+    foreach ($name in @('Invoke-MiM2LiveAcceptance','Invoke-MiM2NormalAccessProbe','Show-MiM2LiveInspection','Repair-MiM2LiveTaskAcl','Save-MiM2LiveFaultBackup','Add-MiM2LiveFaultStage','Invoke-MiM2LiveCheck')) {
+        $node=$ast.Find({param($item) $item -is [Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -ceq $name},$true)
+        if ($null -eq $node) {throw ('Missing live acceptance helper '+$name)}
+        . ([scriptblock]::Create($node.Extent.Text))
+    }
+    function Assert-LiveHarnessRejected {param([scriptblock]$Action)
+        $denied=$false;try {& $Action|Out-Null} catch {$denied=$true};if (-not $denied) {throw 'Unsafe live harness condition accepted.'}
+    }
+    function Test-MiAdminToken {return $false}
+    Assert-LiveHarnessRejected {Invoke-MiM2LiveAcceptance}
+    Assert-LiveHarnessRejected {Show-MiM2LiveInspection}
+    Assert-LiveHarnessRejected {Repair-MiM2LiveTaskAcl}
+    $fixture=Join-Path $root ('test-artifacts\M2-LiveHarness-'+[guid]::NewGuid().ToString('N'))
+    $paths=[pscustomobject]@{Results=$fixture;Executor=(Join-Path $fixture 'missing-executor.ps1')}
+    function Get-MiSecurityPaths {return $paths}
+    Assert-LiveHarnessRejected {Invoke-MiM2NormalAccessProbe}
+    $report=[pscustomobject]@{RunId=[guid]::NewGuid().ToString('N');AttemptId=[guid]::NewGuid().ToString('N');Checks=@()}
+    [void][IO.Directory]::CreateDirectory($fixture)
+    $writable=Join-Path $fixture 'readable-executor.ps1';[IO.File]::WriteAllText($writable,'unchanged')
+    $paths|Add-Member NoteProperty DeploymentLease (Join-Path $fixture 'deployment.lock');[IO.File]::WriteAllText($paths.DeploymentLease,'')
+    function Assert-MiTracePath {param($Path)
+        if (-not (Test-Path -LiteralPath $Path) -or -not [IO.Path]::GetFullPath($Path).StartsWith($fixture+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) {throw 'Unbound live fixture path.'}
+    }
+    $paths.Executor=$writable;$paths|Add-Member NoteProperty Install (Join-Path $fixture 'missing-object')
+    $missingObjectRejected=$false
+    try {Invoke-MiM2NormalAccessProbe} catch {$missingObjectRejected=$_.Exception.Message.StartsWith('Cannot establish live object existence: ')}
+    if (-not $missingObjectRejected) {throw 'Native normal probe counted missing/inaccessible metadata as accepted ACL.'}
+    $paths.Install=$writable
+    $unexpectedAccessRejected=$false
+    try {Invoke-MiM2NormalAccessProbe} catch {$unexpectedAccessRejected=$_.Exception.Message -ceq ('Normal user obtained WriteData on '+$writable)}
+    if (-not $unexpectedAccessRejected -or [IO.File]::ReadAllText($writable) -cne 'unchanged') {throw 'Native normal probe failed to reject writable file without changing its bytes.'}
+    function Set-MiAdminDirectoryAcl {param($Path)}
+    function Set-MiProtectedFileAcl {param($Path)}
+    function Assert-MiTracePath {param($Path)
+        if (-not (Test-Path -LiteralPath $Path) -or -not [IO.Path]::GetFullPath($Path).StartsWith($fixture+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) {throw 'Unbound live fixture path.'}
+    }
+    foreach ($kind in @('TaskEnabled','TaskXml','TaskDacl','Payload')) {
+        $original=[Text.Encoding]::UTF8.GetBytes('original '+$kind)
+        $case=Save-MiM2LiveFaultBackup $kind $original
+        $backup=Join-Path $case 'original.bin';$stages=Join-Path $case 'stages.jsonl'
+        $intent=[IO.File]::ReadAllLines($stages)[0]|ConvertFrom-Json
+        if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($backup)) -cne [Convert]::ToBase64String($original) -or
+            $intent.State -cne 'CapturedBeforeMutation' -or $intent.AttemptId -cne $report.AttemptId -or
+            $intent.OriginalSha256 -cne (Get-FileHash $backup -Algorithm SHA256).Hash) {throw 'Fault backup lost original bytes/intent binding.'}
+        Assert-LiveHarnessRejected {Save-MiM2LiveFaultBackup $kind ([byte[]]@(0))}
+        Add-MiM2LiveFaultStage $case 'MutationApplied';Add-MiM2LiveFaultStage $case 'Restored'
+        $states=@([IO.File]::ReadAllLines($stages)|ForEach-Object {($_|ConvertFrom-Json).State})
+        if (($states -join ',') -cne 'CapturedBeforeMutation,MutationApplied,Restored') {throw 'Fault evidence ordering failed.'}
+    }
+    Assert-LiveHarnessRejected {Add-MiM2LiveFaultStage (Join-Path $fixture 'Payload') 'Restored'}
+    $leases=[Collections.Generic.List[object]]::new();$saved=0
+    function Enter-MiDeploymentLease {$lease=[IO.MemoryStream]::new();$leases.Add($lease);return $lease}
+    function Save-MiM2LiveReport {$script:liveHarnessSaved++}
+    $script:liveHarnessSaved=0
+    Invoke-MiM2LiveCheck 'DisabledTaskRefusedAndRestored' {'successful fixture'}
+    Assert-LiveHarnessRejected {Invoke-MiM2LiveCheck 'InstalledPayloadTamperRefusedAndRestored' {throw 'injected check failure'}}
+    if ($leases.Count -ne 2 -or $leases[0].CanRead -or $leases[1].CanRead -or $script:liveHarnessSaved -ne 2 -or
+        $report.Checks[0].State -cne 'Passed' -or $report.Checks[1].State -cne 'Failed') {throw 'Live check lost failure evidence or deployment lease release.'}
+    Write-Host 'PASS: M2 live harness denies nonadmin/missing install, preserves CreateNew fault originals and ordered evidence, releases leases on success/failure (ACL mocked).'
+}
 $id=[guid]::NewGuid().ToString('N')
 if (-not (Test-MiGuidN $id)) { throw 'Valid GUID rejected.' }
 foreach ($bad in @('', '00000000000000000000000000000000','../evil','xxxx',('a'*33))) {
@@ -329,11 +393,62 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
 
 # 真正的 Task Scheduler COM 定义仅在内存构建；不注册任何任务。
 & {
+    # 确定性复现 IgnoreNew 的“已回应但仍在退出”边界；锁已释放才可派发下一次扫描。
+    $context=@{Mode='Finishing';Polls=0;Runs=0;Published=$false;Respond=$false;Handles=[Collections.Generic.List[object]]::new();Journal=$null}
+    $installId=[guid]::NewGuid().ToString('N');$policy=[pscustomobject]@{InstallationId=$installId;DefinitionHash=('C'*64)}
+    $task=[pscustomobject]@{}
+    $task|Add-Member ScriptProperty State { $context.Polls++;if ($context.Mode -ceq 'Finishing' -and $context.Polls -lt 3) {return 4};return 3 }
+    $task|Add-Member ScriptMethod Run {param($Argument)
+        if (-not $context.Published -or ($context.Mode -ceq 'Finishing' -and $context.Polls -lt 3) -or @($context.Handles|Where-Object {$_.CanRead}).Count -ne 0) {throw 'Watchdog dispatched before ready/challenge or while holding trace lock.'}
+        $context.Runs++;$context.Respond=$true
+    }
+    function Assert-MiWatchdog {
+        if ($context.Mode -ceq 'TaskChanged' -and $context.Published) {throw 'Actual task changed.'}
+        return [pscustomobject]@{Task=$task;Policy=$policy}
+    }
+    function Get-MiBootSessionId {return '123'}
+    function Enter-MiTraceLock {$handle=[IO.MemoryStream]::new();$context.Handles.Add($handle);return $handle}
+    function Add-MiTraceJournalRecord {param($Lock,$Revision,$Kind,$Payload)
+        if ($Kind -cne 'HealthChallenge') {throw 'Unexpected health fixture record.'}
+        $context.Published=$true;$context.Journal.Challenge=$Payload;$context.Journal.Hash=('B'*64);return $context.Journal
+    }
+    function Read-MiTraceJournal {param($Lock)
+        $j=$context.Journal
+        if ($context.Published -and $context.Mode -ceq 'Superseded') {$j.Challenge.Nonce=[guid]::NewGuid().ToString('N')}
+        if ($context.Published -and ($context.Respond -or $context.Mode -ceq 'ExistingResponds')) {
+            $j.Response=[pscustomobject]@{Nonce=$j.Challenge.Nonce;DefinitionHash=$policy.DefinitionHash;InstallationId=$installId;BootSessionId='123';ScannedHash=$j.Hash;Utc=[datetime]::UtcNow.ToString('o')}
+        }
+        return $j
+    }
+    function Start-Sleep {param($Milliseconds)}
+    foreach ($mode in @('Finishing','Ready','ExistingResponds','Superseded','TaskChanged')) {
+        $context.Mode=$mode;$context.Polls=0;$context.Runs=0;$context.Published=$false;$context.Respond=$false;$context.Handles.Clear()
+        $context.Journal=[pscustomobject]@{InstallationId=$installId;Deployment='Ready';Revision=1;Hash=('A'*64);Sessions=@{};HeapTransactions=@{};Artifacts=@{};Challenge=$null;Response=$null}
+        $denied=$false;try {$result=Invoke-MiTraceHealthCheck} catch {$denied=$true}
+        if ($mode -cin @('Superseded','TaskChanged')) {
+            if (-not $denied -or $context.Runs -ne 0) {throw 'Changed health/task context dispatched or accepted.'}
+        } elseif ($denied -or ($mode -ceq 'ExistingResponds' -and $context.Runs -ne 0) -or
+            ($mode -cne 'ExistingResponds' -and $context.Runs -ne 1) -or $null -eq $result.Response) {throw ('Health dispatch contract failed for '+$mode)}
+        if (@($context.Handles|Where-Object {$_.CanRead}).Count -ne 0) {throw 'Health check leaked a held trace lock.'}
+    }
+    Write-Host 'PASS: IgnoreNew finishing/ready health race, existing scan response, single dispatch after Flush/unlock and changed challenge/task refusal (scheduler/journal mocked).'
+}
+
+# 真正的 Task Scheduler COM 定义仅在内存构建；不注册任何任务。
+& {
     $scheduler=Get-MiTaskScheduler
     $definition=Get-MiWatchdogDefinition $scheduler
-    $fake=[pscustomobject]@{Definition=$definition;Enabled=$true;State=3}
-    $fake|Add-Member ScriptMethod GetSecurityDescriptor {param($flags) return 'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'}
+    $fake=[pscustomobject]@{Definition=$definition;Enabled=$true;State=3;Sddl='O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'}
+    $fake|Add-Member ScriptMethod GetSecurityDescriptor {param($flags) return $this.Sddl}
     Assert-MiWatchdogDefinition $fake
+    foreach ($badAcl in @('O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SY)',
+            'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)',
+            'O:BAG:BAD:P(A;;FR;;;SY)(A;;FA;;;BA)','O:BAG:BAD:P(A;;FA;;;SY)')) {
+        $fake.Sddl=$badAcl;$rejected=$false
+        try {Assert-MiWatchdogDefinition $fake} catch {$rejected=$true}
+        if (-not $rejected) {throw 'Unprotected/expanded/incomplete watchdog ACL accepted.'}
+    }
+    $fake.Sddl='O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'
     $definition.Actions.Item(1).Arguments+=' -Command evil'
     $rejected=$false;try {Assert-MiWatchdogDefinition $fake}catch {$rejected=$true}
     if (-not $rejected) {throw 'Changed task action accepted.'}
@@ -346,6 +461,195 @@ Write-Host 'PASS: M6 safeguards retained and M7 service scope gated by exact tar
     $rejected=$false;try {Assert-MiWatchdogDefinition $fake}catch {$rejected=$true}
     if (-not $rejected) {throw 'Unbounded watchdog accepted.'}
     Write-Host 'PASS: real COM task definition (not registered), exact action/principal/bounded runtime rejection.'
+}
+
+# 注册适配器必须禁止自动追加 ACE，并复读真实对象；不能用 XML 里的 D:P 当作已设置成功。
+& {
+    $realScheduler=Get-MiTaskScheduler;$state=@{Flags=0;SetFlags=0;Gets=0;DropProtection=$false}
+    $fixture=Join-Path $root ('test-artifacts\M2-TaskRegistration-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $paths=[pscustomobject]@{Install=$fixture;Executor=(Join-Path $fixture 'ElevatedExecutor.ps1');WatchdogPolicy=(Join-Path $fixture 'policy.json')}
+    function Get-MiSecurityPaths {return $paths}
+    $definition=Get-MiWatchdogDefinition $realScheduler
+    $task=[pscustomobject]@{Definition=$definition;Enabled=$true;State=3;Sddl='';Xml='actual registered XML fixture'}
+    $task|Add-Member ScriptMethod GetSecurityDescriptor {param($flags) return $this.Sddl}
+    $task|Add-Member ScriptMethod SetSecurityDescriptor {param($sddl,$flags)
+        $state.SetFlags=$flags;$this.Sddl=$sddl
+        if ($state.DropProtection) {$this.Sddl=$sddl.Replace('D:P','D:')}
+    }
+    $folder=[pscustomobject]@{}
+    $folder|Add-Member ScriptMethod RegisterTaskDefinition {param($name,$definition,$flags,$sid,$password,$logon,$sddl)
+        if ($name -cne 'MemoryInspector.TraceWatchdog' -or $sid -cne 'S-1-5-18' -or $logon -ne 5) {throw 'Unexpected registration scope.'}
+        $state.Flags=$flags;$task.Sddl='O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;SY)';return $task
+    }
+    $folder|Add-Member ScriptMethod GetTask {param($name) $state.Gets++;return $task}
+    $scheduler=[pscustomobject]@{};$scheduler|Add-Member ScriptMethod GetFolder {param($path) return $folder}
+    function Get-MiTaskScheduler {return $scheduler}
+    function Get-MiWatchdogDefinition {param($Scheduler) return $definition}
+    function Assert-MiTraceLockHeld {param($Lock)}
+    function Set-MiProtectedFileAcl {param($Path)}
+    function Assert-MiTracePath {param($Path) if (-not [IO.File]::Exists($Path)) {throw 'Missing registration fixture.'}}
+    $journal=[pscustomobject]@{InstallationId=[guid]::NewGuid().ToString('N');Sessions=@{};HeapTransactions=@{};Artifacts=@{}}
+    Register-MiWatchdog $null $journal
+    if ($state.Flags -ne 18 -or $state.SetFlags -ne 16 -or $state.Gets -ne 1 -or -not [IO.File]::Exists($paths.WatchdogPolicy)) {throw 'Registration failed exact ACL API/requery contract.'}
+    Register-MiWatchdog $null $journal $true
+    if ($state.Flags -ne 20) {throw 'Update omitted TASK_DONT_ADD_PRINCIPAL_ACE.'}
+    $state.DropProtection=$true;$paths.WatchdogPolicy=Join-Path $fixture 'must-not-exist.json';$denied=$false
+    try {Register-MiWatchdog $null $journal} catch {$denied=$true}
+    if (-not $denied -or [IO.File]::Exists($paths.WatchdogPolicy)) {throw 'Unsupported actual task ACL was trusted or policy created.'}
+    Write-Host 'PASS: registration/create-update flags, exact ACL setter/requery and missing protection refusal (registration/ACL mocked; COM definition real).'
+}
+
+# 初装续跑只补齐确切写前事务，已存在或部分写入的策略不能覆盖；正式健康恢复另行核验。
+& {
+    $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'PrivilegeInstallTest.ps1'),[ref]$tokens,[ref]$errors)
+    $node=$ast.Find({param($item) $item -is [Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -ceq 'Complete-MiM2LiveInitialRegistration'},$true)
+    . ([scriptblock]::Create($node.Extent.Text))
+    $fixture=Join-Path $root ('test-artifacts\M2-InitialRegistration-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $paths=[pscustomobject]@{Data=$fixture;TraceRoot=(Join-Path $fixture 'trace');TraceWorkspace=(Join-Path $fixture 'trace\workspace');
+        TraceJournal=(Join-Path $fixture 'trace\journal.jsonl');TraceLock=(Join-Path $fixture 'trace.lock');WatchdogPolicy=(Join-Path $fixture 'policy.json')}
+    $context=@{Recoveries=0;TaskDenied=$false}
+    function Get-MiSecurityPaths {return $paths}
+    function Assert-MiTrustedInstallation {return $paths}
+    function Set-MiProtectedFileAcl {param($Path)}
+    function Set-MiAdminDirectoryAcl {param($Path)}
+    function Assert-MiTracePath {param($Path)
+        if (-not (Test-Path -LiteralPath $Path) -or -not [IO.Path]::GetFullPath($Path).StartsWith($fixture,[StringComparison]::OrdinalIgnoreCase)) {throw 'Initial registration path invalid.'}
+    }
+    function Enter-MiDeploymentLease {param([switch]$Exclusive) return [IO.File]::Open((Join-Path $fixture 'deployment.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
+    function Enter-MiTraceLock {return [IO.File]::Open($paths.TraceLock,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}
+    $task=[pscustomobject]@{Xml='strict task identity fixture'}
+    $folder=[pscustomobject]@{};$folder|Add-Member ScriptMethod GetTask {param($Name) return $task}
+    $scheduler=[pscustomobject]@{};$scheduler|Add-Member ScriptMethod GetFolder {param($Path) return $folder}
+    function Get-MiTaskScheduler {return $scheduler}
+    function Assert-MiWatchdogDefinition {param($Task) if ($context.TaskDenied) {throw 'Invalid actual task fixture.'}}
+    function Assert-MiWatchdog {
+        $policy=[IO.File]::ReadAllText($paths.WatchdogPolicy)|ConvertFrom-Json
+        if ($policy.DefinitionHash -cne (Get-MiTraceHash $task.Xml)) {throw 'Policy identity lost.'}
+    }
+    function Invoke-MiTraceDeploymentRecovery {$context.Recoveries++}
+    $lock=Enter-MiTraceLock
+    try {
+        $j=Initialize-MiTraceJournal $lock
+        $j=Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='Pending';Intent='PrepareInstallation'})
+        $j=Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='Pending';Intent='RegisterWatchdog'})
+    } finally {$lock.Dispose()}
+    $denied=$false;try {Complete-MiM2LiveInitialRegistration} catch {$denied=$true}
+    if (-not $denied -or [IO.File]::Exists($paths.WatchdogPolicy)) {throw 'Incomplete initial provenance accepted.'}
+    $lock=Enter-MiTraceLock
+    try {$j=Add-MiTraceJournalRecord $lock $j.Revision 'Deployment' ([ordered]@{SchemaVersion=1;State='RecoveryRequired';Intent='ManualRecovery';Error='Untrusted Watchdog task ACL.'})} finally {$lock.Dispose()}
+    $context.TaskDenied=$true;$denied=$false;try {Complete-MiM2LiveInitialRegistration} catch {$denied=$true}
+    if (-not $denied -or [IO.File]::Exists($paths.WatchdogPolicy)) {throw 'Untrusted actual task received a policy.'}
+    $context.TaskDenied=$false;Complete-MiM2LiveInitialRegistration
+    $original=[IO.File]::ReadAllText($paths.WatchdogPolicy);$denied=$false
+    try {Complete-MiM2LiveInitialRegistration} catch {$denied=$true}
+    $lock=Enter-MiTraceLock
+    try {$j=Read-MiTraceJournal $lock} finally {$lock.Dispose()}
+    if (-not $denied -or [IO.File]::ReadAllText($paths.WatchdogPolicy) -cne $original -or $context.Recoveries -ne 1 -or
+        $j.Deployment -cne 'RecoveryRequired' -or $j.Revision -ne 5) {throw 'Initial completion overwrote policy, repeated or bypassed actual health requirement.'}
+    Write-Host 'PASS: exact initial-registration provenance, task refusal, CreateNew policy binding and no readiness without actual health (ACL/task/health mocked).'
+}
+
+# 已知 XML 序列化差异只允许从受保护备份恢复既有指纹；绝不采纳新 hash。
+& {
+    $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'PrivilegeInstallTest.ps1'),[ref]$tokens,[ref]$errors)
+    $node=$ast.Find({param($item) $item -is [Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -ceq 'Read-MiM2LiveAccessRoster'},$true)
+    . ([scriptblock]::Create($node.Extent.Text))
+    $fixture=Join-Path $root ('test-artifacts\M2-AccessRoster-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $root=$fixture;$folder=Join-Path $root 'test-artifacts\v3-m2-win11';[void][IO.Directory]::CreateDirectory($folder)
+    $paths=[pscustomobject]@{Data=(Join-Path $root 'protected')};[void][IO.Directory]::CreateDirectory($paths.Data)
+    $attempt=[guid]::NewGuid().ToString('N');$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $summary=[ordered]@{AttemptId=$attempt;Status='ChecksPassedWithPendingAcceptance'}
+    $snapshot=[ordered]@{SchemaVersion=1;AttemptId=$attempt;RunId=[guid]::NewGuid().ToString('N');OwnerSid=$sid;BootSessionId='123';Utc=[datetime]::UtcNow.ToString('o');Paths=@('fixed fixture')}
+    $context=@{Trusted=$true}
+    function Get-MiBootSessionId {return '123'}
+    function Assert-MiTracePath {param($Path)
+        if (-not $context.Trusted -or -not $Path.StartsWith($paths.Data+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) {throw 'Untrusted access snapshot.'}
+    }
+    function Write-AccessRosterFixture {
+        [IO.File]::WriteAllText((Join-Path $folder 'live-summary.json'),($summary|ConvertTo-Json -Compress))
+        [IO.File]::WriteAllText((Join-Path $paths.Data ('m2-win11-access-'+$attempt+'.json')),($snapshot|ConvertTo-Json -Compress))
+    }
+    Write-AccessRosterFixture;$accepted=Read-MiM2LiveAccessRoster $paths
+    if ($accepted.AttemptId -cne $attempt) {throw 'Protected existence snapshot lost binding.'}
+    foreach ($failure in @('Acl','Schema','Attempt','Owner','Boot','Stale','Future','FailedSummary','PathSelection')) {
+        $snapshot.SchemaVersion=1;$snapshot.AttemptId=$attempt;$snapshot.OwnerSid=$sid;$snapshot.BootSessionId='123';$snapshot.Utc=[datetime]::UtcNow.ToString('o')
+        $summary.AttemptId=$attempt;$summary.Status='ChecksPassedWithPendingAcceptance';$context.Trusted=$true
+        switch ($failure) {
+            'Acl' {$context.Trusted=$false}
+            'Schema' {$snapshot.SchemaVersion=2}
+            'Attempt' {$snapshot.AttemptId=[guid]::NewGuid().ToString('N')}
+            'Owner' {$snapshot.OwnerSid='S-1-5-21-1-2-3-999'}
+            'Boot' {$snapshot.BootSessionId='456'}
+            'Stale' {$snapshot.Utc=[datetime]::UtcNow.AddMinutes(-16).ToString('o')}
+            'Future' {$snapshot.Utc=[datetime]::UtcNow.AddMinutes(1).ToString('o')}
+            'FailedSummary' {$summary.Status='Failed'}
+            'PathSelection' {$summary.AttemptId='../outside'}
+        }
+        Write-AccessRosterFixture;$denied=$false;try {Read-MiM2LiveAccessRoster $paths|Out-Null} catch {$denied=$true}
+        if (-not $denied) {throw ('Invalid administrator snapshot accepted: '+$failure)}
+    }
+    Write-Host 'PASS: protected access snapshot binding rejects ACL/schema/identity/boot/time/failed-summary/path selection faults (ACL mocked).'
+}
+
+# 已知 XML 序列化差异只允许从受保护备份恢复既有指纹；绝不采纳新 hash。
+& {
+    $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'PrivilegeInstallTest.ps1'),[ref]$tokens,[ref]$errors)
+    $node=$ast.Find({param($item) $item -is [Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -ceq 'Restore-MiM2LiveTaskDefinition'},$true)
+    . ([scriptblock]::Create($node.Extent.Text))
+    $fixture=Join-Path $root ('test-artifacts\M2-DefinitionRestore-'+[guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($fixture)
+    $paths=[pscustomobject]@{Results=$fixture;WatchdogPolicy=(Join-Path $fixture 'policy.json')}
+    $run=[guid]::NewGuid().ToString('N');$attempt=[guid]::NewGuid().ToString('N');$installId=[guid]::NewGuid().ToString('N')
+    $sddl='O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)';$actualSddl=$sddl.Replace('D:P','D:PAI')
+    $original='<Task><SecurityDescriptor>'+$sddl+'</SecurityDescriptor><safe /></Task>'
+    $task=[pscustomobject]@{Xml=$original.Replace($sddl,$actualSddl);Sddl=$actualSddl}
+    $state=@{Registers=0;RegisterFlags=0;SetFlags=0};$journal=[pscustomobject]@{InstallationId=$installId;Hash=('A'*64);Sessions=@{};HeapTransactions=@{};Artifacts=@{}}
+    $task|Add-Member ScriptMethod GetSecurityDescriptor {param($Flags) return $this.Sddl}
+    $task|Add-Member ScriptMethod SetSecurityDescriptor {param($Sd,$Flags) $state.SetFlags=$Flags;$this.Sddl=$Sd}
+    $folder=[pscustomobject]@{};$folder|Add-Member ScriptMethod GetTask {param($Name) return $task}
+    $folder|Add-Member ScriptMethod RegisterTask {param($Name,$Xml,$Flags,$Sid,$Password,$Logon,$Sd)
+        if ($Name -cne 'MemoryInspector.TraceWatchdog' -or $Sd -cne $sddl -or $Sid -cne 'S-1-5-18' -or $Logon -ne 5) {throw 'Unexpected task restore scope.'}
+        $state.Registers++;$state.RegisterFlags=$Flags;$task.Xml=$Xml;return $task
+    }
+    $scheduler=[pscustomobject]@{};$scheduler|Add-Member ScriptMethod GetFolder {param($Path) return $folder}
+    function Get-MiTaskScheduler {return $scheduler}
+    function Assert-MiTrustedInstallation {return $paths}
+    function Enter-MiDeploymentLease {param([switch]$Exclusive) return [IO.MemoryStream]::new()}
+    function Enter-MiTraceLock {return [IO.MemoryStream]::new()}
+    function Read-MiTraceJournal {param($Lock) return $journal}
+    function Assert-MiWatchdogDefinition {param($Task)}
+    function Assert-MiWatchdog {if ((Get-MiTraceHash $task.Xml) -cne (Get-MiTraceHash $original)) {throw 'Restore changed accepted fingerprint.'}}
+    function Set-MiProtectedFileAcl {param($Path)}
+    function Assert-MiTracePath {param($Path) if (-not (Test-Path -LiteralPath $Path) -or -not $Path.StartsWith($fixture,[StringComparison]::OrdinalIgnoreCase)) {throw 'Unknown restore fixture.'}}
+    $prior=[ordered]@{SchemaVersion=1;RunId=$run;AttemptId=$attempt;Mode='Windows11LiveM2';Status='Failed';
+        Checks=@([ordered]@{State='Failed';Name='TaskDefinitionTamperRefusedAndRestored';Error='Watchdog definition fingerprint mismatch.'})}
+    [IO.File]::WriteAllText((Join-Path $fixture ('m2-win11-'+$attempt+'.json')),($prior|ConvertTo-Json -Depth 4))
+    $case=Join-Path (Join-Path (Join-Path $fixture 'm2-win11-fault-evidence') $attempt) 'TaskXml';[void][IO.Directory]::CreateDirectory($case)
+    $backup=Join-Path $case 'original.bin';[IO.File]::WriteAllText($backup,$original,[Text.UTF8Encoding]::new($false))
+    $intent=[ordered]@{SchemaVersion=1;RunId=$run;AttemptId=$attempt;Kind='TaskXml';State='CapturedBeforeMutation';OriginalSha256=(Get-FileHash $backup -Algorithm SHA256).Hash}
+    [IO.File]::WriteAllText((Join-Path $case 'stages.jsonl'),($intent|ConvertTo-Json -Compress)+"`n")
+    $policy=[ordered]@{SchemaVersion=1;InstallationId=$installId;DefinitionHash=(Get-MiTraceHash $original)}
+    $policyText=$policy|ConvertTo-Json -Compress;[IO.File]::WriteAllText($paths.WatchdogPolicy,$policyText)
+    foreach ($identities in @(@([guid]::NewGuid().ToString('N'),$attempt),@($run,[guid]::NewGuid().ToString('N')))) {
+        $denied=$false;try {Restore-MiM2LiveTaskDefinition $identities[0] $identities[1]} catch {$denied=$true}
+        if (-not $denied -or $state.Registers -ne 0) {throw 'Definition repair accepted wrong owner run or absent attempt evidence.'}
+    }
+    [IO.File]::WriteAllText($backup,$original+'changed',[Text.UTF8Encoding]::new($false));$denied=$false
+    try {Restore-MiM2LiveTaskDefinition $run $attempt} catch {$denied=$true}
+    if (-not $denied -or $state.Registers -ne 0) {throw 'Definition repair accepted backup SHA mismatch.'}
+    [IO.File]::WriteAllText($backup,$original,[Text.UTF8Encoding]::new($false))
+    $policy.DefinitionHash=('B'*64);[IO.File]::WriteAllText($paths.WatchdogPolicy,($policy|ConvertTo-Json -Compress));$denied=$false
+    try {Restore-MiM2LiveTaskDefinition $run $attempt} catch {$denied=$true}
+    if (-not $denied -or $state.Registers -ne 0) {throw 'Definition repair accepted original XML outside existing policy.'}
+    [IO.File]::WriteAllText($paths.WatchdogPolicy,$policyText)
+    $task.Xml+='unexpected';$denied=$false;try {Restore-MiM2LiveTaskDefinition $run $attempt} catch {$denied=$true}
+    if (-not $denied -or $state.Registers -ne 0) {throw 'Definition repair overwrote extra task changes.'}
+    $task.Xml=$original.Replace($sddl,$actualSddl)
+    Restore-MiM2LiveTaskDefinition $run $attempt
+    $evidence=@(Get-ChildItem -LiteralPath $fixture -Filter 'm2-definition-restore-*.jsonl')
+    $stages=@([IO.File]::ReadAllLines($evidence[0].FullName)|ForEach-Object {($_|ConvertFrom-Json).State})
+    if ($state.Registers -ne 1 -or $state.RegisterFlags -ne 20 -or $state.SetFlags -ne 16 -or
+        [IO.File]::ReadAllText($paths.WatchdogPolicy) -cne $policyText -or ($stages -join ',') -cne 'RestoreIntent,Restored') {throw 'Definition restore lost exact XML/ACL/policy or intent ordering.'}
+    Write-Host 'PASS: definition restore rejects unrelated changes and restores only protected original fingerprint with separate registration/actual ACL (task/ACL mocked).'
 }
 
 

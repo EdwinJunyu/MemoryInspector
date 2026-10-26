@@ -510,7 +510,7 @@ function Get-MiWatchdogDefinition {
 function Get-MiTaskScheduler {
     $scheduler=New-Object -ComObject 'Schedule.Service'; $scheduler.Connect(); return $scheduler
 }
-function Assert-MiWatchdogDefinition {
+function Assert-MiWatchdogConfiguration {
     param($Task)
     $p=Get-MiSecurityPaths; $d=$Task.Definition
     $exe=Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -530,6 +530,11 @@ function Assert-MiWatchdogDefinition {
         $d.Settings.MultipleInstances -ne 2 -or $d.Settings.ExecutionTimeLimit -cne 'PT45S' -or
         -not $d.Settings.AllowDemandStart -or -not $d.Settings.StartWhenAvailable -or
         $d.Settings.DisallowStartIfOnBatteries -or $d.Settings.StopIfGoingOnBatteries) { throw 'Watchdog task definition changed or not runnable.' }
+    if (-not (Test-MiNoReparse $exe) -or -not [IO.File]::Exists($exe)) { throw 'Fixed Windows PowerShell missing.' }
+}
+function Assert-MiWatchdogDefinition {
+    param($Task)
+    Assert-MiWatchdogConfiguration $Task
     $sd=[Security.AccessControl.RawSecurityDescriptor]::new($Task.GetSecurityDescriptor(7))
     if ($sd.Owner.Value -cnotin @('S-1-5-18','S-1-5-32-544') -or $null -eq $sd.DiscretionaryAcl -or
         ($sd.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0) { throw 'Untrusted Watchdog task ACL.' }
@@ -541,7 +546,6 @@ function Assert-MiWatchdogDefinition {
         $allowed[$ace.SecurityIdentifier.Value]=$true
     }
     if ($allowed.Count -ne 2) { throw 'Watchdog administrator/SYSTEM access missing.' }
-    if (-not (Test-MiNoReparse $exe) -or -not [IO.File]::Exists($exe)) { throw 'Fixed Windows PowerShell missing.' }
 }
 function Assert-MiWatchdog {
     $p=Assert-MiTrustedInstallation
@@ -560,9 +564,14 @@ function Register-MiWatchdog {
     Assert-MiTraceLockHeld $Lock; Assert-MiTraceQuiescent $Journal
     $p=Get-MiSecurityPaths; $scheduler=Get-MiTaskScheduler; $folder=$scheduler.GetFolder('\')
     # 仅 CREATE 或已核验的 UPDATE；不得覆盖恰好同名的未知任务。
+    # TASK_DONT_ADD_PRINCIPAL_ACE，禁止调度器向精确白名单额外添加主体 ACE。
     $flags=if ($Replace) {4} else {2}
+    $flags=$flags -bor 16
     $task=$folder.RegisterTaskDefinition('MemoryInspector.TraceWatchdog',(Get-MiWatchdogDefinition $scheduler),
         $flags,'S-1-5-18',$null,5,'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
+    $task.SetSecurityDescriptor('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)',16)
+    # 注册 XML 的描述符不等于实际对象权限；重新获取并严格核验实际 ACL。
+    $task=$folder.GetTask('MemoryInspector.TraceWatchdog')
     Assert-MiWatchdogDefinition $task
     $policy=[ordered]@{SchemaVersion=1;InstallationId=$Journal.InstallationId;DefinitionHash=(Get-MiTraceHash $task.Xml)}
     if ([IO.File]::Exists($p.WatchdogPolicy)) {
@@ -633,9 +642,8 @@ function Invoke-MiTraceHealthCheck {
             DefinitionHash=$watchdog.Policy.DefinitionHash;RequestedUtc=[datetime]::UtcNow.ToString('o');ExpiresUtc=[datetime]::UtcNow.AddSeconds(40).ToString('o')}
         $j=Add-MiTraceJournalRecord $lock $j.Revision 'HealthChallenge' $challenge
     } finally { $lock.Dispose() }
-    [void]$watchdog.Task.Run($null)
     # 不持锁等待另一个进程；使用单调计时，系统时钟变化不能延长等待。
-    $timer=[Diagnostics.Stopwatch]::StartNew()
+    $timer=[Diagnostics.Stopwatch]::StartNew();$dispatched=$false
     while ($timer.Elapsed.TotalSeconds -lt 40) {
         Start-Sleep -Milliseconds 250
         $lock=$null
@@ -653,6 +661,13 @@ function Invoke-MiTraceHealthCheck {
                 return $current
             }
         } finally { $lock.Dispose() }
+        if (-not $dispatched) {
+            # IgnoreNew：上一轮已响应但进程仍在退出时，Run 会被忽略。
+            # 先发布挑战，观察已有扫描的响应；没有响应且实际任务回到 Ready 才派发一次。
+            # 这样下一轮扫描必然在挑战 Flush 后启动，不重试未知任务，也不延长原 40 秒期限。
+            $ready=Assert-MiWatchdog
+            if ($ready.Task.State -eq 3) {[void]$ready.Task.Run($null);$dispatched=$true}
+        }
     }
     throw 'Watchdog health response timed out; advanced tracing disabled.'
 }

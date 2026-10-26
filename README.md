@@ -41,11 +41,13 @@ $executor = Join-Path $env:ProgramW6432 'MemoryInspector\ElevatedExecutor.ps1'
 
 默认输出诊断报告；输入 `VERIFY DEPLOYMENT` 只重新核验已有完整安装和新的 SYSTEM 响应，成功后解除对应部署阻断。它不能删除日志、清除未知会话、重建被篡改任务或跳过配置恢复。初次迁移在任务注册前失败且已核验回滚时，可重跑安装器，保留并复用原 Journal。日志损坏或实际 WPR 归属不可证明时只提供人工指引，继续阻断。完整 GUI Recovery Wizard 整合属于 M7。
 
-本轮只执行普通权限回归、真实文件故障夹具及内存 COM 定义检查，**未在本机安装 SYSTEM 任务**。真实安装/健康响应/禁用任务拒绝/卸载重装已加入原 PrivilegeInstallTest，仍需隔离环境执行；Windows 10/11 启动、调度延迟和权限实测未完成，因此不能据此开放高级追踪或宣布 Preview B / Stable v3。
+最初实现轮次只执行普通权限回归、真实文件故障夹具及内存 COM 定义检查，未安装 SYSTEM 任务。后续 Windows 11 实机验收在原 `PrivilegeInstallTest.ps1` 增加独立 `-LiveM2` 模式，保留本次安装，先核验独占验收锁/资源归属，再检查实际 SYSTEM 健康响应、任务和文件篡改拒绝、周期扫描与受保护恢复；原默认模式仍只用于 disposable CI，不能用于个人机器。故障注入前保留受保护原值和写前意图，中断后不自动覆盖不可信状态。
+
+本轮 Windows 11 实机的 **12 项管理员检查全部通过**：受保护安装、固定 SYSTEM 任务、实际健康响应、禁用/篡改拒绝与恢复、重放拒绝、跨进程持久恢复及周期回收。实机发现并修复了注册后任务 ACL 不符合要求和 IgnoreNew 连续健康检查竞态；XML 故障恢复区分注册描述符与实际 ACL，始终保留原策略指纹。普通探针观察到 21 项文件写入/改 ACL/删除拒绝、Journal 读取与任务查询拒绝，但部分对象当前存在性仍不能由普通令牌确认，完整权限验收保留 Pending。用户本轮明确不重启，开机触发、完整崩溃/跨用户矩阵及 Windows 10 继续待验收；M2Accepted 和所有未验收发布门仍关闭。执行边界和证据见 [M2 Windows 11 项目备注](docs/M8-ACCEPTANCE.md)。
 
 ## V3-M3 — WPR Core（代码完成，录制发布门关闭）
 
-按冻结规格在原 PrivilegeSecurity / ElevatedExecutor 内接入固定 VirtualAlloc、Pool Profile、默认 Memory / 可选 File Mode、独立停止/保存、受保护 ETL 目录与恢复事务。**本机 M2 前置条件未通过：没有受保护安装、Journal 或 Watchdog 策略，当前令牌不是管理员。** M2 的真实 SYSTEM、任务 DACL、启动触发与 Windows 10/11 验收也未完成。因此 `Get-MiWprReleaseStatus` 的 M2/Memory/File 验收标志及总开关固定为 false，不提供配置绕过；实际追踪尚不能使用，不能发布 Preview B。
+按冻结规格在原 PrivilegeSecurity / ElevatedExecutor 内接入固定 VirtualAlloc、Pool Profile、默认 Memory / 可选 File Mode、独立停止/保存、受保护 ETL 目录与恢复事务。M3 实现轮次本机尚无受保护安装、Journal 或 Watchdog 策略；后续 M2 实机进度见上节。**M2 完整安全验收仍未通过**，启动触发与 Windows 10/11 验收未完成。因此 `Get-MiWprReleaseStatus` 的 M2/Memory/File 验收标志及总开关固定为 false，不提供配置绕过；实际追踪尚不能使用，不能发布 Preview B。
 
 - `TraceStart` 只接受 VirtualAlloc/Pool、Memory/File、300–1800 秒；默认 300 秒，独立显示并确认本次请求。只有发布门、完整安装、实际 SYSTEM 健康响应、公共 ETW 状态、路径与三层预算全部通过才有启动资格。GUI 高级追踪接入留待 M7。
 - 归属绑定启动会话、授权、固定 Profile/程序身份、启动意图和 ETW GUID/handle/logger thread 创建时间等证据。停止只能作用于已绑定实例；不存在全局 cancel、force、任意路径/命令或进程 Kill。仅名称匹配、结果未知、线程/程序身份变化均不派发停止。QueryAllTraces 不声称能枚举所有私有会话，实际共存能力须实机验收。
