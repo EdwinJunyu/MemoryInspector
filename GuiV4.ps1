@@ -474,6 +474,125 @@ function New-MiV4DataGrid {
     }
     return $grid
 }
+function Initialize-MiAttributionView {
+    param($Page)
+    # 沿用现有控件与配色；此页只消费后台计算结果，没有进程/服务操作按钮。
+    $layout=[Windows.Forms.TableLayoutPanel]::new()
+    $layout.Dock='Fill';$layout.ColumnCount=1;$layout.RowCount=4
+    foreach ($height in @(42,66)) { [void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute',[single]$height)) }
+    [void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent',[single]60))
+    [void]$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent',[single]40))
+    $Page.Controls.Add($layout)
+    $bar=[Windows.Forms.FlowLayoutPanel]::new();$bar.Dock='Fill'
+    $caption=New-MiLabel '只读归因视角' 9;$caption.AutoSize=$true;$bar.Controls.Add($caption)
+    $script:AttributionMode=[Windows.Forms.ComboBox]::new()
+    $script:AttributionMode.DropDownStyle='DropDownList';$script:AttributionMode.Width=280
+    $script:AttributionMode.AccessibleName='归因统计口径'
+    [void]$script:AttributionMode.Items.AddRange([object[]]@('系统 Commit / Pool','进程实例 / 自选逻辑组','可执行路径分组','当前父子关系分组'))
+    $script:AttributionMode.SelectedIndex=0;$bar.Controls.Add($script:AttributionMode);$layout.Controls.Add($bar,0,0)
+    $script:AttributionNote=New-MiLabel '等待后台归因；普通监控继续运行。' 9
+    $script:AttributionNote.Dock='Fill';$script:AttributionNote.AutoEllipsis=$true
+    $layout.Controls.Add($script:AttributionNote,0,1)
+    $script:AttributionGrid=New-MiV4DataGrid -Defs @(
+        @('Metric','来源 / 统计口径',30),@('Observed','观测 GiB',12),@('Growth','实测增长 GiB',12),
+        @('Quality','测量完整性',13),@('Confidence','归因可信度',16),@('Trend','趋势 / 成员',17))
+    $script:AttributionGrid.AccessibleName='只读归因结果'
+    $script:AttributionGrid.MultiSelect=$true
+    foreach ($column in $script:AttributionGrid.Columns) {$column.MinimumWidth=100}
+    $layout.Controls.Add($script:AttributionGrid,0,2)
+    $script:AttributionDetails=[Windows.Forms.TextBox]::new()
+    $script:AttributionDetails.Multiline=$true;$script:AttributionDetails.ReadOnly=$true
+    $script:AttributionDetails.Dock='Fill';$script:AttributionDetails.ScrollBars='Both'
+    $script:AttributionDetails.AccessibleName='归因证据、时间范围与局限'
+    $layout.Controls.Add($script:AttributionDetails,0,3)
+    $script:AttributionRendering=$false
+    $script:AttributionMode.Add_SelectedIndexChanged({Update-MiAttributionView})
+    $script:AttributionGrid.Add_SelectionChanged({Show-MiAttributionDetails})
+}
+
+function Show-MiAttributionDetails {
+    if ($script:AttributionRendering -or -not $script:AttributionDetails) {return}
+    $selected=@($script:AttributionGrid.SelectedRows | ForEach-Object {$_.Tag} | Where-Object {$null -ne $_})
+    if ($selected.Count -eq 0) {$script:AttributionDetails.Text='选择一行查看来源、实际时间范围和局限。';return}
+    $prefix=''
+    if ($script:AttributionMode.SelectedIndex -eq 1 -and $selected.Count -gt 1) {
+        # Ctrl/Shift 仅创建本次所选实例的逻辑诊断组；无批量操作、无 PID 授权传递。
+        $sum=[decimal]0;$valid=0
+        foreach ($finding in $selected) {if ($null -ne $finding.ObservedBytes) {$sum+=[decimal]$finding.ObservedBytes;$valid++}}
+        $value='Unavailable';if ($valid -gt 0) {$value=('{0:N3} GiB' -f ($sum/1GB))}
+        $prefix=('用户逻辑组：{0} 个精确实例，{1} 个有效值，Private Bytes 合计 {2}。仅本次快照；不含共享内存，不代表 RAM 或可释放量。{3}{3}' -f
+            $selected.Count,$valid,$value,[Environment]::NewLine)
+    }
+    # 展示证据而非内部 JSON 日期编码；只排版后台结果，不在 GUI 重跑趋势分析。
+    $lines=New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $selected) {
+        if ($item.GroupingKind) {
+            $lines.Add($item.Label);$lines.Add($item.Scope);$lines.Add($item.Limitations)
+            $lines.Add('实例：'+($item.ProcessInstanceIds -join ', '))
+        } else {
+            $lines.Add(('指标：{0}；来源：{1}；测量完整性：{2}；归因可信度：{3}' -f
+                $item.MetricName,$item.SourceType,$item.MeasurementQuality,$item.AttributionConfidence))
+            $range=$item.TimeRangeUtc
+            $start='不可用';$end='不可用'
+            if ($null -ne $range.StartUtc) {$start=([datetime]$range.StartUtc).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')}
+            if ($null -ne $range.EndUtc) {$end=([datetime]$range.EndUtc).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')}
+            $q=$item.SamplingQuality
+            $lines.Add(('实际观察 UTC：{0} 至 {1}；跨度 {2:N1} 秒。' -f $start,$end,$q.ActualSpanSeconds))
+            $lines.Add(('采样：目标周期 {0} 秒，有效 {1}/{2}，缺失 {3}，最大缺口 {4:N1} 秒。' -f
+                $item.TargetIntervalSeconds,$q.ValidSampleCount,$q.ExpectedSampleCount,$q.MissingSampleCount,$q.MaximumGapSeconds))
+            $lines.Add('局限：'+($item.Limitations -join ' '));$lines.Add('建议：'+$item.SuggestedNextStep)
+            if ($item.ProcessInstanceId) {$lines.Add('实例：'+$item.ProcessInstanceId)}
+        }
+        $lines.Add('')
+    }
+    $script:AttributionDetails.Text=$prefix+($lines -join [Environment]::NewLine)
+}
+
+function Update-MiAttributionView {
+    if (-not $script:AttributionGrid) {return}
+    $a=$script:CurrentDiagnosis.Attribution
+    $script:AttributionRendering=$true
+    try {
+        $saved=@{}
+        foreach ($row in $script:AttributionGrid.SelectedRows) {
+            if ($row.Tag) {
+                $key=[string]$row.Tag.ProcessInstanceId+[string]$row.Tag.GroupId+[string]$row.Tag.MetricName
+                $saved[$key]=$true
+            }
+        }
+        if (-not $a -or $a.Status -ne 'Success') {
+            $script:AttributionGrid.Rows.Clear();$script:AttributionNote.Text='归因不可用 / 等待有效采样；没有将缺失值显示为零。'
+            $script:AttributionDetails.Text='没有可用的归因结果。';return
+        }
+        $ram=$a.Ram
+        $script:AttributionNote.Text=('UTC {0} · Commit 与 RAM 独立 · 未关联实例 {1} 个。{2}RAM：总量 {3} / 可用 {4} / Cache {5} / Standby {6} / Compression {7} GiB；不可相加。' -f
+            $a.CapturedUtc.ToString('HH:mm:ss'),$a.UnassociatedProcessCount,[Environment]::NewLine,
+            (Format-MiGiB $ram.TotalPhysicalBytes),(Format-MiGiB $ram.AvailablePhysicalBytes),
+            (Format-MiGiB $ram.CacheBytes),(Format-MiGiB $ram.StandbyBytes),(Format-MiGiB $ram.CompressionBytes))
+        $rows=@()
+        switch ($script:AttributionMode.SelectedIndex) {
+            0 {$rows=@($a.Findings)}
+            1 {$rows=@($a.ProcessFindings | Sort-Object ObservedBytes -Descending)}
+            2 {$rows=@($a.ProcessGroups | Sort-Object ObservedPrivateBytes -Descending)}
+            3 {$rows=@($a.ParentGroups | Sort-Object ObservedPrivateBytes -Descending)}
+        }
+        while ($script:AttributionGrid.Rows.Count -gt $rows.Count) {$script:AttributionGrid.Rows.RemoveAt($script:AttributionGrid.Rows.Count-1)}
+        while ($script:AttributionGrid.Rows.Count -lt $rows.Count) {[void]$script:AttributionGrid.Rows.Add()}
+        $script:AttributionGrid.ClearSelection()
+        for ($i=0;$i -lt $rows.Count;$i++) {
+            $item=$rows[$i];$label=$item.MetricName;$observed=$item.ObservedBytes;$growth=$item.GrowthBytes;$trend=$item.Trend
+            if ($item.Label) {$label=$item.Label}
+            if ($item.GroupingKind) {$observed=$item.ObservedPrivateBytes;$growth=$null;$trend=('{0}/{1} 个有效成员' -f $item.ValidMemberCount,$item.MemberCount)}
+            $values=@($label,(Format-MiGiB $observed),(Format-MiGiB $growth),$item.MeasurementQuality,$item.AttributionConfidence,$trend)
+            $row=$script:AttributionGrid.Rows[$i];$row.Tag=$item
+            for ($j=0;$j -lt $values.Count;$j++) {if ($row.Cells[$j].Value -cne $values[$j]) {$row.Cells[$j].Value=$values[$j]}}
+            $key=[string]$item.ProcessInstanceId+[string]$item.GroupId+[string]$item.MetricName
+            if ($saved.ContainsKey($key)) {$row.Selected=$true}
+        }
+    } finally {$script:AttributionRendering=$false}
+    Show-MiAttributionDetails
+}
+
 function Initialize-MiV4Gui {
     param($Root,$Cards,$Charts,$Bottom,$StatusBar)
     $script:AllProcesses=@()
@@ -512,7 +631,7 @@ function Initialize-MiV4Gui {
     $script:Tabs=New-Object System.Windows.Forms.TabControl
     $script:Tabs.Dock='Fill'
     $script:Tabs.Font=[Drawing.Font]::new('Microsoft YaHei UI',[single]10)
-    foreach ($title in @('Processes · 进程','Overview · 总览','Services · 服务','History · 历史','Settings · 设置')) {
+    foreach ($title in @('Processes · 进程','Overview · 总览','Services · 服务','History · 历史','Settings · 设置','Attribution · 归因')) {
         $page=New-Object System.Windows.Forms.TabPage
         $page.Text=$title;$page.BackColor=$script:Background
         [void]$script:Tabs.TabPages.Add($page)
@@ -520,6 +639,7 @@ function Initialize-MiV4Gui {
     $Root.Controls.Add($script:Tabs,0,1)
     $Root.Controls.Add($StatusBar,0,2)
     $Root.ResumeLayout()
+    Initialize-MiAttributionView -Page $script:Tabs.TabPages[5]
 
     # 监控和操作反馈分别占固定行；长结果保留文本，完整审计始终可通过按钮访问。
     $StatusBar.SuspendLayout()
@@ -740,6 +860,7 @@ function Initialize-MiV4Gui {
     })
 
     $script:Tabs.Add_SelectedIndexChanged({
+        if ($script:Tabs.SelectedIndex -eq 5) { Update-MiAttributionView }
         if ($script:Tabs.SelectedIndex -eq 2 -and $script:ServiceRows.Count -eq 0) { Start-MiV4ServicesLoad }
         if ($script:Tabs.SelectedIndex -eq 3 -and $script:AggregateHistory.Count -eq 0) { Start-MiV4HistoryLoad }
     })

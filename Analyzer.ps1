@@ -15,9 +15,11 @@ function Get-MiMedian {
 
 function Get-MiInstanceKey {
     param([string]$BootId,$Process)
-    if ($null -eq $Process -or $null -eq $Process.PID -or $null -eq $Process.StartUtcTicks -or
-        [long]$Process.StartUtcTicks -le 0 -or [string]::IsNullOrWhiteSpace([string]$Process.Name)) { return $null }
-    return ('{0}:{1}:{2}' -f $BootId,[int]$Process.PID,[long]$Process.StartUtcTicks)
+    $processId=0;$ticks=0L
+    if ($null -eq $Process -or -not [int]::TryParse([string]$Process.PID,[ref]$processId) -or $processId -le 0 -or
+        -not [long]::TryParse([string]$Process.StartUtcTicks,[ref]$ticks) -or $ticks -le 0 -or
+        [string]::IsNullOrWhiteSpace([string]$Process.Name)) { return $null }
+    return ('{0}:{1}:{2}' -f $BootId,$processId,$ticks)
 }
 
 function Get-MiAnalysisParameters {
@@ -40,6 +42,7 @@ function Initialize-MiAnalysisStorage {
     # 每个实例保留完整30分钟证据；紧凑值类型只消除 PSObject 开销，不降采样、不改归槽规则。
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 namespace MemoryInspector {
     public struct AnalysisPoint {
         public readonly DateTime Utc;
@@ -52,6 +55,73 @@ namespace MemoryInspector {
         public long StartUtcTicks;
         public string ProcessInstanceId;
         public long? PrivateBytes;
+    }
+    // 在紧凑标量列表上计算质量，避免每轮为每个进程复制数百个 PowerShell 对象。
+    public sealed class AttributionWindow {
+        public int ExpectedSampleCount, ValidSampleCount, RawSampleCount, MissingSampleCount;
+        public double CoverageRatio, ActualSpanSeconds, MaximumGapSeconds;
+        public double LatestAgeSeconds;
+        public int[] SegmentExpectedSampleCounts, SegmentValidSampleCounts;
+        public double[] SegmentMedians;
+        public DateTime? StartUtc, EndUtc;
+        public long? GrowthBytes;
+        public bool SufficientTrend;
+        public int UpwardSegments;
+        public static AttributionWindow Measure(IList<AnalysisPoint> points, DateTime now, int interval) {
+            return Measure(points, now, interval, 0);
+        }
+        // 旧诊断保留半周期边界容差和 double 中位数；新 Finding 使用严格观察窗口。
+        // 两者共享遍历，绝不以性能优化改变原 85%/分段/缺口阈值。
+        public static AttributionWindow Measure(IList<AnalysisPoint> points, DateTime now, int interval, double boundaryTolerance) {
+            var result = new AttributionWindow();
+            result.ExpectedSampleCount = 1800 / interval + 1;
+            var slots = new Dictionary<int,AnalysisPoint>();
+            if (points != null) foreach (var p in points) {
+                double age = (now-p.Utc).TotalSeconds;
+                if (age < 0 || age > 1800+boundaryTolerance) continue;
+                result.RawSampleCount++;
+                int slot = (int)Math.Round(age/interval, MidpointRounding.AwayFromZero);
+                if (slot >= result.ExpectedSampleCount) continue;
+                AnalysisPoint prior;
+                if (!slots.TryGetValue(slot, out prior) || p.Utc > prior.Utc) slots[slot]=p;
+            }
+            var evidence = new List<AnalysisPoint>(slots.Values);
+            evidence.Sort((a,b) => a.Utc.CompareTo(b.Utc));
+            result.ValidSampleCount=evidence.Count;
+            result.MissingSampleCount=result.ExpectedSampleCount-evidence.Count;
+            result.CoverageRatio=(double)evidence.Count/result.ExpectedSampleCount;
+            if (evidence.Count > 0) {
+                result.StartUtc=evidence[0].Utc; result.EndUtc=evidence[evidence.Count-1].Utc;
+                result.ActualSpanSeconds=(result.EndUtc.Value-result.StartUtc.Value).TotalSeconds;
+                result.LatestAgeSeconds=(now-result.EndUtc.Value).TotalSeconds;
+            }
+            if (evidence.Count >= 2) result.GrowthBytes=evidence[evidence.Count-1].Bytes-evidence[0].Bytes;
+            for (int i=1;i<evidence.Count;i++) result.MaximumGapSeconds=Math.Max(result.MaximumGapSeconds,
+                (evidence[i].Utc-evidence[i-1].Utc).TotalSeconds);
+            var bins=new List<long>[6]; var expected=new int[6];
+            for (int i=0;i<6;i++) bins[i]=new List<long>();
+            for (int slot=0;slot<result.ExpectedSampleCount;slot++) {
+                int bin=Math.Min(5,(1800-slot*interval)/300); expected[bin]++;
+                AnalysisPoint p; if (slots.TryGetValue(slot,out p)) bins[bin].Add(p.Bytes);
+            }
+            result.SegmentExpectedSampleCounts=expected;
+            result.SegmentValidSampleCounts=new int[6]; result.SegmentMedians=new double[6];
+            bool adequate=result.CoverageRatio>=0.85 && result.ActualSpanSeconds>=1800-interval &&
+                result.LatestAgeSeconds<=interval && result.MaximumGapSeconds<=Math.Max(60,3*interval);
+            decimal? previous=null;
+            for (int i=0;i<6;i++) {
+                result.SegmentValidSampleCounts[i]=bins[i].Count;
+                if (bins[i].Count<Math.Ceiling(expected[i]*0.85)) adequate=false;
+                if (bins[i].Count==0) { previous=null; continue; }
+                bins[i].Sort(); int mid=bins[i].Count/2;
+                result.SegmentMedians[i]=(bins[i].Count%2==1) ? (double)bins[i][mid] : ((double)bins[i][mid-1]+(double)bins[i][mid])/2;
+                decimal median=(bins[i].Count%2==1) ? bins[i][mid] : ((decimal)bins[i][mid-1]+bins[i][mid])/2;
+                if (previous.HasValue && median>previous.Value) result.UpwardSegments++;
+                previous=median;
+            }
+            result.SufficientTrend=adequate;
+            return result;
+        }
     }
 }
 '@ -ErrorAction Stop
@@ -68,6 +138,7 @@ function New-MiAnalyzer {
         Root = $Root
         Tracks = @{}
         PoolHistory = (New-Object 'System.Collections.Generic.List[object]')
+        AttributionHistory = @{}
         Historical = @{}
         HistoricalLoadedUtc = [datetime]::MinValue
         LastCaptureUtc = [datetime]::MinValue
@@ -93,6 +164,7 @@ function Set-MiAnalyzerInterval {
     $Analyzer.Parameters=Get-MiAnalysisParameters -IntervalSeconds $IntervalSeconds
     $Analyzer.Tracks.Clear()
     $Analyzer.PoolHistory.Clear()
+    $Analyzer.AttributionHistory.Clear()
     $Analyzer.LastCaptureUtc=[datetime]::MinValue
     $Analyzer.LastSequence=$null
     $Analyzer.LastMonotonicSeconds=$null
@@ -135,8 +207,8 @@ function Add-MiTrackSample {
         if ($null -eq $p -or $null -eq $p.PrivateBytes) { continue }
         $key = Get-MiInstanceKey -BootId $Analyzer.BootId -Process $p
         if ($null -eq $key) { continue }
-        $bytes = [long]$p.PrivateBytes
-        if ($bytes -lt 0) { continue }
+        $bytes = Get-MiAttributionBytes $p.PrivateBytes
+        if ($null -eq $bytes) { continue }
         if (-not $Analyzer.Tracks.ContainsKey($key)) {
             $Analyzer.Tracks[$key] = [pscustomobject]@{
                 Name = [string]$p.Name
@@ -389,51 +461,27 @@ function Get-MiProcessAnomaly {
         HistoricalScope = 'Unavailable'
     }
     if ($null -eq $key -or -not $Analyzer.Tracks.ContainsKey($key)) { return [pscustomobject]$report }
-    $samples = @($Analyzer.Tracks[$key].Samples.ToArray() | Where-Object {
-        $_.Utc -ge $NowUtc.AddSeconds(-$Analyzer.Parameters.WindowSeconds-$Analyzer.Parameters.BoundaryToleranceSeconds) -and $_.Utc -le $NowUtc
-    } | Sort-Object Utc)
-    $report.RawSampleCount=$samples.Count
-    # 按当前调度周期的时间槽计算覆盖，一个时间槽至多贡献一份证据。
-    # 最新时刻是调度锚点，四舍五入允许小幅采集完成时间抖动，不能靠密集补采填平休眠缺口。
-    $slots=@{}
-    $lastSlot=$Analyzer.Parameters.ExpectedSampleCount-1
-    foreach ($point in $samples) {
-        $slot=[int][math]::Round(($NowUtc-$point.Utc).TotalSeconds/$Analyzer.IntervalSeconds,
-            [MidpointRounding]::AwayFromZero)
-        if ($slot -ge 0 -and $slot -le $lastSlot) { $slots[$slot]=$point }
-    }
-    # 半周期只用于端点的槽归属，所有跨度和缺口验证都使用真正归入预期槽的代表点。
-    $evidence=@($slots.Values | Sort-Object Utc)
-    $report.ValidSampleCount=$slots.Count
-    $coverage=[double]$slots.Count/$Analyzer.Parameters.ExpectedSampleCount
+    # 已实测的热点是对每个进程历史反复创建管道/排序对象；复用原模块的紧凑计算。
+    # 原诊断继续使用半周期端点容差、首末跨度、分段 double 中位数及原报告格式。
+    $window=[MemoryInspector.AttributionWindow]::Measure($Analyzer.Tracks[$key].Samples,$NowUtc,
+        $Analyzer.IntervalSeconds,$Analyzer.Parameters.BoundaryToleranceSeconds)
+    $report.RawSampleCount=$window.RawSampleCount
+    $report.ValidSampleCount=$window.ValidSampleCount
+    $coverage=$window.CoverageRatio
     $report.CoverageRatio=[math]::Round($coverage,3)
-    $bins = @()
-    for ($i=0;$i -lt 6;$i++) { $bins += ,(New-Object 'System.Collections.Generic.List[object]') }
-    $expectedBins=@(0,0,0,0,0,0)
-    $windowStart=$NowUtc.AddSeconds(-$Analyzer.Parameters.WindowSeconds)
-    for ($slot=0;$slot -le $lastSlot;$slot++) {
-        # 分段边界用预期调度点归属；最后分段包含 NowUtc，避免任意周期的边界重复计数。
-        $nominalUtc=$NowUtc.AddSeconds(-$slot*$Analyzer.IntervalSeconds)
-        $bin=[int][math]::Floor(($nominalUtc-$windowStart).TotalSeconds/$Analyzer.Parameters.BinSeconds)
-        $bin=[math]::Max(0,[math]::Min(5,$bin))
-        $expectedBins[$bin]++
-        if ($slots.ContainsKey($slot)) { $bins[$bin].Add([double]$slots[$slot].Bytes) }
-    }
+    $expectedBins=$window.SegmentExpectedSampleCounts
     $report.SegmentExpectedSampleCounts=$expectedBins
-    $report.SegmentValidSampleCounts=@($bins | ForEach-Object { $_.Count })
-    if ($evidence.Count -eq 0) { return [pscustomobject]$report }
-    $span=($evidence[$evidence.Count-1].Utc-$evidence[0].Utc).TotalSeconds
-    $latestAge=($NowUtc-$evidence[$evidence.Count-1].Utc).TotalSeconds
-    $largestGap=0.0
-    for ($i=1;$i -lt $evidence.Count;$i++) {
-        $largestGap=[math]::Max($largestGap,($evidence[$i].Utc-$evidence[$i-1].Utc).TotalSeconds)
-    }
+    $report.SegmentValidSampleCounts=$window.SegmentValidSampleCounts
+    if ($window.ValidSampleCount -eq 0) { return [pscustomobject]$report }
+    $span=$window.ActualSpanSeconds
+    $latestAge=$window.LatestAgeSeconds
+    $largestGap=$window.MaximumGapSeconds
     $report.MaximumGapSeconds=$largestGap
     if ($coverage -lt $Analyzer.Parameters.MinimumCoverageRatio -or
         $span -lt ($Analyzer.Parameters.WindowSeconds-$Analyzer.IntervalSeconds) -or
         $latestAge -gt $Analyzer.IntervalSeconds) {
         $report.Explanation=('30 分钟窗口需 {0}/{1} 个独立时间槽且覆盖完整跨度；当前 {2}/{1}，跨度 {3:N0} 秒。' -f
-            $Analyzer.Parameters.MinimumSampleCount,$Analyzer.Parameters.ExpectedSampleCount,$slots.Count,$span)
+            $Analyzer.Parameters.MinimumSampleCount,$Analyzer.Parameters.ExpectedSampleCount,$window.ValidSampleCount,$span)
         return [pscustomobject]$report
     }
     if ($largestGap -gt $Analyzer.Parameters.MaximumGapSeconds) {
@@ -444,11 +492,11 @@ function Get-MiProcessAnomaly {
     $medians = @()
     for ($i=0;$i -lt 6;$i++) {
         $minimum=[int][math]::Ceiling($expectedBins[$i]*$Analyzer.Parameters.MinimumCoverageRatio)
-        if ($bins[$i].Count -lt $minimum) {
+        if ($window.SegmentValidSampleCounts[$i] -lt $minimum) {
             $report.Explanation = '至少一个五分钟分段的有效样本不足，暂不判断增长趋势。'
             return [pscustomobject]$report
         }
-        $medians += [double](Get-MiMedian -Values $bins[$i].ToArray())
+        $medians += $window.SegmentMedians[$i]
     }
     $baseline = [double]$medians[0]
     $growth = [double]($medians[5]-$baseline)
@@ -544,6 +592,7 @@ function Invoke-MiDiagnosis {
         }
         if ($rollback) {
             $Analyzer.Tracks.Clear();$Analyzer.PoolHistory.Clear()
+            $Analyzer.AttributionHistory.Clear()
             $Analyzer.LastCaptureUtc=[datetime]::MinValue
             $Analyzer.ContinuityId=[guid]::NewGuid().ToString('N')
             $Analyzer.ContinuityReason='检测到采样时间回拨，已重新建立分析窗口。'
@@ -594,6 +643,207 @@ function Invoke-MiDiagnosis {
         Status='Success'
         Reports=$reports.ToArray()
         Pressure=$pressure
+        Attribution=(Get-MiSystemAttribution -Analyzer $Analyzer -Snapshot $Snapshot -NowUtc $utc)
         Error=$null
+    }
+}
+
+function Get-MiAttributionBytes {
+    param($Value)
+    # 保留 null 与 0 的区别；拒绝负数、NaN、字符串小数及溢出，旧历史缺字段不能变成零。
+    $number=0L
+    if ($null -eq $Value -or $Value -is [bool] -or
+        -not [long]::TryParse($Value.ToString(),[ref]$number) -or $number -lt 0) { return $null }
+    return $number
+}
+
+function New-MiAttributionFinding {
+    param($Analyzer,[string]$Category,[string]$MetricName,$Current,$Samples,[datetime]$NowUtc,
+        [string]$ProcessInstanceId,[string]$SourceType='Counter',[string[]]$Limitations=@())
+    $window=[MemoryInspector.AttributionWindow]::Measure($Samples,$NowUtc,$Analyzer.IntervalSeconds)
+    $quality='Partial'
+    if ($null -eq $Current) { $quality='Unavailable' }
+    elseif ($window.MissingSampleCount -eq 0 -and $window.SufficientTrend) { $quality='Complete' }
+    $limits=New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $Limitations) { $limits.Add($item) }
+    if ($quality -ne 'Complete') { $limits.Add('观察窗口不完整；不插值、不补零，不将缺失样本视为有效证据。') }
+    if ($Analyzer.ContinuityReason) { $limits.Add($Analyzer.ContinuityReason) }
+    return [pscustomobject]@{
+        SchemaVersion=1;FindingId=[guid]::NewGuid().ToString('N');Category=$Category
+        TimeRangeUtc=[pscustomobject]@{StartUtc=$window.StartUtc;EndUtc=$window.EndUtc}
+        MetricName=$MetricName;ObservedBytes=$Current
+        GrowthBytes=$(if ($null -ne $Current) {$window.GrowthBytes} else {$null})
+        SourceType=$SourceType;ProcessInstanceId=$ProcessInstanceId;TraceSessionId=$null
+        MeasurementQuality=$quality
+        AttributionConfidence=$(if ($null -ne $Current) {'DirectlyObserved'} else {'Unresolved'})
+        EventLossStatus='NotApplicable';Limitations=$limits.ToArray()
+        SuggestedNextStep='继续观察完整窗口；增长本身不能证明泄漏。'
+        SamplingQuality=$window;TargetIntervalSeconds=$Analyzer.IntervalSeconds
+        RequestedTimeRangeUtc=[pscustomobject]@{StartUtc=$NowUtc.AddMinutes(-30);EndUtc=$NowUtc}
+        Trend='InsufficientEvidence'
+    }
+}
+
+function Get-MiProcessGroups {
+    param([object[]]$Processes,[string]$BootId,
+        [ValidateSet('Instance','Executable','Parent','Logical')][string]$Mode='Executable',
+        [string[]]$SelectedInstanceIds=@(),[string]$CollectionStatus='Success')
+    # 诊断分组没有动作能力。路径只是本轮可执行文件路径口径，不是签名或文件哈希授权。
+    $groups=@{};$seen=@{};$byKey=@{}
+    foreach ($p in $Processes) {
+        $key=Get-MiInstanceKey -BootId $BootId -Process $p
+        if ($key) { $byKey[$key]=$p }
+    }
+    foreach ($p in $Processes) {
+        $instance=Get-MiInstanceKey -BootId $BootId -Process $p
+        if (-not $instance -or $seen.ContainsKey($instance)) { continue }
+        $seen[$instance]=$true;$id=$instance;$label=('{0} · PID {1}' -f $p.Name,$p.PID)
+        if ($Mode -eq 'Logical') {
+            if ($instance -notin $SelectedInstanceIds) {continue}
+            $id='UserSelection';$label='用户选定的精确进程实例'
+        } elseif ($Mode -eq 'Executable') {
+            if (-not [string]::IsNullOrWhiteSpace([string]$p.ExecutablePath)) {
+                $id=([string]$p.ExecutablePath).ToUpperInvariant();$label=[string]$p.ExecutablePath
+            } else { $label+='（路径未知，单独保留）' }
+        } elseif ($Mode -eq 'Parent') {
+            # 只合并当前可核验的根及后代；父进程已退出或 PID 被复用时不猜测旧关系。
+            $ancestor=$p;$visited=@{$instance=$true}
+            while ($null -ne $ancestor.ParentPid -and $null -ne $ancestor.ParentStartUtcTicks) {
+                $parentKey='{0}:{1}:{2}' -f $BootId,$ancestor.ParentPid,$ancestor.ParentStartUtcTicks
+                if (-not $byKey.ContainsKey($parentKey) -or $visited.ContainsKey($parentKey) -or
+                    $ancestor.ParentStartUtcTicks -gt $ancestor.StartUtcTicks) {break}
+                $visited[$parentKey]=$true;$ancestor=$byKey[$parentKey];$id=$parentKey
+                $label=('{0} · 根 PID {1}' -f $ancestor.Name,$ancestor.PID)
+            }
+        }
+        if (-not $groups.ContainsKey($id)) {
+            $groups[$id]=[pscustomobject]@{SchemaVersion=1;GroupId=$id;GroupingKind=$Mode;Label=$label
+                ProcessInstanceIds=(New-Object 'System.Collections.Generic.List[string]')
+                ObservedPrivateBytes=[decimal]0;ValidMemberCount=0;MemberCount=0
+                MeasurementQuality='Complete';AttributionConfidence='Correlated'
+                Scope='当前采样中可验证实例的 Private Bytes 之和；不含共享内存，不等于 RAM 或可释放量。'
+                Limitations='进程枚举非原子；路径/父子关系仅用于诊断，缺失身份不参与分组。'}
+        }
+        $g=$groups[$id];$g.MemberCount++;$g.ProcessInstanceIds.Add($instance)
+        if (($Mode -eq 'Executable' -and [string]::IsNullOrWhiteSpace([string]$p.ExecutablePath)) -or
+            ($Mode -eq 'Parent' -and $null -eq $p.ParentStartUtcTicks -and $p.ParentPid -ne 0)) {
+            $g.MeasurementQuality='Partial'
+        }
+        $bytes=Get-MiAttributionBytes $p.PrivateBytes
+        if ($null -ne $bytes) { $g.ObservedPrivateBytes+=[decimal]$bytes;$g.ValidMemberCount++ }
+    }
+    foreach ($g in $groups.Values) {
+        if ($g.ValidMemberCount -eq 0 -or $g.ObservedPrivateBytes -gt [long]::MaxValue) {
+            $g.ObservedPrivateBytes=$null;$g.MeasurementQuality='Unavailable'
+        } else {
+            $g.ObservedPrivateBytes=[long]$g.ObservedPrivateBytes
+            if ($g.ValidMemberCount -ne $g.MemberCount -or $CollectionStatus -ne 'Success' -or
+                ($Mode -eq 'Logical' -and $g.MemberCount -ne @($SelectedInstanceIds | Select-Object -Unique).Count)) {
+                $g.MeasurementQuality='Partial'
+            }
+        }
+        $g.ProcessInstanceIds=$g.ProcessInstanceIds.ToArray()
+        $g
+    }
+}
+
+function Get-MiSystemAttribution {
+    param($Analyzer,$Snapshot,[datetime]$NowUtc)
+    $findings=New-Object 'System.Collections.Generic.List[object]'
+    $system=$Snapshot.System
+    $values=[ordered]@{}
+    foreach ($metric in @('CommittedBytes','CommitLimitBytes','PagedPoolBytes','NonpagedPoolBytes')) {
+        $values[$metric]=$(if ($system.Status -ne 'Failed') {Get-MiAttributionBytes $system.$metric} else {$null})
+    }
+    $values['CommitHeadroomBytes']=$null
+    if ($null -ne $values.CommittedBytes -and $null -ne $values.CommitLimitBytes -and
+        $values.CommitLimitBytes -gt 0 -and $values.CommitLimitBytes -ge $values.CommittedBytes) {
+        $values.CommitHeadroomBytes=$values.CommitLimitBytes-$values.CommittedBytes
+    }
+    $sum=[decimal]0;$valid=0;$unknown=0
+    $processRows=@();$processFindings=New-Object 'System.Collections.Generic.List[object]';$identities=@{}
+    if ($Snapshot.Processes.Status -ne 'Failed') {$processRows=@($Snapshot.Processes.Items)}
+    foreach ($p in $processRows) {
+        $bytes=Get-MiAttributionBytes $p.PrivateBytes
+        $key=Get-MiInstanceKey -BootId $Analyzer.BootId -Process $p
+        if ($key -and $identities.ContainsKey($key)) {$unknown++;continue}
+        if ($key) {$identities[$key]=$true}
+        if ($null -ne $bytes) {$sum+=[decimal]$bytes;$valid++}
+        if (-not $key) {$unknown++;continue}
+        $samples=$null
+        if ($Analyzer.Tracks.ContainsKey($key)) {$samples=$Analyzer.Tracks[$key].Samples}
+        $f=New-MiAttributionFinding $Analyzer ProcessPrivate PrivateBytes $bytes $samples $NowUtc -ProcessInstanceId $key -SourceType Snapshot
+        $f | Add-Member -NotePropertyName Label -NotePropertyValue ('{0} · PID {1}' -f $p.Name,$p.PID)
+        $processFindings.Add($f)
+    }
+    $values['ProcessPrivateBytes']=$null
+    if ($valid -gt 0 -and $sum -le [long]::MaxValue) {$values.ProcessPrivateBytes=[long]$sum}
+    $collectionComplete=$Snapshot.Processes.Status -eq 'Success' -and $valid -eq $processRows.Count -and $unknown -eq 0 -and $valid -gt 0
+    foreach ($metric in $values.Keys) {
+        if (-not $Analyzer.AttributionHistory.ContainsKey($metric)) {
+            $Analyzer.AttributionHistory[$metric]=New-Object 'System.Collections.Generic.List[MemoryInspector.AnalysisPoint]'
+        }
+        $history=$Analyzer.AttributionHistory[$metric];$current=$values[$metric]
+        # 全进程汇总缺成员时不写入完整趋势，避免退出/权限缺失造成假增长或假释放。
+        if ($null -ne $current -and ($metric -ne 'ProcessPrivateBytes' -or $collectionComplete) -and
+            ($history.Count -eq 0 -or $NowUtc -gt $history[$history.Count-1].Utc)) {
+            $history.Add([MemoryInspector.AnalysisPoint]::new($NowUtc,$current))
+        }
+        Limit-MiAnalysisHistory $Analyzer $history $NowUtc
+        $category='SystemCommit'
+        if ($metric -like '*PoolBytes') {$category='KernelPool'}
+        if ($metric -eq 'ProcessPrivateBytes') {$category='ProcessAggregate'}
+        $source='Counter';if ($metric -eq 'ProcessPrivateBytes') {$source='Snapshot'}
+        $f=New-MiAttributionFinding $Analyzer $category $metric $current $history $NowUtc -SourceType $source
+        if ($metric -eq 'ProcessPrivateBytes' -and -not $collectionComplete) {
+            $f.MeasurementQuality=$(if ($null -eq $current) {'Unavailable'} else {'Partial'})
+            $f.GrowthBytes=$null;$f.Limitations+=('仅 {0}/{1} 个可读 Private Bytes；身份未知 {2} 个，枚举状态 {3}。' -f $valid,$processRows.Count,$unknown,$Snapshot.Processes.Status)
+        }
+        if ($category -eq 'KernelPool') {
+            $f.Limitations+='Pool 计数器不能归属到具体驱动或 Pool Tag，也不能证明泄漏。'
+            if ($null -ne $current -and $f.SamplingQuality.SufficientTrend) {
+                $f.Trend=$(if ($f.GrowthBytes -ge 128MB -and $f.SamplingQuality.UpwardSegments -ge 4) {'SustainedGrowth'} else {'NoSustainedGrowth'})
+            }
+        }
+        $findings.Add($f)
+    }
+    # 差额仅是两个不同统计口径的残差，绝不把 Pool/Working Set 再加进去凑成 Commit。
+    $residualValue=$null
+    if ($null -ne $values.CommittedBytes -and $null -ne $values.ProcessPrivateBytes) {
+        $residualValue=$values.CommittedBytes-$values.ProcessPrivateBytes
+    }
+    if (-not $Analyzer.AttributionHistory.ContainsKey('Residual')) {
+        $Analyzer.AttributionHistory['Residual']=New-Object 'System.Collections.Generic.List[MemoryInspector.AnalysisPoint]'
+    }
+    $residualHistory=$Analyzer.AttributionHistory['Residual']
+    if ($null -ne $residualValue -and $collectionComplete -and
+        ($residualHistory.Count -eq 0 -or $NowUtc -gt $residualHistory[$residualHistory.Count-1].Utc)) {
+        $residualHistory.Add([MemoryInspector.AnalysisPoint]::new($NowUtc,$residualValue))
+    }
+    Limit-MiAnalysisHistory $Analyzer $residualHistory $NowUtc
+    $residual=New-MiAttributionFinding $Analyzer UnresolvedCommit CommitMinusObservedPrivateBytes $residualValue $residualHistory $NowUtc -SourceType Snapshot
+    $residual.AttributionConfidence='Unresolved'
+    if ($null -ne $values.CommittedBytes -and $null -ne $values.ProcessPrivateBytes) {
+        $residual.ObservedBytes=$values.CommittedBytes-$values.ProcessPrivateBytes
+        $residual.MeasurementQuality='Partial';$residual.TimeRangeUtc=[pscustomobject]@{StartUtc=$NowUtc;EndUtc=$NowUtc}
+    }
+    if (-not $collectionComplete) {$residual.GrowthBytes=$null}
+    elseif ($null -ne $residual.SamplingQuality.StartUtc) {
+        $residual.TimeRangeUtc=[pscustomobject]@{StartUtc=$residual.SamplingQuality.StartUtc;EndUtc=$residual.SamplingQuality.EndUtc}
+    }
+    $residual.Limitations=@('系统 Commit 减去可读进程 Private Bytes；采集不同步且可能缺进程，差额可为负。','包含尚未归属的系统提交及统计差异，不代表泄漏；Pool 与进程指标不能保证完整分解 Commit。')
+    $residual.SuggestedNextStep='结合进程及 Pool 趋势继续调查；高级 ETW 诊断尚未开放。'
+    $findings.Add($residual)
+    $ram=[ordered]@{SchemaVersion=1}
+    foreach ($metric in @('TotalPhysicalBytes','AvailablePhysicalBytes','CacheBytes','StandbyBytes','CompressionBytes')) {
+        $ram[$metric]=$(if ($system.Status -ne 'Failed') {Get-MiAttributionBytes $system.$metric} else {$null})
+    }
+    $ram['Limitations']='RAM 与 Commit 独立；Working Set 仅显示单进程，禁止求和作为物理占用。Cache/Standby 可能重叠；压缩量不可用时保持 null。'
+    return [pscustomobject]@{
+        SchemaVersion=1;CapturedUtc=$NowUtc;BootId=$Analyzer.BootId;Status='Success'
+        Findings=$findings.ToArray();ProcessFindings=$processFindings.ToArray();Ram=[pscustomobject]$ram
+        ProcessGroups=@(Get-MiProcessGroups $processRows $Analyzer.BootId -Mode Executable -CollectionStatus $Snapshot.Processes.Status)
+        ParentGroups=@(Get-MiProcessGroups $processRows $Analyzer.BootId -Mode Parent -CollectionStatus $Snapshot.Processes.Status)
+        UnassociatedProcessCount=$unknown;CollectionStatus=$Snapshot.Processes.Status
     }
 }

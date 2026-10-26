@@ -244,3 +244,37 @@ Windows PowerShell Desktop 5.1 下运行 SmokeTest.ps1、AnalyzerTest.ps1、Proc
 最终正式观察为 35 分钟/210 条：平均归一化 CPU 0.0914%，Working Set 均值 194.42 MiB、采样峰值 210.08 MiB，之后读取的 OS 存活期峰值 234.94 MiB。第 5–10 与 30–35 分钟均值分别为 194.103 和 195.025 MiB，没有重现原先数百 MiB 增长，但严格内存峰值目标仍未通过。
 
 真实落盘 412 对、跨度 2057.558 秒，0 解析/重复/配对/序号/时钟异常；Collector 均值 1474.13 ms、P95 1830 ms。最终回放 343/361 槽（95%），六段 50/60、52/60、60/60、60/60、60/60、61/61，首段低于原 85%，所以诊断仍为证据不足，不能算采样充分性通过。修改前后分析器在同一窗口的 24967 个点哈希和完整报告相同，排除本轮存储优化造成该差异；360 个原始点有 17 次归槽碰撞，累计完成相位漂移约 2.558 秒，仍需后续修复/实测，不能放宽检查。
+
+## 2026-10-25 V3-M1：System Memory Attribution
+
+需求来源是 v3 冻结规格第 4 节及 V3-M1，起始提交 `3d2ee903e6dafe63c74860f285c3aa811f6036b9`。本轮实现、Review 审阅后仅创建本地提交，不推送远程。VERSION 保持 0.0.9，不把 M1 开发完成冒充 Stable v3 或更新安装版本信任。未新增生产模块，未删除既有文件，未执行安装、服务操作、进程终止、WPR 或系统配置修改。
+
+### 实现与统计口径
+
+- Collector：增加可选 Cache/Standby；压缩量无可靠来源时保持 null。使用只读 limited-query 句柄绑定映像路径与创建时间，Toolhelp 获取父 PID，再核验父子创建时间。路径仅供诊断分组，不是签名或文件身份授权。创建时间晚于枚举前边界，或两次身份查询不同，均清除实例/路径关联并标记 Partial，独立可读数值仍保留。
+- Analyzer：版本化 AttributionFinding 分别报告 Commit/Limit/Headroom、Paged/Nonpaged Pool、可读 Private Bytes 汇总与 Unresolved 残差；RAM 独立。分组区分实例、可执行路径、当前可验证父子关系及用户逻辑组，标注统计口径及成员完整性。无可信身份的记录不参与实例分组。
+- 质量：30 分钟窗口使用实际 UTC、目标周期、独立时间槽、跨度及最大缺口，不补零、不插值。新 Finding 使用严格观察边界，原诊断保留半周期端点容差；周期切换/时间回拨重建系统归因窗口。Pool 增长不能确定泄漏或指定驱动；Commit 残差可能为负，不能通过加入 Pool/Working Set 凑平。
+- 持久化：原 system/process schema=1 新增可选字段，Finding 自带 SchemaVersion；原历史、配额及读取继续工作。新系统归因从本次 Worker 启动积累，不伪造旧数据缺失的身份和质量；原进程历史恢复保留。
+- GUI：新增只读 Attribution 页，后台分析，UI 只显示结果。实例视角 Ctrl/Shift 多选形成临时逻辑组，无批量操作能力；PID 复用不继承选择。详情显示来源、实际 UTC、有效/预期样本、缺口、局限和建议。界面约定和使用方式写入原 README，复用原控件/配色。
+
+### 测试与 Review
+
+Windows PowerShell Desktop **5.1** / RemoteSigned 下，SmokeTest、AnalyzerTest、GuiV4Test、PersistenceTest、ProcessActionsTest、PrivilegeSecurityTest、ServiceManagementTest、Milestone8Test 八个回归最终均退出 **0**。
+
+新增测试覆盖 Finding 字段、Commit/RAM 独立、Pool 趋势、5/7/30/60 秒动态覆盖、长缺口、密集补采、重复时间、周期/时钟变化、PID 复用、同名不同路径、父 PID 复用、逻辑组缺失成员、null/零/非法/溢出计数器、Int64 精度、历史新字段往返及真实映像/父 PID 读取。GUI 使用真实控件验证冷启动、失效清空、选择身份、逻辑汇总及证据详情。
+
+Review **Standards / Spec** 两轴首轮各发现一项 P2：新增采样分支缺少直接测试、枚举后首次身份查询前 PID 复用可能误关联。均修复并补测，两轴复核无剩余阻断项；后续性能优化亦经两轴复核。静态审阅不能替代实机验收。
+
+测试自有隐藏 WinForms 窗口在 **1300×850、1020×690** 渲染，已查看截图，表头与详情未重叠。此项不是用户桌面端到端交互、真实 DPI 或多屏验收。frontend-design 静态 audit `--mode strict --no-write` 返回 0、无发现，其结果不替代 WinForms 运行验证。
+
+### 性能证据
+
+初轮同输入回放（618 进程、403 实例、完整进程窗口）基线分析均值 **2925.61 ms**、首版 M1 **4730.21 ms**；另 8 次真实采集均值 **1699.78 ms**、最大 **2131.51 ms**。首版存在默认 5 秒周期超时风险，没有记为性能通过。
+
+定位后复用原 Analyzer 内紧凑 C# 时间槽/分段计算，消除原诊断每轮反复创建的 PowerShell 管道/排序对象。旧 double 中位数、半周期容差、85% 总体/分段覆盖、缺口阈值和报告文本保持不变。对照起始 SHA 的原函数，6 个周期 × 6 种输入（稳定、增长、缺口、抖动、稀疏、大整数），共 **36 组完整 JSON 报告逐字段一致**，新旧 AnalyzerTest 均通过。
+
+最终独立复测在同一份 **590 进程、380 实例**输入上，两版均预填完整进程窗口、运行 8 轮并排除首轮：基线分析均值 **860.67 ms** / 最大 **948.86 ms**，最终 M1 **526.61 ms** / 最大 **663.13 ms**。这只证明该场景的分析开销；两轮负载和进程数不同，不能将初轮与末轮绝对时间当成同条件比较。也不代表 30 分钟真实持续采样、端到端 GUI 延迟或全部设备验收。
+
+本地证据位于 `test-artifacts/v3-m1/`：smoke-reviewed.log、analyzer-optimized.log、GuiV4Test-optimized.log、PersistenceTest.log、ProcessActionsTest.log、PrivilegeSecurityTest.log、ServiceManagementTest.log、Milestone8Test-optimized.log、legacy-parity.log、performance-reviewed.json、performance-optimized.json、attribution-1020/1300.png。初轮失败及性能夹具类型加载错误日志保留，未改写为通过；测试产物不纳入源码提交。
+
+**仍未验证与开放问题：**非管理员主机的管理员 ACL 分支为 SKIP；没有执行 PrivilegeInstallTest、受保护部署/UAC/卸载、真实管理操作、Windows 10、本轮长期 GUI/24 小时、真实故障/休眠/回拨或 DPI/多屏验收。旧版 <200 MiB 峰值和部分窗口覆盖不足仍然开放，本轮未放宽或宣称解决。WPR、Watchdog、Heap、WPAExporter、ActionGrant 未开放，M2–M7 仍需独立实现与验收。

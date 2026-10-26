@@ -42,6 +42,11 @@ try {
                 })
             }
         }
+        $sample.System | Add-Member CacheBytes 100MB -Force
+        $sample.Processes.Items[0] | Add-Member ExecutablePath 'C:\fixture\example.exe' -Force
+        $sample | Add-Member Diagnosis ([pscustomobject]@{Attribution=[pscustomobject]@{Findings=@(
+            [pscustomobject]@{SchemaVersion=1;FindingId='v3-fixture';MetricName='CommittedBytes';ObservedBytes=9007199254740993L;GrowthBytes=$null;AttributionConfidence='Unresolved'}
+        )}}) -Force
         Assert-Mi (Save-MiSnapshot -State $s -Snapshot $sample) ('Cannot save sample: '+$s.Warning)
         foreach ($type in @('system','process')) {
             $savedPath=Join-Path (Join-Path $s.Root $type) ($type+'-'+$stamp.ToString('yyyy-MM-dd')+'.jsonl')
@@ -49,6 +54,11 @@ try {
             Assert-Mi ($savedRecord.SchemaVersion -eq 1 -and $savedRecord.ContinuityId -eq 'p2-fixture' -and
                 $savedRecord.TimeDiscontinuity -eq ($i -eq 1) -and $savedRecord.MonotonicSeconds -eq (100+$i*5) -and
                 ([datetime]$savedRecord.CaptureEndUtc).ToUniversalTime() -eq $stamp) 'P2 continuity metadata or UTC round trip failed.'
+            if ($type -eq 'system') {
+                Assert-Mi ($savedRecord.AttributionSchemaVersion -eq 1 -and $savedRecord.CacheBytes -eq 100MB -and
+                    $savedRecord.AttributionFindings[0].ObservedBytes -eq 9007199254740993L -and
+                    $null -eq $savedRecord.AttributionFindings[0].GrowthBytes) 'V3 Finding roundtrip lost exact bytes/null/schema.'
+            } else {Assert-Mi ($savedRecord.Items[0].ExecutablePath -ceq 'C:\fixture\example.exe') 'V3 grouping metadata lost.'}
         }
     }
     $aggregateFile=Get-MiAggregatePath -State $s -Key (Get-MiBucketKey -Utc $t1)

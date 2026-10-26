@@ -39,6 +39,18 @@ Write-Host 'PASS: snapshot schema and available collection sources.' -Foreground
         if ($ClassName -eq 'Win32_OperatingSystem') { return $script:OsFixture }
         return $script:MemoryFixture
     }
+    # V3 可选 RAM 字段：完整三项才合计，缺失/溢出不能静默补零。
+    $script:MemoryFixture | Add-Member CacheBytes 50MB
+    $script:MemoryFixture | Add-Member StandbyCacheCoreBytes 10MB
+    $script:MemoryFixture | Add-Member StandbyCacheNormalPriorityBytes 20MB
+    $script:MemoryFixture | Add-Member StandbyCacheReserveBytes 30MB
+    $optional=Get-MiSystemSnapshot
+    if ($optional.CacheBytes -ne 50MB -or $optional.StandbyBytes -ne 60MB -or $null -ne $optional.CompressionBytes) {throw 'V3 optional RAM metrics incorrect.'}
+    $script:MemoryFixture.StandbyCacheCoreBytes=$null
+    if ($null -ne (Get-MiSystemSnapshot).StandbyBytes) {throw 'V3 missing Standby component was replaced by zero.'}
+    $script:MemoryFixture.StandbyCacheCoreBytes=[long]::MaxValue
+    if ($null -ne (Get-MiSystemSnapshot).StandbyBytes) {throw 'V3 Standby sum overflow was accepted.'}
+    $script:MemoryFixture.StandbyCacheCoreBytes=10MB
     foreach ($field in @('CommittedBytes','CommitLimit','PoolPagedBytes','PoolNonpagedBytes')) {
         $saved=$script:MemoryFixture.$field
         $outputField=switch ($field) {'CommitLimit' {'CommitLimitBytes'} 'PoolPagedBytes' {'PagedPoolBytes'} 'PoolNonpagedBytes' {'NonpagedPoolBytes'} default {$field}}
@@ -76,6 +88,13 @@ Write-Host 'PASS: P2-01 null/invalid/overflow/zero counters, partial sources, fa
 $self=Get-Process -Id $PID
 try {
     $expectedTicks=$self.StartTime.ToUniversalTime().Ticks
+    $imagePath=[MemoryInspector.CollectorProcessTimes]::ReadImagePath($PID,$expectedTicks)
+    if ($imagePath -ine $self.Path -or $null -ne [MemoryInspector.CollectorProcessTimes]::ReadImagePath($PID,($expectedTicks+1))) {
+        throw 'V3 executable path was not bound to exact creation time.'
+    }
+    $parentMap=[MemoryInspector.CollectorProcessTimes]::ReadParents()
+    $selfCim=Get-CimInstance Win32_Process -Filter ('ProcessId='+$PID)
+    if (-not $parentMap.ContainsKey($PID) -or $parentMap[$PID] -ne $selfCim.ParentProcessId) {throw 'V3 native parent enumeration mismatch.'}
     if ((Get-MiProcessStartUtcTicks -ProcessId $PID) -ne $expectedTicks -or
         (Get-MiProcessStartUtcTicks -ProcessId $PID) -ne $expectedTicks) {throw 'Limited-query creation time differs from the actual process identity.'}
     foreach($invalidPid in @(0,-1,2147483647)) {
@@ -102,5 +121,20 @@ try {
     $unknown=Get-MiProcessSnapshot
     if ($unknown.Status -ne 'Partial' -or $unknown.Incomplete -ne 1 -or $null -ne $unknown.Items[0].StartUtcTicks -or
         $unknown.Items[0].PrivateBytes -ne 8MB) {throw 'Unavailable identity was fabricated or valid independent memory was lost.'}
+    # 第一次查身份前 PID 已复用：两次查询可能完全一致，仍不能关联枚举缓存。
+    $script:KnownCreationTicks=[datetime]::UtcNow.AddMinutes(1).Ticks
+    $future=Get-MiProcessSnapshot
+    if ($future.Status -ne 'Partial' -or $null -ne $future.Items[0].StartUtcTicks -or
+        $null -ne $future.Items[0].ExecutablePath -or $future.Items[0].PrivateBytes -ne 8MB) {throw 'V3 post-enumeration PID reuse inherited cached memory identity.'}
+    $script:IdentityRead=0
+    function Get-MiProcessStartUtcTicks {param($ProcessId)
+        $script:IdentityRead++
+        if ($script:IdentityRead -eq 1) {return $expectedTicks}
+        return ($expectedTicks+1)
+    }
+    $changed=Get-MiProcessSnapshot
+    if ($changed.Status -ne 'Partial' -or $null -ne $changed.Items[0].StartUtcTicks -or
+        $null -ne $changed.Items[0].ExecutablePath) {throw 'V3 identity changed during measurement but association survived.'}
 }
 Write-Host 'PASS: fresh limited-query creation times, failure/null identity, handle release and no legacy getter.' -ForegroundColor Green
+Write-Host 'PASS: V3 Cache/Standby null and overflow, native image/parent identity, both PID-reuse timing windows.' -ForegroundColor Green

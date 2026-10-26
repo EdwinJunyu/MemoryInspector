@@ -449,3 +449,87 @@ Assert-Mi ((Restore-MiAnalyzer $midAnalyzer $midEnd) -eq 2 -and $midAnalyzer.Con
 $resumed=Invoke-MiDiagnosis $midAnalyzer (New-ClockFixture ($midEnd.AddMinutes(-10).AddSeconds(5)) 1 810)
 Assert-Mi ($resumed.Status -eq 'Success' -and $resumed.Reports[0].ValidSampleCount -eq 3 -and $midAnalyzer.ContinuityId -eq 'after') 'Normal restart failed to preserve the recovered segment.'
 Write-Host 'PASS: P2 cross-midnight historical ordering and restart continuity.' -ForegroundColor Green
+
+# V3-M1：实际时间与独立统计口径。夹具只创建标量，不终止或修改真实进程。
+foreach ($cadence in @(5,7,30,60)) {
+    $a=New-MiAnalyzer -BootId V3 -Root '' -IntervalSeconds $cadence
+    $end=[datetime]::SpecifyKind([datetime]'2026-10-25T12:30:00',[DateTimeKind]::Utc)
+    $count=[int][math]::Floor(1800/$cadence)
+    for ($i=$count;$i -ge 0;$i--) {
+        $s=New-Fixture -Utc $end.AddSeconds(-$i*$cadence) -PrivateBytes (100MB+($count-$i)*10MB) -IntervalSeconds $cadence
+        $s.System | Add-Member PagedPoolBytes (100MB+($count-$i)*10MB)
+        $s.System.NonpagedPoolBytes=128MB+($count-$i)*10MB
+        $d=Invoke-MiDiagnosis $a $s
+    }
+    $v3=$d.Attribution
+    $pool=@($v3.Findings | Where-Object MetricName -eq PagedPoolBytes)[0]
+    Assert-Mi ($pool.MeasurementQuality -eq 'Complete' -and $pool.Trend -eq 'SustainedGrowth') ('V3 pool trend/cadence '+$cadence)
+    Assert-Mi ($pool.SamplingQuality.ExpectedSampleCount -eq ($count+1) -and $pool.SamplingQuality.ValidSampleCount -eq ($count+1)) 'V3 dynamic window counts incorrect.'
+    Assert-Mi ($pool.SamplingQuality.ActualSpanSeconds -eq $count*$cadence) 'V3 manufactured time span.'
+    Assert-Mi ($v3.Ram.AvailablePhysicalBytes -eq 6GB -and $null -eq $v3.Ram.CompressionBytes) 'V3 RAM mixed with commit or unknown compressed memory became zero.'
+    $commit=@($v3.Findings | Where-Object MetricName -eq CommittedBytes)[0]
+    $residual=@($v3.Findings | Where-Object Category -eq UnresolvedCommit)[0]
+    Assert-Mi ($commit.ObservedBytes -eq 4GB -and $commit.GrowthBytes -eq 0 -and $residual.AttributionConfidence -eq 'Unresolved') 'V3 double counted Working Set or resolved a residual.'
+    foreach ($finding in @($v3.Findings)+@($v3.ProcessFindings)) {
+        foreach ($field in @('FindingId','SchemaVersion','Category','TimeRangeUtc','MetricName','ObservedBytes','GrowthBytes','SourceType',
+            'ProcessInstanceId','TraceSessionId','MeasurementQuality','AttributionConfidence','EventLossStatus','Limitations','SuggestedNextStep')) {
+            Assert-Mi ($null -ne $finding.PSObject.Properties[$field]) ('Missing Finding field '+$field)
+        }
+        Assert-Mi ($finding.EventLossStatus -eq 'NotApplicable' -and $null -eq $finding.TraceSessionId) 'Counter finding invented ETW completeness.'
+    }
+    # 一个缺失字段只降低自己的证据质量，不能抹掉其他可读指标或填零。
+    $s=New-Fixture -Utc $end.AddSeconds($cadence) -IntervalSeconds $cadence
+    $s.System.CommittedBytes=$null
+    $partial=(Invoke-MiDiagnosis $a $s).Attribution
+    $missing=@($partial.Findings | Where-Object MetricName -eq CommittedBytes)[0]
+    Assert-Mi ($missing.MeasurementQuality -eq 'Unavailable' -and $null -eq $missing.ObservedBytes -and $null -eq $missing.GrowthBytes) 'Missing commit reused stale value.'
+    Assert-Mi ($partial.ProcessFindings[0].ObservedBytes -eq 200MB) 'Missing commit removed valid process evidence.'
+    # PID 相同但创建时间变化，不能继承前实例的趋势。
+    $replacement=New-Fixture -Utc $end.AddSeconds(2*$cadence) -StartTicks 888888888 -IntervalSeconds $cadence
+    $new=(Invoke-MiDiagnosis $a $replacement).Attribution.ProcessFindings[0]
+    Assert-Mi ($new.SamplingQuality.ValidSampleCount -eq 1 -and $null -eq $new.GrowthBytes -and $new.MeasurementQuality -eq 'Partial') 'PID reuse inherited old attribution.'
+}
+
+$a=New-MiAnalyzer -BootId V3 -Root '' -IntervalSeconds 5
+for ($i=0;$i -le 360;$i++) {
+    if ($i -ge 150 -and $i -le 180) {continue}
+    $s=New-Fixture -Utc $end.AddSeconds(($i-360)*5) -IntervalSeconds 5
+    $s.System.NonpagedPoolBytes=128MB+$i*4MB
+    $d=Invoke-MiDiagnosis $a $s
+}
+$gapFinding=@($d.Attribution.Findings | Where-Object MetricName -eq NonpagedPoolBytes)[0]
+Assert-Mi ($gapFinding.MeasurementQuality -eq 'Partial' -and $gapFinding.Trend -eq 'InsufficientEvidence' -and
+    $gapFinding.SamplingQuality.MissingSampleCount -eq 31 -and $gapFinding.SamplingQuality.MaximumGapSeconds -eq 160) 'Sleep gap hidden by high coverage.'
+$dup=Invoke-MiDiagnosis $a $s
+Assert-Mi ($dup.Status -eq 'Stale' -and $a.AttributionHistory.CommittedBytes.Count -eq 330) 'Duplicate samples inflated attribution.'
+$s=New-Fixture -Utc $end.AddSeconds(30) -IntervalSeconds 30
+$changed=(Invoke-MiDiagnosis $a $s).Attribution
+Assert-Mi ($changed.Findings[0].SamplingQuality.ValidSampleCount -eq 1 -and $changed.Findings[0].SamplingQuality.ExpectedSampleCount -eq 61) 'Cadence change retained old system window.'
+$s=New-Fixture -Utc $end.AddMinutes(-60) -IntervalSeconds 30
+Assert-Mi ((Invoke-MiDiagnosis $a $s).Status -eq 'Stale' -and $a.AttributionHistory.Count -eq 0) 'Clock rollback retained attribution window.'
+
+# 精确计数、合法零、非法计数器与高密度补采。
+foreach ($bad in @($null,'',-1,'NaN','Infinity','1.5',$true,'9223372036854775808')) {
+    Assert-Mi ($null -eq (Get-MiAttributionBytes $bad)) 'Invalid attribution counter accepted.'
+}
+Assert-Mi ((Get-MiAttributionBytes 0) -ceq 0L -and (Get-MiAttributionBytes 9007199254740993L) -eq 9007199254740993L) 'Exact Int64/zero lost.'
+$points=New-Object 'System.Collections.Generic.List[MemoryInspector.AnalysisPoint]'
+for ($i=0;$i -lt 400;$i++) {$points.Add([MemoryInspector.AnalysisPoint]::new($end.AddMilliseconds(-$i*10),100))}
+$burst=[MemoryInspector.AttributionWindow]::Measure($points,$end,5)
+Assert-Mi ($burst.ValidSampleCount -le 2 -and -not $burst.SufficientTrend) 'Burst fabricated full coverage.'
+
+# 同名不同路径分开，同路径多个实例合并；父创建时间晚于子时不建立关系。
+$members=@(
+    [pscustomobject]@{PID=10;Name='same';StartUtcTicks=100;ExecutablePath='C:\fixture\a.exe';PrivateBytes=10MB},
+    [pscustomobject]@{PID=11;Name='same';StartUtcTicks=110;ExecutablePath='C:\fixture\a.exe';PrivateBytes=20MB;ParentPid=10;ParentStartUtcTicks=100},
+    [pscustomobject]@{PID=12;Name='same';StartUtcTicks=120;ExecutablePath='C:\fixture\b.exe';PrivateBytes=$null;ParentPid=10;ParentStartUtcTicks=999}
+)
+$exe=@(Get-MiProcessGroups $members V3 -Mode Executable)
+Assert-Mi ($exe.Count -eq 2 -and @($exe | Where-Object ObservedPrivateBytes -eq 30MB).Count -eq 1) 'Executable grouping merged names or lost instances.'
+$parents=@(Get-MiProcessGroups $members V3 -Mode Parent)
+Assert-Mi ($parents.Count -eq 2 -and @($parents | Where-Object MemberCount -eq 2).Count -eq 1) 'Parent PID reuse linked wrong group.'
+$logic=@(Get-MiProcessGroups $members V3 -Mode Logical -SelectedInstanceIds @('V3:10:100','V3:12:120','V3:99:999'))
+Assert-Mi ($logic.Count -eq 1 -and $logic[0].MemberCount -eq 2 -and $logic[0].ObservedPrivateBytes -eq 10MB -and $logic[0].MeasurementQuality -eq 'Partial') 'Logical group hid missing members.'
+$instances=@(Get-MiProcessGroups @($members[0],$members[0]) V3 -Mode Instance)
+Assert-Mi ($instances.Count -eq 1 -and $instances[0].ObservedPrivateBytes -eq 10MB) 'Duplicate instance counted twice.'
+Write-Host 'PASS: V3-M1 contracts, Commit/RAM separation, pool trends, cadence/gaps/reset, PID reuse and process grouping.' -ForegroundColor Green

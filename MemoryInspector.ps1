@@ -400,6 +400,7 @@ function Process-MiMailbox {
     Show-MiProcessObservation $actionObservation
     Update-MiGrid -ProcessCollection $latest.Processes
     Update-MiCharts
+    if ($script:Tabs -and $script:Tabs.SelectedIndex -eq 5) { Update-MiAttributionView }
     $timeString = $latest.CaptureEndUtc.ToLocalTime().ToString('HH:mm:ss')
     $text = ('{0} | 第 {1} 次采样 | 耗时 {2} ms | 系统：{3} | 进程：{4} ({5} 条)' -f
         $timeString,$latest.Sequence,$latest.DurationMs,$latest.System.Status,$latest.Processes.Status,$latest.Processes.Total)

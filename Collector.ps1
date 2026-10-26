@@ -12,6 +12,8 @@ function Initialize-MiCollectorProcessTimes {
     if ($null -ne ('MemoryInspector.CollectorProcessTimes' -as [type])) { return }
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.Text;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 namespace MemoryInspector {
@@ -23,6 +25,46 @@ namespace MemoryInspector {
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetProcessTimes(SafeProcessHandle process,
             out long creation, out long exit, out long kernel, out long user);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(SafeProcessHandle process, int flags,
+            StringBuilder name, ref int size);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ProcessEntry {
+            public uint Size, Usage, Pid;
+            public UIntPtr Heap;
+            public uint Module, Threads, Parent;
+            public int Priority;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+        }
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32First(SafeFileHandle snapshot, ref ProcessEntry entry);
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32Next(SafeFileHandle snapshot, ref ProcessEntry entry);
+        // 只读枚举父 PID；调用方还需核对父子创建时间，不能直接把 PID 当作实例关系。
+        public static Dictionary<int,int> ReadParents() {
+            var result = new Dictionary<int,int>();
+            using (var snapshot = CreateToolhelp32Snapshot(2, 0)) {
+                if (snapshot == null || snapshot.IsInvalid) return result;
+                var entry = new ProcessEntry(); entry.Size = (uint)Marshal.SizeOf(entry);
+                if (!Process32First(snapshot, ref entry)) return result;
+                do { result[(int)entry.Pid] = (int)entry.Parent; }
+                while (Process32Next(snapshot, ref entry));
+            }
+            return result;
+        }
+        public static string ReadImagePath(int pid, long expectedTicks) {
+            using (var handle = OpenProcess(QueryLimitedInformation, false, pid)) {
+                if (handle == null || handle.IsInvalid) return null;
+                long creation, exit, kernel, user;
+                if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user) ||
+                    DateTime.FromFileTimeUtc(creation).Ticks != expectedTicks) return null;
+                int size = 32768; var name = new StringBuilder(size);
+                return QueryFullProcessImageName(handle, 0, name, ref size) ? name.ToString() : null;
+            }
+        }
         public static long? ReadStartUtcTicks(int processId) {
             if (processId <= 0) return null;
             try {
@@ -53,7 +95,7 @@ function Get-MiMemoryCounter {
         $value=$Source.$Property
         $number=0L
         if ($null -eq $value -or $value -is [bool] -or
-            -not [long]::TryParse([string]$value,[Globalization.NumberStyles]::Integer,
+            -not [long]::TryParse($value.ToString(),[Globalization.NumberStyles]::Integer,
                 [Globalization.CultureInfo]::InvariantCulture,[ref]$number) -or $number -lt $Minimum) { return $null }
         $bytes=[decimal]$number*$Scale
         if ($bytes -gt [long]::MaxValue) { return $null }
@@ -65,6 +107,7 @@ function Get-MiSystemSnapshot {
     $result = [ordered]@{
         Status='Failed';TotalPhysicalBytes=$null;AvailablePhysicalBytes=$null;UsedPhysicalBytes=$null
         CommittedBytes=$null;CommitLimitBytes=$null;PagedPoolBytes=$null;NonpagedPoolBytes=$null;Error=$null
+        CacheBytes=$null;StandbyBytes=$null;CompressionBytes=$null
     }
     $errors=New-Object 'System.Collections.Generic.List[string]'
     $memory=$null;$os=$null
@@ -88,6 +131,15 @@ function Get-MiSystemSnapshot {
     $result.CommitLimitBytes=Get-MiMemoryCounter $memory CommitLimit -Minimum 1
     $result.PagedPoolBytes=Get-MiMemoryCounter $memory PoolPagedBytes
     $result.NonpagedPoolBytes=Get-MiMemoryCounter $memory PoolNonpagedBytes
+    # 可选 RAM 视角：缓存、Standby 可能重叠，不能加入 Commit 或当成可释放量。
+    $result.CacheBytes=Get-MiMemoryCounter $memory CacheBytes
+    $standby=@('StandbyCacheCoreBytes','StandbyCacheNormalPriorityBytes','StandbyCacheReserveBytes' |
+        ForEach-Object { Get-MiMemoryCounter $memory $_ })
+    if (@($standby | Where-Object {$null -eq $_}).Count -eq 0 -and $standby.Count -eq 3) {
+        $sum=[decimal]$standby[0]+[decimal]$standby[1]+[decimal]$standby[2]
+        if ($sum -le [long]::MaxValue) { $result.StandbyBytes=[long]$sum }
+    }
+    # 当前来源没有可靠的压缩内存字节定义，明确保持 Unavailable，不以进程名称猜测。
     $missing=@('TotalPhysicalBytes','AvailablePhysicalBytes','UsedPhysicalBytes','CommittedBytes',
         'CommitLimitBytes','PagedPoolBytes','NonpagedPoolBytes' | Where-Object { $null -eq $result[$_] })
     if ($missing.Count -eq 0 -and $errors.Count -eq 0) { $result.Status='Success' }
@@ -102,6 +154,8 @@ function Get-MiProcessSnapshot {
     $errorText = $null
     try {
         Initialize-MiCollectorProcessTimes
+        $parentCaptureUtc=[datetime]::UtcNow
+        $parents=[MemoryInspector.CollectorProcessTimes]::ReadParents()
         $processes = @(Get-Process -ErrorAction Stop)
     } catch {
         return [pscustomobject]@{
@@ -117,6 +171,9 @@ function Get-MiProcessSnapshot {
             StartUtcTicks  = $null
             PrivateBytes   = $null
             WorkingBytes   = $null
+            ExecutablePath = $null
+            ParentPid      = $null
+            ParentStartUtcTicks = $null
             Status         = 'Success'
         }
         try {
@@ -130,6 +187,17 @@ function Get-MiProcessSnapshot {
             catch { $row.Status = 'Partial' }
             try { $row.WorkingBytes = [long]$proc.WorkingSet64 }
             catch { $row.Status = 'Partial' }
+            if ($null -ne $row.StartUtcTicks) {
+                try { $row.ExecutablePath=[MemoryInspector.CollectorProcessTimes]::ReadImagePath($row.PID,$row.StartUtcTicks) } catch {}
+                # Get-Process 内含枚举时的缓存；若新实例晚于枚举前时间边界，即使两次
+                # 查询都看到新实例，也不能把旧缓存内存归给它。保留数值但移除实例归属。
+                if ($row.StartUtcTicks -gt $parentCaptureUtc.Ticks -or
+                    (Get-MiProcessStartUtcTicks -ProcessId $row.PID) -ne $row.StartUtcTicks) {
+                    $row.StartUtcTicks=$null;$row.ExecutablePath=$null;$row.Status='Partial'
+                } elseif ($row.StartUtcTicks -le $parentCaptureUtc.Ticks -and $parents.ContainsKey($row.PID)) {
+                    $row.ParentPid=$parents[$row.PID]
+                }
+            }
             if ($null -eq $row.PrivateBytes -or $null -eq $row.WorkingBytes) { $row.Status = 'Partial' }
             if ($row.Status -ne 'Success') { $incomplete++ }
             $items.Add([pscustomobject]$row)
@@ -137,6 +205,15 @@ function Get-MiProcessSnapshot {
             $incomplete++
         } finally {
             if ($null -ne $proc) { $proc.Dispose() }
+        }
+    }
+    $byPid=@{}
+    foreach ($item in $items) { $byPid[$item.PID]=$item }
+    foreach ($item in $items) {
+        if ($null -eq $item.ParentPid -or $item.ParentPid -eq $item.PID -or -not $byPid.ContainsKey($item.ParentPid)) { continue }
+        $parent=$byPid[$item.ParentPid]
+        if ($null -ne $item.StartUtcTicks -and $null -ne $parent.StartUtcTicks -and $parent.StartUtcTicks -le $item.StartUtcTicks) {
+            $item.ParentStartUtcTicks=$parent.StartUtcTicks
         }
     }
     $status = if ($incomplete -eq 0) { 'Success' } else { 'Partial' }

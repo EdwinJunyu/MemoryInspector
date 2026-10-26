@@ -415,6 +415,28 @@ try {
     $script:SearchInput.Text=''
     if($script:Grid.Rows.Count -ne 1 -or $script:Grid.Rows[0].Tag.Name -ne 'replacement'){throw 'Clearing filter failed to rebuild current rows.'}
     # 此窗口属于测试自身；创建真实布局句柄，透明且不占任务栏，不触碰用户的运行窗口。
+    . (Join-Path $runtimeRepo 'Analyzer.ps1')
+    $v3Analyzer=New-MiAnalyzer -BootId GuiV3 -Root ''
+    $snapshot.Processes.Items=@($fresh,$larger)
+    $script:CurrentDiagnosis=Invoke-MiDiagnosis $v3Analyzer $snapshot
+    $script:Tabs.SelectedIndex=5
+    Update-MiAttributionView
+    if ($script:AttributionGrid.Rows.Count -ne 7 -or $script:AttributionNote.Text -notmatch 'RAM') {throw 'Attribution page missing independent system/RAM views.'}
+    $script:AttributionGrid.Rows[0].Selected=$true
+    Show-MiAttributionDetails
+    if ($script:AttributionDetails.Text -notmatch '实际观察 UTC' -or $script:AttributionDetails.Text -notmatch '局限：') {throw 'Finding evidence details missing.'}
+    $script:AttributionMode.SelectedIndex=1
+    $script:AttributionGrid.Rows[0].Selected=$true;$script:AttributionGrid.Rows[1].Selected=$true
+    Show-MiAttributionDetails
+    if ($script:AttributionDetails.Text -notmatch '用户逻辑组：2' -or $script:AttributionDetails.Text -notmatch '0.750 GiB') {throw 'User-selected group sum incorrect.'}
+    $snapshot.CaptureEndUtc=$now.AddSeconds(5);$snapshot.Processes.Items=@($replacement)
+    $script:CurrentDiagnosis=Invoke-MiDiagnosis $v3Analyzer $snapshot
+    Update-MiAttributionView
+    if ($script:AttributionGrid.SelectedRows.Count -ne 0) {throw 'Attribution logical selection survived PID reuse.'}
+    $script:CurrentDiagnosis=$null;Update-MiAttributionView
+    if ($script:AttributionGrid.Rows.Count -ne 0 -or $script:AttributionNote.Text -notmatch '不可用') {throw 'Unavailable attribution retained old findings.'}
+    $script:CurrentDiagnosis=[pscustomobject]@{Attribution=(Get-MiSystemAttribution $v3Analyzer $snapshot $snapshot.CaptureEndUtc)}
+    $script:AttributionMode.SelectedIndex=0;Update-MiAttributionView
     $script:Form.ShowInTaskbar=$false;$script:Form.Opacity=0;$script:Form.Show()
     # 主机字体缩放会放大 MinimumSize；本夹具固定物理像素，确保真的覆盖1020窄窗。
     $script:Form.AutoScaleMode='None';$script:Form.MinimumSize=[Drawing.Size]::new(1020,690)
@@ -423,7 +445,7 @@ try {
         $script:Form.Size=$size
         if($script:Form.Width -ne $size.Width -or $script:Form.Height -ne $size.Height){throw 'Layout fixture did not reach its requested physical size.'}
         [void]$script:Form.Handle
-        foreach($tabIndex in @(0,1,2,3,4)) {
+        foreach($tabIndex in @(0,1,2,3,4,5)) {
             $script:Tabs.SelectedIndex=$tabIndex
             $script:Form.PerformLayout();$script:Tabs.TabPages[$tabIndex].PerformLayout()
             [Windows.Forms.Application]::DoEvents()
@@ -435,6 +457,18 @@ try {
             }
             if ($tabIndex -eq 0 -and ($script:Grid.ColumnHeadersHeight -lt $script:Grid.Font.Height+6 -or
                 $script:Grid.GetCellDisplayRectangle(0,-1,$false).Height -le 0)) {throw 'Visible process column headers are clipped or missing.'}
+            if ($tabIndex -eq 5) {
+                if ($script:AttributionGrid.Height -lt 100 -or $script:AttributionDetails.Height -lt 80 -or
+                    $script:AttributionGrid.Bounds.IntersectsWith($script:AttributionNote.Bounds)) {throw 'Attribution layout clipped/overlapped.'}
+                $script:AttributionGrid.Rows[0].Selected=$true;Show-MiAttributionDetails
+                $image=[Drawing.Bitmap]::new($script:Form.Width,$script:Form.Height)
+                try {
+                    $script:Form.DrawToBitmap($image,[Drawing.Rectangle]::new(0,0,$image.Width,$image.Height))
+                    $renderRoot=Join-Path $runtimeRepo 'test-artifacts\v3-m1'
+                    [void][IO.Directory]::CreateDirectory($renderRoot)
+                    $image.Save((Join-Path $renderRoot ('attribution-'+$size.Width+'.png')))
+                } finally {$image.Dispose()}
+            }
         }
     }
 } finally {

@@ -431,6 +431,10 @@ function Save-MiSnapshot {
             CommitLimitBytes=$Snapshot.System.CommitLimitBytes
             PagedPoolBytes=$Snapshot.System.PagedPoolBytes
             NonpagedPoolBytes=$Snapshot.System.NonpagedPoolBytes
+            CacheBytes=$Snapshot.System.CacheBytes;StandbyBytes=$Snapshot.System.StandbyBytes
+            CompressionBytes=$Snapshot.System.CompressionBytes
+            # 仅保存小型系统 Finding；进程原始记录沿用原配额及 schema=1，旧文件缺字段仍可读。
+            AttributionSchemaVersion=1;AttributionFindings=@($Snapshot.Diagnosis.Attribution.Findings)
         }
         $all=@()
         if ($Snapshot.Processes.Status -ne 'Failed') {
@@ -447,6 +451,7 @@ function Save-MiSnapshot {
                 PID=$p.PID;Name=$p.Name;StartUtcTicks=$p.StartUtcTicks
                 ProcessInstanceId=$id;PrivateBytes=$p.PrivateBytes
                 WorkingBytes=$p.WorkingBytes;Status=$p.Status
+                ExecutablePath=$p.ExecutablePath;ParentPid=$p.ParentPid;ParentStartUtcTicks=$p.ParentStartUtcTicks
             })
         }
         $proc=[ordered]@{
